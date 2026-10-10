@@ -128,6 +128,28 @@ python3 -m unittest discover -s src/qai_hub_models/test/test_scripts \
   -p test_moshi_verify_downloaded_lm_bundle.py
 ```
 
+The native delay-ring was also replayed against the actual 38-frame clean
+upstream trace: all 38 Temporal input token sequences and all 37 emitted
+text/audio sequences matched exactly. This checks host scheduling, not QNN
+execution. Reproduce the check by exporting the fixture **on the remote**
+(where Torch and the trace are available), then copying that small fixture
+to the local model directory:
+
+```sh
+python scripts/moshi_export_scheduler_trace.py \
+  --trace-dir /data2/yejialei/tmp/moshi-cal-trace-clean-38f-mp-v1 \
+  --output /data3/yejialei/moshi-lm-guarded-dlc-set-v2/scheduler_trace_38f.txt
+# Locally, after copying scheduler_trace_38f.txt:
+clang++ -std=c++17 -Wall -Wextra -Werror android/test_moshi_scheduler_trace.cpp \
+  -o /tmp/moshi-scheduler-trace-test
+/tmp/moshi-scheduler-trace-test \
+  /Users/e1ainay/d_personal/moshi-models/lm-guarded-v2/scheduler_trace_38f.txt
+```
+
+The exporter assumes the captured run uses greedy sampling: mismatched
+sampling configuration produces a replay failure rather than being silently
+accepted as evidence of correct scheduling.
+
 Then separately check APK build/signature, local 26-file hashes, phone graph
 load/execute, two-frame tensors/tokens against references, and actual audio.
 If a phone failure occurs, identify the first graph name in native logs; do
