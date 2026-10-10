@@ -20,6 +20,7 @@
 #include "QnnInterface.h"
 #include "System/QnnSystemInterface.h"
 #include "moshi_lm_scheduler.h"
+#include "moshi_cache_prefix.h"
 
 namespace {
 
@@ -478,7 +479,7 @@ size_t runCodecFrames(Graph& encoder, Graph& decoder, const std::string& inputWa
 }
 
 // Keep one LM graph/context resident at a time. Full resident weights plus
-// 64 FP32 Temporal caches exceed many phone memory budgets. This is an offline
+// 64 full FP32 Temporal caches exceed many phone memory budgets. This is an offline
 // correctness path, not a real-time implementation.
 class PagedMoshiLm {
  public:
@@ -491,7 +492,7 @@ class PagedMoshiLm {
 
   void reset() {
     ring_.reset();
-    for (auto& cache : temporalCache_) cache.clear();
+    for (auto& cache : temporalCache_) std::vector<uint8_t>().swap(cache);
   }
 
   std::optional<std::array<int32_t, 9>> step(const std::array<int32_t, 8>& user,
@@ -514,7 +515,9 @@ class PagedMoshiLm {
         auto& input = graph.input(name);
         expect(input, QNN_DATATYPE_FLOAT_32, 1ULL * 32 * 3000 * 128 * sizeof(float));
         auto& cache = temporalCache_[2 * layer + j];
-        if (!cache.empty()) set(input, cache.data(), cache.size(), QNN_DATATYPE_FLOAT_32);
+        // No wrap in this <=3000-frame host. Store only slots already written;
+        // restore each head's prefix into a fresh zero-filled full ABI tensor.
+        MoshiCachePrefix::restore(input.bytes, cache, 32, 3000, 128 * sizeof(float), position);
       }
       graph.execute();
       finite(graph.output("output_hidden"));
@@ -522,7 +525,8 @@ class PagedMoshiLm {
       for (int j = 0; j < 4; ++j) {
         auto& output = graph.output("output_" + cacheName(layer + j / 2, j % 2));
         expect(output, QNN_DATATYPE_FLOAT_32, 1ULL * 32 * 3000 * 128 * sizeof(float));
-        temporalCache_[2 * layer + j] = output.bytes;
+        auto& cache = temporalCache_[2 * layer + j];
+        MoshiCachePrefix::pack(output.bytes, cache, 32, 3000, 128 * sizeof(float), position + 1);
       }
     }
     std::vector<uint8_t> temporal;

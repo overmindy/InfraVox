@@ -71,8 +71,13 @@ imports are retained as `lm-import-*` rather than destroying the old models.
 64 full FP32 Temporal K/V caches alone are ~2.93 GiB. All model weights plus
 all graph I/O buffers resident at once would exceed many phone memory budgets.
 The initial implementation loads, executes and frees one LM graph/context at
-a time. It trades very large model-load latency for lower peak memory; it
-still needs several GiB available native memory and is **not real-time**.
+a time. The host retains only the written prefix of each cache and restores
+it into a zero-filled full ABI tensor before the next call. For two frames,
+the persistent Temporal cache is ~2 MiB, not ~3 GiB. Each active Temporal graph
+still has ~375 MiB full input/output cache buffers, plus model/preparation
+memory. At 3000 frames the retained prefix reaches the full cache size.
+This trades very large model-load latency for lower peak memory; it still
+needs substantial available native memory and is **not real-time**.
 It does not promise compatibility with low-memory devices or arbitrary HTPs.
 Use QAIRT 2.45-compatible HTP libraries and the previously tested phone family.
 

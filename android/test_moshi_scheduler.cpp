@@ -1,7 +1,23 @@
 #include "moshi_lm_scheduler.h"
+#include "moshi_cache_prefix.h"
 #include <cassert>
 
 int main() {
+  std::vector<uint8_t> full(2 * 4 * 2, 0);
+  full[0] = 11; full[1] = 12; full[8] = 21; full[9] = 22;
+  std::vector<uint8_t> prefix;
+  MoshiCachePrefix::pack(full, prefix, 2, 4, 2, 1);
+  assert((prefix == std::vector<uint8_t>{11, 12, 21, 22}));
+  std::vector<uint8_t> restored(full.size(), 255);
+  MoshiCachePrefix::restore(restored, prefix, 2, 4, 2, 1);
+  assert(restored == full);
+  MoshiCachePrefix::pack(full, prefix, 2, 4, 2, 4);
+  MoshiCachePrefix::restore(restored, prefix, 2, 4, 2, 4);
+  assert(restored == full);
+  bool rejected = false;
+  try { MoshiCachePrefix::restore(restored, prefix, 2, 4, 2, 5); }
+  catch (const std::runtime_error&) { rejected = true; }
+  assert(rejected);
   MoshiDelayRing ring;
   std::array<int32_t, 8> user{};
   std::array<int32_t, 8> previousAudio{};
