@@ -32,7 +32,7 @@ CXX="$NDK/toolchains/llvm/prebuilt/$HOST/bin/aarch64-linux-android29-clang++"
 mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/stage/lib/arm64-v8a" "$OUT/stage/assets"
 
 "$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -fPIC -shared \
-  -DMIMI_CODEC_LIBRARY -static-libstdc++ -I "$QNN_HEADERS" \
+  -DMIMI_CODEC_LIBRARY -static-libstdc++ -Wl,--no-undefined -I "$QNN_HEADERS" \
   "$REPO_ROOT/android/mimi_qnn_runner.cpp" "$SCRIPT_DIR/mimi_codec_jni.cpp" \
   -o "$OUT/stage/lib/arm64-v8a/libmimi_codec.so" -ldl
 
@@ -56,7 +56,7 @@ cp "$OUT/dex/classes.dex" "$OUT/stage/classes.dex"
 (cd "$OUT/stage" && zip -q -0 -r "$OUT/unsigned.apk" classes.dex lib assets)
 "$BUILD_TOOLS/zipalign" -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
 
-KEYSTORE="$OUT/demo.keystore"
+KEYSTORE=${KEYSTORE_PATH:-$OUT/demo.keystore}
 if [[ ! -f "$KEYSTORE" ]]; then
   "$JAVA_HOME/bin/keytool" -genkeypair -keystore "$KEYSTORE" -alias mimi-demo \
     -storepass android -keypass android -dname 'CN=Mimi Demo' \

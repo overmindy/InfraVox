@@ -1,5 +1,9 @@
 # Mimi float codec on Android (SM8850 experiment)
 
+The demo now also has an experimental Moshi LM mode. See `MOSHI_LM.md` for
+the 26-DLC bundle, delay-ring, paged-memory execution and verification limits.
+The encoder/decoder-only path below remains available as a control.
+
 This directory contains a small native host for the **explicit-state** Mimi
 Encoder and Decoder DLCs. It reconstructs audio without the Moshi LM:
 
@@ -131,8 +135,9 @@ bash android/demo/build.sh
 When the phone is connected, install the resulting
 `android/demo/build/mimi-codec-demo.apk`. Copy the Encoder and Decoder DLCs
 to the phone's `Download` directory (or another location exposed by the
-document picker), open **Mimi Codec Demo**, import each DLC, press **加载两个 DLC
-到 QNN**, then record or choose audio and press **运行 QNN Encoder → Decoder**.
+document picker), open **Moshi QNN Demo** with the Moshi switch disabled,
+import each DLC, press **加载两个 Mimi DLC 到 QNN**, then record or choose audio
+and press **运行 Encoder → Decoder 对照**.
 Grant microphone permission on first use. The app build and APK signature can
 be checked without a phone; QNN execution and user interaction require an
 on-device test.
