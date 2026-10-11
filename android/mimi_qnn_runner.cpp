@@ -527,10 +527,15 @@ class PagedMoshiLm {
         MoshiCachePrefix::restore(input.bytes, cache, 32, 3000, 128 * sizeof(float), position);
       }
       graph.execute();
-      finite(graph.output("output_hidden"));
-      hidden = graph.output("output_hidden").bytes;
+      // This delivered 0_1 DLC alone uses numbered outputs. The verified source
+      // order is hidden, layer_0_key, layer_0_value, layer_1_key, layer_1_value.
+      auto& nextHidden = graph.output(layer == 0 ? "output_0" : "output_hidden");
+      expect(nextHidden, QNN_DATATYPE_FLOAT_32, 4096 * sizeof(float));
+      finite(nextHidden);
+      hidden = nextHidden.bytes;
       for (int j = 0; j < 4; ++j) {
-        auto& output = graph.output("output_" + cacheName(layer + j / 2, j % 2));
+        auto& output = graph.output(layer == 0 ? "output_" + std::to_string(j + 1)
+            : "output_" + cacheName(layer + j / 2, j % 2));
         expect(output, QNN_DATATYPE_FLOAT_32, 1ULL * 32 * 3000 * 128 * sizeof(float));
         auto& cache = temporalCache_[2 * layer + j];
         MoshiCachePrefix::pack(output.bytes, cache, 32, 3000, 128 * sizeof(float), position + 1);

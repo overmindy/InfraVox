@@ -153,6 +153,19 @@ This changes file modes (644) and directory modes (755) only under the two known
 and checks all 26 LM hashes. It does not transfer, delete or overwrite models.
 Full LM execution remains a separate test from successful Mimi loading.
 
+The delivered `temporal_layers_0_1` is also the only Temporal DLC with numbered
+outputs. Its verified mapping is `output_0` -> hidden, `output_1/2` -> layer-0
+key/value, `output_3/4` -> layer-1 key/value. `PagedMoshiLm::step` uses this
+explicit mapping only for that shard; all other shards use their semantic
+output names. No runtime output-order guessing is performed.
+
+On-phone follow-up: after correcting directory/file permissions, the app itself
+verified all 26 LM file hashes and successfully prepared the default-directory
+Mimi pair. The first two-frame execution attempt stopped at the 0_1 numbered
+output mismatch described above. Version `2.2-model-permissions` fixes that
+mapping and is built/signed, but its installation was rejected by the device's
+USB installation confirmation. Full-chain phone execution is not yet passed.
+
 Use the environment documented in `README.md`, then preserve the existing
 signing key if upgrading an installed demo (never uninstall just to bypass a
 signature mismatch; that would erase its imported models):
