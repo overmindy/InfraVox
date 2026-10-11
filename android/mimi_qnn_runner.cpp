@@ -2,6 +2,11 @@
 // Uses the QAIRT 2.45 public QNN interfaces. Each graph owns its streaming state.
 
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -11,21 +16,61 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
+#include <map>
 #include <stdexcept>
+#include <sstream>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "QnnInterface.h"
 #include "System/QnnSystemInterface.h"
+#include "HTP/QnnHtpDevice.h"
 #include "moshi_lm_scheduler.h"
 #include "moshi_cache_prefix.h"
+#include "moshi_graph_io_pool.h"
 
 namespace {
 
 constexpr size_t kFrameSamples = 1920;
 constexpr uint32_t kSampleRate = 24000;
+
+double elapsedMs(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+uint64_t availableMemoryBytes() {
+  std::ifstream file("/proc/meminfo");
+  std::string line;
+  while (std::getline(file, line)) {
+    std::istringstream row(line);
+    std::string key; uint64_t kib = 0;
+    if (row >> key >> kib && key == "MemAvailable:") return kib * 1024;
+  }
+  return 0; // No reliable budget: do not expand residency.
+}
+
+// Context binaries are device/runtime-specific caches, not replacement model files.
+// Keep the mapping alive until contextFree, including backends which retain it.
+struct MappedBinary {
+  void* data = MAP_FAILED;
+  size_t size = 0;
+  ~MappedBinary() { clear(); }
+  void clear() { if (data != MAP_FAILED) munmap(data, size); data = MAP_FAILED; size = 0; }
+  bool open(const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat info{};
+    if (fstat(fd, &info) || info.st_size <= 0) { close(fd); return false; }
+    size = static_cast<size_t>(info.st_size);
+    data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    return data != MAP_FAILED;
+  }
+};
 
 void check(Qnn_ErrorHandle_t status, const std::string& operation) {
   if (status != QNN_SUCCESS) {
@@ -167,12 +212,56 @@ class Runtime {
   }
 
   ~Runtime() {
+    endPerformanceVote();
     if (device && qnn.deviceFree) qnn.deviceFree(device);
     if (backend && qnn.backendFree) qnn.backendFree(backend);
     // The HTP backend can retain process-wide cleanup hooks, so leave its SO loaded.
   }
 
   const QnnInterface_t& provider() const { return *qnnProvider_; }
+  void beginPerformanceVote() {
+    QnnDevice_Infrastructure_t infrastructure = nullptr;
+    if (!qnn.deviceGetInfrastructure || qnn.deviceGetInfrastructure(&infrastructure) != QNN_SUCCESS ||
+        !infrastructure || infrastructure->infraType != QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF) return;
+    perf_ = infrastructure->perfInfra;
+    if (!perf_.createPowerConfigId || !perf_.destroyPowerConfigId || !perf_.setPowerConfig ||
+        perf_.createPowerConfigId(0, 0, &powerConfigId_) != QNN_SUCCESS) return;
+    hasPowerConfig_ = true;
+    QnnHtpPerfInfrastructure_PowerConfig_t config{};
+    config.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
+    auto& vote = config.dcvsV3Config;
+    vote.contextId = powerConfigId_;
+    vote.setDcvsEnable = 1; vote.dcvsEnable = 1; // Allow scaling; never disable thermal control.
+    vote.powerMode = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+    vote.setSleepLatency = 1; vote.sleepLatency = 100;
+    vote.setBusParams = 1; vote.setCoreParams = 1;
+    vote.busVoltageCornerMin = vote.coreVoltageCornerMin = DCVS_VOLTAGE_VCORNER_SVS;
+    vote.busVoltageCornerTarget = vote.coreVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_TURBO;
+    vote.busVoltageCornerMax = vote.coreVoltageCornerMax = DCVS_VOLTAGE_VCORNER_TURBO;
+    const QnnHtpPerfInfrastructure_PowerConfig_t* configs[] = {&config, nullptr};
+    const auto status = perf_.setPowerConfig(powerConfigId_, configs);
+    timing("HTP", status == QNN_SUCCESS ? "performance_vote_accepted" : "performance_vote_rejected", 0);
+    if (status != QNN_SUCCESS) endPerformanceVote();
+  }
+  void endPerformanceVote() {
+    if (hasPowerConfig_) {
+      perf_.destroyPowerConfigId(powerConfigId_);
+      hasPowerConfig_ = false;
+    }
+  }
+  void timing(const std::string& graph, const std::string& phase, double milliseconds) {
+    timings.push_back({graph, phase, milliseconds});
+    std::cerr << "moshi_timing graph=" << graph << " phase=" << phase << " ms=" << milliseconds << '\n';
+  }
+  void writeTimings(const std::string& path) const {
+    std::ofstream file(path);
+    if (!file) throw std::runtime_error("Cannot write performance CSV: " + path);
+    file << "graph,phase,milliseconds\n";
+    for (const auto& row : timings) file << row.graph << ',' << row.phase << ',' << row.ms << '\n';
+    if (!file) throw std::runtime_error("Cannot finish performance CSV: " + path);
+  }
+  struct Timing { std::string graph, phase; double ms; };
+  std::vector<Timing> timings;
   QNN_INTERFACE_VER_TYPE qnn{};
   QNN_SYSTEM_INTERFACE_VER_TYPE system{};
   Qnn_BackendHandle_t backend = nullptr;
@@ -182,12 +271,22 @@ class Runtime {
   void* backendLibrary_ = nullptr;
   void* systemLibrary_ = nullptr;
   const QnnInterface_t* qnnProvider_ = nullptr;
+  QnnHtpDevice_PerfInfrastructure_t perf_{};
+  uint32_t powerConfigId_ = 0;
+  bool hasPowerConfig_ = false;
 };
 
 class Graph {
  public:
-  Graph(Runtime& runtime, const std::string& dlcPath) : runtime_(runtime) {
+  Graph(Runtime& runtime, const std::string& dlcPath, const std::string& cachePath = "",
+        GraphIoPool* ioPool = nullptr) : runtime_(runtime), ioPool_(ioPool) {
     try {
+    label_ = dlcPath.substr(dlcPath.find_last_of('/') + 1);
+    const auto start = std::chrono::steady_clock::now();
+    if (!cachePath.empty() && loadBinary(cachePath)) {
+      runtime_.timing(label_, "restore_context", elapsedMs(start));
+      return;
+    }
     // SDK 1002 can hide an unreadable external-storage file. Fail clearly first.
     {
       std::ifstream readable(dlcPath, std::ios::binary);
@@ -199,11 +298,14 @@ class Graph {
           "contextCreate " + dlcPath);
     check(runtime_.system.systemDlcCreateFromFile(nullptr, dlcPath.c_str(), &dlc_),
           "systemDlcCreateFromFile " + dlcPath);
+    runtime_.timing(label_, "open_dlc", elapsedMs(start));
+    auto phaseStart = std::chrono::steady_clock::now();
     uint32_t count = 0;
     check(runtime_.system.systemDlcComposeGraphs(
               dlc_, nullptr, 0, runtime_.backend, context_, runtime_.provider(),
               QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1, &graphs_, &count),
           "systemDlcComposeGraphs " + dlcPath);
+    runtime_.timing(label_, "compose", elapsedMs(phaseStart));
     if (count != 1 || !graphs_ || graphs_[0].version !=
                                   QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1) {
       throw std::runtime_error("Expected one DLC graph with v1 graph metadata");
@@ -212,9 +314,14 @@ class Graph {
     name_ = graphInfo.graphName;
     check(runtime_.qnn.graphRetrieve(context_, name_.c_str(), &graph_),
           "graphRetrieve " + name_);
+    phaseStart = std::chrono::steady_clock::now();
     check(runtime_.qnn.graphFinalize(graph_, nullptr, nullptr), "graphFinalize " + name_);
-    prepare(graphInfo.graphInputs, graphInfo.numGraphInputs, inputs_, inputTensors_);
-    prepare(graphInfo.graphOutputs, graphInfo.numGraphOutputs, outputs_, outputTensors_);
+    runtime_.timing(label_, "finalize", elapsedMs(phaseStart));
+    if (!cachePath.empty()) saveBinary(cachePath);
+    phaseStart = std::chrono::steady_clock::now();
+    prepare(graphInfo.graphInputs, graphInfo.numGraphInputs, inputs_, inputTensors_, "input");
+    prepare(graphInfo.graphOutputs, graphInfo.numGraphOutputs, outputs_, outputTensors_, "output");
+    runtime_.timing(label_, "allocate_io", elapsedMs(phaseStart));
     std::cerr << dlcPath << " graph=" << name_ << '\n';
     printIO("input", inputs_);
     printIO("output", outputs_);
@@ -231,14 +338,94 @@ class Graph {
  private:
   void release() {
     if (context_ && runtime_.qnn.contextFree) runtime_.qnn.contextFree(context_, nullptr);
+    context_ = nullptr;
+    if (ioPool_) {
+      for (size_t i = 0; i < inputs_.size(); ++i) ioPool_->put("input", i, inputs_[i].bytes);
+      for (size_t i = 0; i < outputs_.size(); ++i) ioPool_->put("output", i, outputs_[i].bytes);
+    }
     if (graphs_) std::free(graphs_);
+    graphs_ = nullptr;
     if (dlc_ && runtime_.system.systemDlcFree) runtime_.system.systemDlcFree(dlc_);
+    dlc_ = nullptr;
+    if (systemContext_ && runtime_.system.systemContextFree) runtime_.system.systemContextFree(systemContext_);
+    systemContext_ = nullptr;
+    binary_.clear();
+  }
+
+  bool loadBinary(const std::string& path) {
+    if (!runtime_.qnn.contextCreateFromBinary || !runtime_.system.systemContextGetBinaryInfo || !binary_.open(path)) return false;
+    try {
+      check(runtime_.system.systemContextCreate(&systemContext_), "systemContextCreate");
+      const QnnSystemContext_BinaryInfo_t* info = nullptr;
+      Qnn_ContextBinarySize_t metadataSize = 0;
+      check(runtime_.system.systemContextGetBinaryInfo(systemContext_, binary_.data, binary_.size, &info, &metadataSize), "context metadata");
+      QnnSystemContext_GraphInfo_t* graphs = nullptr;
+      uint32_t count = 0;
+      if (info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1) { graphs = info->contextBinaryInfoV1.graphs; count = info->contextBinaryInfoV1.numGraphs; }
+      else if (info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2) { graphs = info->contextBinaryInfoV2.graphs; count = info->contextBinaryInfoV2.numGraphs; }
+      else if (info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3) { graphs = info->contextBinaryInfoV3.graphs; count = info->contextBinaryInfoV3.numGraphs; }
+      if (count != 1 || !graphs) throw std::runtime_error("Expected one cached graph");
+      QnnSystemContext_GraphInfoV1_t graphInfo{};
+      if (graphs[0].version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1) graphInfo = graphs[0].graphInfoV1;
+      else if (graphs[0].version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_2) {
+        const auto& g = graphs[0].graphInfoV2;
+        graphInfo.graphName = g.graphName; graphInfo.graphInputs = g.graphInputs; graphInfo.numGraphInputs = g.numGraphInputs;
+        graphInfo.graphOutputs = g.graphOutputs; graphInfo.numGraphOutputs = g.numGraphOutputs;
+      } else if (graphs[0].version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3) {
+        const auto& g = graphs[0].graphInfoV3;
+        graphInfo.graphName = g.graphName; graphInfo.graphInputs = g.graphInputs; graphInfo.numGraphInputs = g.numGraphInputs;
+        graphInfo.graphOutputs = g.graphOutputs; graphInfo.numGraphOutputs = g.numGraphOutputs;
+      } else throw std::runtime_error("Unsupported cached graph metadata");
+      check(runtime_.qnn.contextCreateFromBinary(runtime_.backend, runtime_.device, nullptr, binary_.data, binary_.size, &context_, nullptr), "contextCreateFromBinary");
+      name_ = graphInfo.graphName;
+      check(runtime_.qnn.graphRetrieve(context_, name_.c_str(), &graph_), "cached graphRetrieve");
+      prepare(graphInfo.graphInputs, graphInfo.numGraphInputs, inputs_, inputTensors_, "input");
+      prepare(graphInfo.graphOutputs, graphInfo.numGraphOutputs, outputs_, outputTensors_, "output");
+      return true; // Already finalized: never finalize a deserialized context.
+    } catch (const std::exception& error) {
+      std::cerr << "Context cache rejected; rebuilding DLC: " << error.what() << '\n';
+      release(); inputs_.clear(); outputs_.clear(); inputTensors_.clear(); outputTensors_.clear();
+      return false;
+    }
+  }
+
+  void saveBinary(const std::string& path) {
+    if (!runtime_.qnn.contextGetBinarySize || !runtime_.qnn.contextGetBinary) return;
+    const auto start = std::chrono::steady_clock::now();
+    Qnn_ContextBinarySize_t size = 0, written = 0;
+    if (runtime_.qnn.contextGetBinarySize(context_, &size) != QNN_SUCCESS || !size) return;
+    struct statvfs space{};
+    const std::string directory = path.substr(0, path.find_last_of('/'));
+    if (statvfs(directory.c_str(), &space) || size + (512ULL << 20) >
+        static_cast<uint64_t>(space.f_bavail) * space.f_frsize) {
+      runtime_.timing(label_, "save_context_no_space", elapsedMs(start));
+      return;
+    }
+    std::string temporary = path + ".tmp-XXXXXX";
+    std::vector<char> filename(temporary.begin(), temporary.end()); filename.push_back('\0');
+    int fd = mkstemp(filename.data());
+    if (fd < 0) return; // Cache failures must not prevent model execution.
+    bool saved = false;
+    if (!ftruncate(fd, static_cast<off_t>(size))) {
+      void* data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      if (data != MAP_FAILED) {
+        saved = runtime_.qnn.contextGetBinary(context_, data, size, &written) == QNN_SUCCESS && written > 0 && written <= size;
+        if (saved) saved = msync(data, size, MS_SYNC) == 0;
+        munmap(data, size);
+      }
+    }
+    if (saved) saved = ftruncate(fd, static_cast<off_t>(written)) == 0 && fsync(fd) == 0;
+    close(fd);
+    if (saved) saved = rename(filename.data(), path.c_str()) == 0;
+    if (!saved) unlink(filename.data()); // Only our uniquely created temporary cache.
+    runtime_.timing(label_, saved ? "save_context" : "save_context_failed", elapsedMs(start));
   }
 
  public:
 
   Buffer& input(const std::string& name) { return find(inputs_, name); }
   Buffer& output(const std::string& name) {
+    resumeIo();
     for (auto& buffer : outputs_) {
       if (buffer.name == name) return buffer;
     }
@@ -251,13 +438,16 @@ class Graph {
   }
 
   double execute() {
+    resumeIo();
     const auto start = std::chrono::steady_clock::now();
     check(runtime_.qnn.graphExecute(graph_, inputTensors_.data(), inputTensors_.size(),
                                     outputTensors_.data(), outputTensors_.size(), nullptr,
                                     nullptr),
           "graphExecute " + name_);
     const auto end = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::milli>(end - start).count();
+    const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+    runtime_.timing(label_, "execute", ms);
+    return ms;
   }
 
   void advanceState() {
@@ -283,16 +473,41 @@ class Graph {
     std::memcpy(target.bytes.data(), source.bytes.data(), source.bytes.size());
   }
 
+  void suspendIo() {
+    if (!ioPool_ || !ioActive_) return;
+    for (size_t i = 0; i < inputs_.size(); ++i) ioPool_->put("input", i, inputs_[i].bytes);
+    for (size_t i = 0; i < outputs_.size(); ++i) ioPool_->put("output", i, outputs_[i].bytes);
+    ioActive_ = false;
+  }
+
+  void resumeIo() {
+    if (ioActive_) return;
+    const auto start = std::chrono::steady_clock::now();
+    auto restore = [&](const std::string& role, std::vector<Buffer>& buffers, std::vector<Qnn_Tensor_t>& tensors) {
+      for (size_t i = 0; i < buffers.size(); ++i) {
+        auto& buffer = buffers[i];
+        ioPool_->take(role, i, tensorBytes(buffer.tensor), buffer.bytes);
+        setClientBuffer(buffer.tensor, buffer.bytes.data(), static_cast<uint32_t>(buffer.bytes.size()));
+        tensors[i] = buffer.tensor;
+      }
+    };
+    restore("input", inputs_, inputTensors_); restore("output", outputs_, outputTensors_);
+    ioActive_ = true;
+    runtime_.timing(label_, "rebind_io", elapsedMs(start));
+  }
+
  private:
-  static Buffer& find(std::vector<Buffer>& buffers, const std::string& name) {
+  Buffer& find(std::vector<Buffer>& buffers, const std::string& name) {
+    resumeIo();
     for (auto& buffer : buffers) {
       if (buffer.name == name) return buffer;
     }
     throw std::runtime_error("Missing QNN graph tensor: " + name);
   }
 
-  static void prepare(Qnn_Tensor_t* metadata, uint32_t count,
-                      std::vector<Buffer>& buffers, std::vector<Qnn_Tensor_t>& tensors) {
+  void prepare(Qnn_Tensor_t* metadata, uint32_t count,
+               std::vector<Buffer>& buffers, std::vector<Qnn_Tensor_t>& tensors,
+               const std::string& role) {
     if (count == 0) throw std::runtime_error("Graph has no tensors");
     buffers.resize(count);
     tensors.resize(count);
@@ -300,7 +515,8 @@ class Graph {
       auto& buffer = buffers[i];
       buffer.tensor = metadata[i];
       buffer.name = tensorName(metadata[i]);
-      buffer.bytes.resize(tensorBytes(metadata[i]));
+      if (ioPool_) ioPool_->take(role, i, tensorBytes(metadata[i]), buffer.bytes);
+      else buffer.bytes.resize(tensorBytes(metadata[i]));
       if (buffer.bytes.size() > UINT32_MAX) throw std::runtime_error("QNN client buffer exceeds uint32");
       setClientBuffer(buffer.tensor, buffer.bytes.data(),
                       static_cast<uint32_t>(buffer.bytes.size()));
@@ -322,11 +538,16 @@ class Graph {
   }
 
   Runtime& runtime_;
+  GraphIoPool* ioPool_;
+  bool ioActive_ = true;
   Qnn_ContextHandle_t context_ = nullptr;
   QnnSystemDlc_Handle_t dlc_ = nullptr;
   QnnSystemContext_GraphInfo_t* graphs_ = nullptr;
   Qnn_GraphHandle_t graph_ = nullptr;
+  QnnSystemContext_Handle_t systemContext_ = nullptr;
+  MappedBinary binary_;
   std::string name_;
+  std::string label_;
   std::vector<Buffer> inputs_;
   std::vector<Buffer> outputs_;
   std::vector<Qnn_Tensor_t> inputTensors_;
@@ -495,6 +716,29 @@ class PagedMoshiLm {
     for (const auto& name : {"frontend", "head"}) requireFile(name);
     for (int i = 0; i < 32; i += 2) requireFile(shardName(i));
     for (int i = 0; i < 8; ++i) requireFile("depformer_codebook_" + std::to_string(i));
+    // This is a conservative SOURCE-WEIGHT budget, not a claimed hard RSS cap.
+    // Keep OS/headroom; never automatically try to fill all physical RAM.
+    const uint64_t available = availableMemoryBytes();
+    uint64_t budget = available >= (8ULL << 30) ? std::min<uint64_t>(3ULL << 30, available / 4) : 0;
+    if (const char* limit = std::getenv("MOSHI_TEMPORAL_RESIDENT_MIB"))
+      budget = std::min<uint64_t>(budget, std::stoull(limit) << 20);
+    std::vector<std::pair<uint64_t, int>> candidates;
+    for (int layer = 0; layer < 32; layer += 2) {
+      struct stat info{};
+      if (!stat(path(shardName(layer)).c_str(), &info)) candidates.emplace_back(info.st_size, layer);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    for (const auto& candidate : candidates) {
+      if (candidate.first <= budget) { residentTemporal_.insert(candidate.second); budget -= candidate.first; }
+    }
+    std::cerr << "Temporal resident plan: " << residentTemporal_.size() << " shards; shared I/O pool; available_memory=" << available << '\n';
+  }
+
+  void configureCache(const std::string& directory) {
+    if (!cacheDirectory_.empty()) return;
+    const char* overrideDirectory = std::getenv("MOSHI_CONTEXT_CACHE_DIR");
+    cacheDirectory_ = overrideDirectory && *overrideDirectory ? overrideDirectory : directory;
+    mkdir(cacheDirectory_.c_str(), 0700);
   }
 
   void reset() {
@@ -507,14 +751,16 @@ class PagedMoshiLm {
     auto sequence = ring_.begin(user);
     std::vector<uint8_t> hidden;
     {
-      Graph graph(runtime_, path("frontend"));
+      Graph& graph = resident("frontend");
       set(graph.input("sequence"), sequence.data(), sizeof(sequence), QNN_DATATYPE_INT_32);
       graph.execute();
       finite(graph.output("hidden"));
       hidden = graph.output("hidden").bytes;
     }
     for (int layer = 0; layer < 32; layer += 2) {
-      Graph graph(runtime_, path(shardName(layer)));
+      std::unique_ptr<Graph> paged;
+      Graph& graph = temporal(layer, paged);
+      const auto hostStart = std::chrono::steady_clock::now();
       set(graph.input("hidden"), hidden.data(), hidden.size(), QNN_DATATYPE_FLOAT_32);
       set(graph.input("position"), &position, sizeof(position), QNN_DATATYPE_INT_32);
       for (int j = 0; j < 4; ++j) {
@@ -526,6 +772,7 @@ class PagedMoshiLm {
         // restore each head's prefix into a fresh zero-filled full ABI tensor.
         MoshiCachePrefix::restore(input.bytes, cache, 32, 3000, 128 * sizeof(float), position);
       }
+      runtime_.timing(shardName(layer), "restore_kv", elapsedMs(hostStart));
       graph.execute();
       // This delivered 0_1 DLC alone uses numbered outputs. The verified source
       // order is hidden, layer_0_key, layer_0_value, layer_1_key, layer_1_value.
@@ -533,6 +780,7 @@ class PagedMoshiLm {
       expect(nextHidden, QNN_DATATYPE_FLOAT_32, 4096 * sizeof(float));
       finite(nextHidden);
       hidden = nextHidden.bytes;
+      const auto packStart = std::chrono::steady_clock::now();
       for (int j = 0; j < 4; ++j) {
         auto& output = graph.output(layer == 0 ? "output_" + std::to_string(j + 1)
             : "output_" + cacheName(layer + j / 2, j % 2));
@@ -540,11 +788,13 @@ class PagedMoshiLm {
         auto& cache = temporalCache_[2 * layer + j];
         MoshiCachePrefix::pack(output.bytes, cache, 32, 3000, 128 * sizeof(float), position + 1);
       }
+      runtime_.timing(shardName(layer), "pack_kv", elapsedMs(packStart));
+      graph.suspendIo(); // Context may remain resident; scratch buffers do not.
     }
     std::vector<uint8_t> temporal;
     int32_t previous;
     {
-      Graph graph(runtime_, path("head"));
+      Graph& graph = resident("head");
       set(graph.input("hidden"), hidden.data(), hidden.size(), QNN_DATATYPE_FLOAT_32);
       graph.execute();
       finite(graph.output("temporal"));
@@ -565,13 +815,14 @@ class PagedMoshiLm {
     // Depth cache is reset EACH audio frame, but shared across all 8 codebooks.
     std::array<std::vector<uint8_t>, 12> depthCache;
     for (int book = 0; book < 8; ++book) {
-      Graph graph(runtime_, path("depformer_codebook_" + std::to_string(book)));
+      Graph& graph = resident("depformer_codebook_" + std::to_string(book));
       set(graph.input("previous_token"), &previous, sizeof(previous), QNN_DATATYPE_INT_32);
       set(graph.input("temporal"), temporal.data(), temporal.size(), QNN_DATATYPE_FLOAT_32);
       for (int j = 0; j < 12; ++j) {
         auto& input = graph.input(cacheName(j / 2, j % 2));
         expect(input, QNN_DATATYPE_FLOAT_32, 16 * 8 * 64 * sizeof(float));
         if (!depthCache[j].empty()) set(input, depthCache[j].data(), depthCache[j].size(), QNN_DATATYPE_FLOAT_32);
+        else std::fill(input.bytes.begin(), input.bytes.end(), 0); // Resident graphs retain last frame's inputs.
       }
       graph.execute();
       finite(graph.output("audio_logits"));
@@ -589,6 +840,41 @@ class PagedMoshiLm {
   }
 
  private:
+  Graph& temporal(int layer, std::unique_ptr<Graph>& paged) {
+    const std::string name = shardName(layer);
+    auto found = temporalGraphs_.find(layer);
+    if (found != temporalGraphs_.end()) {
+      runtime_.timing(name, "resident_reuse", 0);
+      return *found->second;
+    }
+    if (residentTemporal_.count(layer) && availableMemoryBytes() >= (4ULL << 30)) {
+      auto graph = std::make_unique<Graph>(runtime_, path(name), cachePath(name), &temporalIoPool_);
+      auto& result = *graph;
+      temporalGraphs_[layer] = std::move(graph);
+      return result;
+    }
+    paged = std::make_unique<Graph>(runtime_, path(name), cachePath(name), &temporalIoPool_);
+    return *paged;
+  }
+  Graph& resident(const std::string& name) {
+    auto& graph = residentGraphs_[name];
+    if (!graph) graph = std::make_unique<Graph>(runtime_, path(name), cachePath(name));
+    else runtime_.timing(name, "resident_reuse", 0);
+    return *graph;
+  }
+  std::string cachePath(const std::string& name) const {
+    struct stat info{}, directoryInfo{};
+    if (stat(path(name).c_str(), &info) || stat(cacheDirectory_.c_str(), &directoryInfo) ||
+        access(cacheDirectory_.c_str(), W_OK)) return "";
+    const auto& api = runtime_.provider().apiVersion;
+    // Bundles are SHA256-verified by the App; size+mtime invalidate replaced DLCs.
+    // Cache remains on this phone. API/backend version changes select a new file.
+    return cacheDirectory_ + "/" + name + "-" + std::to_string(info.st_size) + "-" +
+        std::to_string(info.st_mtime) + "-" + std::to_string(api.coreApiVersion.major) + "." +
+        std::to_string(api.coreApiVersion.minor) + "." + std::to_string(api.coreApiVersion.patch) + "-" +
+        std::to_string(api.backendApiVersion.major) + "." + std::to_string(api.backendApiVersion.minor) + "." +
+        std::to_string(api.backendApiVersion.patch) + ".bin";
+  }
   static void set(Buffer& buffer, const void* data, size_t size, Qnn_DataType_t type) {
     expect(buffer, type, size);
     std::memcpy(buffer.bytes.data(), data, size);
@@ -615,13 +901,20 @@ class PagedMoshiLm {
   }
   Runtime& runtime_;
   std::string directory_;
+  std::string cacheDirectory_;
+  GraphIoPool temporalIoPool_;
+  std::set<int> residentTemporal_;
+  std::map<int, std::unique_ptr<Graph>> temporalGraphs_;
+  std::map<std::string, std::unique_ptr<Graph>> residentGraphs_;
   MoshiDelayRing ring_;
   std::array<std::vector<uint8_t>, 64> temporalCache_;
 };
 
+using FrameCallback = std::function<void(size_t, size_t, double, const std::vector<int16_t>&)>;
+
 size_t runMoshiFrames(Graph& encoder, Graph& decoder, PagedMoshiLm& lm,
                       const std::string& inputWav, const std::string& outputWav,
-                      size_t requestedFrames) {
+                      size_t requestedFrames, const FrameCallback& callback = {}) {
   const auto samples = readWav(inputWav);
   if (!requestedFrames) requestedFrames = samples.size() / kFrameSamples;
   if (requestedFrames < 2 || requestedFrames > samples.size() / kFrameSamples || requestedFrames > 3000)
@@ -635,6 +928,7 @@ size_t runMoshiFrames(Graph& encoder, Graph& decoder, PagedMoshiLm& lm,
   size_t emitted = 0;
   for (size_t frame = 0; frame < requestedFrames; ++frame) {
     auto start = std::chrono::steady_clock::now();
+    std::vector<int16_t> audioChunk;
     auto& input = encoder.input("audio");
     expect(input, QNN_DATATYPE_FLOAT_32, kFrameSamples * sizeof(float));
     for (size_t i = 0; i < kFrameSamples; ++i) {
@@ -672,13 +966,15 @@ size_t runMoshiFrames(Graph& encoder, Graph& decoder, PagedMoshiLm& lm,
         float value;
         std::memcpy(&value, wave.bytes.data() + i * sizeof(float), sizeof(value));
         if (!std::isfinite(value)) throw std::runtime_error("Nonfinite Moshi decoder audio");
-        result.push_back(static_cast<int16_t>(std::lrintf(std::clamp(value, -1.0f, 32767.0f / 32768.0f) * 32768)));
+        const auto sample = static_cast<int16_t>(std::lrintf(std::clamp(value, -1.0f, 32767.0f / 32768.0f) * 32768));
+        result.push_back(sample); audioChunk.push_back(sample);
       }
       codes << emitted;
       for (size_t i = 1; i < 9; ++i) codes << ',' << (*generated)[i];
       codes << '\n'; text << emitted << ',' << (*generated)[0] << '\n';
       ++emitted;
     }
+    if (callback) callback(frame + 1, emitted, elapsedMs(start), audioChunk);
     std::cerr << "moshi_frame=" << frame << " emitted=" << emitted << " total_ms="
               << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() << '\n';
   }
@@ -697,9 +993,29 @@ class PreparedMimiCodec {
   }
 
   size_t run(const std::string& inputWav, const std::string& outputWav,
-             size_t requestedFrames) {
-    if (lm_) return runMoshiFrames(encoder_, decoder_, *lm_, inputWav, outputWav, requestedFrames);
-    return runCodecFrames(encoder_, decoder_, inputWav, outputWav, requestedFrames);
+             size_t requestedFrames, const FrameCallback& callback = {}, bool highPerformance = false) {
+    runtime_.timings.clear();
+    const auto start = std::chrono::steady_clock::now();
+    if (lm_) lm_->configureCache(outputWav + ".contexts-v1");
+    const char* boost = std::getenv("MOSHI_HTP_PERFORMANCE");
+    if (highPerformance || (boost && std::string(boost) == "1")) runtime_.beginPerformanceVote();
+    try {
+      const auto frames = lm_ ? runMoshiFrames(encoder_, decoder_, *lm_, inputWav, outputWav, requestedFrames, callback)
+                              : runCodecFrames(encoder_, decoder_, inputWav, outputWav, requestedFrames);
+      runtime_.timing("pipeline", "wall_total", elapsedMs(start));
+      runtime_.endPerformanceVote();
+      runtime_.writeTimings(outputWav + ".performance.csv");
+      return frames;
+    } catch (...) {
+      runtime_.endPerformanceVote();
+      runtime_.timing("pipeline", "wall_failed", elapsedMs(start));
+      try { runtime_.writeTimings(outputWav + ".performance.csv"); } catch (...) {}
+      throw;
+    }
+  }
+
+  void configureCache(const std::string& directory) {
+    if (lm_) lm_->configureCache(directory);
   }
 
  private:
@@ -729,8 +1045,20 @@ size_t runMimiCodecSession(void* session, const std::string& inputWav,
                                                        requestedFrames);
 }
 
+size_t runMimiCodecSessionStreaming(void* session, const std::string& inputWav,
+                                  const std::string& outputWav, size_t frames,
+                                  const FrameCallback& callback, bool highPerformance) {
+  if (!session) throw std::runtime_error("Models have not been loaded");
+  return static_cast<PreparedMimiCodec*>(session)->run(inputWav, outputWav, frames, callback, highPerformance);
+}
+
 void destroyMimiCodecSession(void* session) {
   delete static_cast<PreparedMimiCodec*>(session);
+}
+
+void configureMimiCodecSessionCache(void* session, const std::string& directory) {
+  if (!session) throw std::runtime_error("Models have not been loaded");
+  static_cast<PreparedMimiCodec*>(session)->configureCache(directory);
 }
 
 size_t runMimiCodec(const std::string& libraryDir, const std::string& encoderDlc,
@@ -743,14 +1071,37 @@ size_t runMimiCodec(const std::string& libraryDir, const std::string& encoderDlc
 #ifndef MIMI_CODEC_LIBRARY
 int main(int argc, char** argv) {
   try {
-    if (argc != 7 && argc != 8) {
+    if (argc == 5 && std::string(argv[1]) == "--benchmark-frontend") {
+      Runtime runtime(argv[2]);
+      // Same deterministic streaming initial input, same DLC; change only lifecycle.
+      MoshiDelayRing ring;
+      const auto sequence = ring.begin(std::array<int32_t, 8>{});
+      std::vector<uint8_t> reference;
+      for (int pass = 0; pass < 2; ++pass) {
+        Graph graph(runtime, argv[3], argv[4]);
+        auto& input = graph.input("sequence");
+        expect(input, QNN_DATATYPE_INT_32, sizeof(sequence));
+        std::memcpy(input.bytes.data(), sequence.data(), sizeof(sequence));
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          graph.execute();
+          auto& output = graph.output("hidden");
+          if (reference.empty()) reference = output.bytes;
+          else if (reference != output.bytes) throw std::runtime_error("Context-cache/resident frontend output differs from first execution");
+        }
+      }
+      runtime.writeTimings(std::string(argv[4]) + ".performance.csv");
+      std::cout << "Frontend cache + resident repeat byte parity: PASS\n";
+      return 0;
+    }
+    if (argc != 7 && argc != 8 && !(argc == 9 && std::string(argv[8]) == "--repeat")) {
       std::cerr << "Usage: mimi_qnn_runner LIB_DIR ENCODER.dlc DECODER.dlc "
-                   "INPUT.wav OUTPUT.wav FRAMES [LM_BUNDLE_DIR] (0 = all complete frames)\n";
+                   "INPUT.wav OUTPUT.wav FRAMES [LM_BUNDLE_DIR [--repeat]] (0 = all complete frames)\n";
       return 2;
     }
-    if (argc == 8) {
+    if (argc >= 8) {
       PreparedMimiCodec session(argv[1], argv[2], argv[3], argv[7]);
       session.run(argv[4], argv[5], std::stoul(argv[6]));
+      if (argc == 9) session.run(argv[4], std::string(argv[5]) + ".repeat.wav", std::stoul(argv[6]));
     } else {
       runMimiCodec(argv[1], argv[2], argv[3], argv[4], argv[5], std::stoul(argv[6]));
     }

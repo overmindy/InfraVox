@@ -70,13 +70,18 @@ imports are retained as `lm-import-*` rather than destroying the old models.
 
 64 full FP32 Temporal K/V caches alone are ~2.93 GiB. All model weights plus
 all graph I/O buffers resident at once would exceed many phone memory budgets.
-The initial implementation loads, executes and frees one LM graph/context at
-a time. The host retains only the written prefix of each cache and restores
+Version 2.2 loaded, composed, finalized, executed and freed every LM graph
+on every frame. Version 2.3 retains frontend, head and all eight DepFormer
+graphs inside the session; Temporal contexts remain paged but are restored
+from device-local serialized finalized contexts after their first use.
+The host retains only the written prefix of each cache and restores
 it into a zero-filled full ABI tensor before the next call. For two frames,
 the persistent Temporal cache is ~2 MiB, not ~3 GiB. Each active Temporal graph
 still has ~375 MiB full input/output cache buffers, plus model/preparation
 memory. At 3000 frames the retained prefix reaches the full cache size.
-This trades very large model-load latency for lower peak memory; it still
+Paging bounds the large Temporal graph I/O allocations; context caching
+avoids repeating expensive graph preparation. The first run still builds the
+cache and needs extra disk space. It still
 needs substantial available native memory and is **not real-time**.
 It does not promise compatibility with low-memory devices or arbitrary HTPs.
 Use QAIRT 2.45-compatible HTP libraries and the previously tested phone family.
@@ -159,12 +164,15 @@ key/value, `output_3/4` -> layer-1 key/value. `PagedMoshiLm::step` uses this
 explicit mapping only for that shard; all other shards use their semantic
 output names. No runtime output-order guessing is performed.
 
-On-phone follow-up: after correcting directory/file permissions, the app itself
-verified all 26 LM file hashes and successfully prepared the default-directory
-Mimi pair. The first two-frame execution attempt stopped at the 0_1 numbered
-output mismatch described above. Version `2.2-model-permissions` fixes that
-mapping and is built/signed, but its installation was rejected by the device's
-USB installation confirmation. Full-chain phone execution is not yet passed.
+On-phone follow-up: version `2.2-model-permissions` was installed and completed
+Encoder -> 26 LM graphs -> Decoder for two input frames, producing one 80 ms
+audio frame. App-reported run time was 565.72 seconds: this is a smoke pass,
+not a real-time implementation. Text token 3 and first audio token 1049 match
+the deterministic initial upstream frame; the other seven phone audio tokens
+have not been compared against matching-input references. The separate remote
+two-frame full LM chain passed text/audio token parity against FP32 and BF16,
+with quantized-vs-FP32 text/audio logit relative RMS about 1.159% / 1.005%.
+See `MOSHI_PERFORMANCE.md` for lifecycle changes and new measurement boundaries.
 
 Use the environment documented in `README.md`, then preserve the existing
 signing key if upgrading an installed demo (never uninstall just to bypass a
@@ -221,5 +229,5 @@ accepted as evidence of correct scheduling.
 Then separately check APK build/signature, local 26-file hashes, phone graph
 load/execute, two-frame tensors/tokens against references, and actual audio.
 If a phone failure occurs, identify the first graph name in native logs; do
-not replace the whole bundle. The ongoing remote full LM chain is a separate
+not replace the whole bundle. The completed remote two-frame full LM chain is a separate
 reference test and does not include Mimi encoder/decoder or host delay-ring.

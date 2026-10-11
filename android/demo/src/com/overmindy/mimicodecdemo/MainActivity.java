@@ -11,6 +11,8 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
+import android.media.AudioTrack;
+import android.media.AudioAttributes;
 import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.net.Uri;
@@ -72,8 +74,13 @@ public final class MainActivity extends Activity {
     private Button outputButton;
     private Button exportButton;
     private Switch moshiMode;
+    private Switch streamPlayback;
+    private Switch htpPerformance;
+    private AudioTrack streamTrack; // Worker thread owns creation/write/release.
+    private int streamedSamples;
     private EditText lmFrameLimit;
     private File selectedEncoder, selectedDecoder, selectedLm;
+    private File contextCacheDirectory;
     private boolean localLmVerified;
     private Button scanModelsButton;
     private MediaPlayer player;
@@ -83,9 +90,9 @@ public final class MainActivity extends Activity {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     private static native long nativePrepare(String libraryDir, String encoderDlc,
-                                             String decoderDlc, String lmDirectory);
+                                             String decoderDlc, String lmDirectory, String cacheDirectory);
     private static native int nativeRunPrepared(long handle, String inputWav,
-                                                 String outputWav, int frames);
+                                                 String outputWav, int frames, MainActivity receiver, boolean highPerformance);
     private static native void nativeRelease(long handle);
 
     static {
@@ -95,6 +102,9 @@ public final class MainActivity extends Activity {
     @Override
     public void onCreate(Bundle state) {
         super.onCreate(state);
+        contextCacheDirectory = getExternalFilesDir("qnn-context-v1");
+        if (contextCacheDirectory == null) contextCacheDirectory = new File(getFilesDir(), "qnn-context-v1");
+        contextCacheDirectory.mkdirs();
         getWindow().setStatusBarColor(BACKGROUND);
         getWindow().setNavigationBarColor(BACKGROUND);
         files[PICK_AUDIO] = new File(getFilesDir(), "input.wav");
@@ -140,7 +150,7 @@ public final class MainActivity extends Activity {
             long previous = sessionHandle;
             sessionHandle = 0;
             if (previous != 0) worker.execute(() -> nativeRelease(previous));
-            modelStatus.setText("模式已更换，请重新加载；LM 图在推理时逐个加载");
+            modelStatus.setText("模式已更换，请重新加载；LM 使用常驻小图与本机 context 缓存");
             outputFile().delete(); codesFile().delete();
             refresh();
         });
@@ -160,19 +170,28 @@ public final class MainActivity extends Activity {
 
         LinearLayout result = card(column);
         label(result, "③ 手机本地编码与重建", 19, Color.WHITE, true);
-        label(result, "LM 首次默认只跑 2 帧（160 ms 输入）；逐图加载很慢。可填 2–3000，或 0 跑整段。codec 模式仍跑整段。",
+        label(result, "LM 默认只跑 2 帧（160 ms 输入）。首次建立 context 缓存；后续跳过图编译，小图在会话内常驻。可填 2–3000，或 0 跑整段。",
               14, Color.rgb(176, 193, 210), false);
         lmFrameLimit = new EditText(this);
         lmFrameLimit.setInputType(InputType.TYPE_CLASS_NUMBER);
         lmFrameLimit.setTextColor(Color.WHITE);
         lmFrameLimit.setText("2");
         result.addView(lmFrameLimit);
+        streamPlayback = new Switch(this);
+        streamPlayback.setText("每生成 80 ms 音频立即播放（仍可能有计算间隔）");
+        streamPlayback.setTextColor(Color.WHITE);
+        result.addView(streamPlayback);
+        htpPerformance = new Switch(this);
+        htpPerformance.setText("推理期间请求 HTP 性能档（更耗电，系统温控仍有效）");
+        htpPerformance.setTextColor(Color.WHITE);
+        htpPerformance.setChecked(true);
+        result.addView(htpPerformance);
         runButton = button(result, "运行 QNN Encoder → Decoder", this::runCodec);
         status = label(result, "加载模型并准备音频后可推理", 14,
                        Color.rgb(176, 193, 210), false);
         originalButton = button(result, "▶ 播放原音", () -> play(files[PICK_AUDIO]));
         outputButton = button(result, "▶ 播放重建音频", () -> play(outputFile()));
-        exportButton = button(result, "保存 WAV 与 tokens 到下载目录", this::exportResults);
+        exportButton = button(result, "保存音频、tokens 与性能计时到下载目录", this::exportResults);
 
         LinearLayout tokenCard = card(column);
         label(tokenCard, "④ 每帧的 codec tokens", 19, Color.WHITE, true);
@@ -522,7 +541,7 @@ public final class MainActivity extends Activity {
         if (working || recording || !modelFilesReady()) return;
         working = true;
         final boolean useLm = moshiMode.isChecked();
-        modelStatus.setText("正在加载 Mimi 图；LM 使用逐图加载模式…");
+        modelStatus.setText("正在加载 Mimi 图；LM 使用本机 context 缓存、预算内常驻和共享缓冲…");
         refresh();
         worker.execute(() -> {
             long start = System.nanoTime();
@@ -533,10 +552,10 @@ public final class MainActivity extends Activity {
                 sessionHandle = nativePrepare(getApplicationInfo().nativeLibraryDir,
                         encoderFile().getAbsolutePath(),
                         decoderFile().getAbsolutePath(),
-                        useLm ? lmDirectory().getAbsolutePath() : "");
+                        useLm ? lmDirectory().getAbsolutePath() : "", contextCacheDirectory.getAbsolutePath());
                 double seconds = (System.nanoTime() - start) / 1e9;
                 runOnUiThread(() -> modelStatus.setText(String.format(Locale.US,
-                        useLm ? "Mimi 就绪、LM 文件已检查；LM 图将在推理时加载。准备用时 %.1f 秒"
+                        useLm ? "Mimi 就绪；LM 首次运行建立本机 context 缓存，后续复用。准备用时 %.1f 秒"
                               : "两个 Mimi DLC 已就绪；本次加载用时 %.1f 秒", seconds)));
             } catch (Exception error) {
                 runOnUiThread(() -> modelStatus.setText("加载失败：" + error.getMessage()));
@@ -692,26 +711,50 @@ public final class MainActivity extends Activity {
         codesFile().delete();
         textTokensFile().delete();
         tokens.setText("正在执行 QNN 图…");
-        status.setText(moshiMode.isChecked() ? "正在逐图执行 Encoder → LM → Decoder；每帧可能耗时很长…"
+        status.setText(moshiMode.isChecked() ? "正在流式递进 Encoder → LM → Decoder；首次建立 context 缓存，之后复用…"
                                             : "正在逐帧执行 Encoder → Decoder…");
         working = true;
         refresh();
+        final boolean enableStreamPlayback = moshiMode.isChecked() && streamPlayback.isChecked();
+        final boolean enableHtpPerformance = htpPerformance.isChecked();
         worker.execute(() -> {
             long start = System.nanoTime();
             try {
+                stopStream();
+                streamedSamples = 0;
+                if (enableStreamPlayback) {
+                    int minimum = AudioTrack.getMinBufferSize(SAMPLE_RATE,
+                            AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                    streamTrack = new AudioTrack.Builder()
+                            .setAudioAttributes(new AudioAttributes.Builder()
+                                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                            .setAudioFormat(new AudioFormat.Builder().setSampleRate(SAMPLE_RATE)
+                                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                            .setBufferSizeInBytes(Math.max(minimum, FRAME_SAMPLES * 2 * 4))
+                            .setTransferMode(AudioTrack.MODE_STREAM).build();
+                    streamTrack.play();
+                }
                 int frames = nativeRunPrepared(sessionHandle,
                                        files[PICK_AUDIO].getAbsolutePath(),
-                                       outputFile().getAbsolutePath(), requestedFrames);
+                                       outputFile().getAbsolutePath(), requestedFrames, this, enableHtpPerformance);
+                // Drain only the bounded final playback buffer, not an unbounded queue.
+                long deadline = android.os.SystemClock.uptimeMillis() + 500;
+                while (streamTrack != null && streamTrack.getPlaybackHeadPosition() < streamedSamples
+                        && android.os.SystemClock.uptimeMillis() < deadline) Thread.sleep(10);
+                stopStream();
                 String codeText = readCodes();
                 double seconds = (System.nanoTime() - start) / 1e9;
                 runOnUiThread(() -> {
                     status.setText(String.format(Locale.US,
-                            "推理完成：%d 帧 / %.2f 秒音频；已加载模型推理用时 %.2f 秒（音频时长的 %.2f 倍）",
+                            "推理完成：%d 帧 / %.2f 秒输出音频；本次运行 %.2f 秒，输出 RTF %.2f（小于 1 才达到实时）。详细计时可导出。",
                             frames, frames * 0.08, seconds,
-                            frames * 0.08 / Math.max(seconds, 1e-9)));
+                            seconds / Math.max(frames * 0.08, 1e-9)));
                     tokens.setText(codeText);
                 });
             } catch (Exception error) {
+                stopStream();
                 runOnUiThread(() -> {
                     status.setText("运行失败：" + error.getMessage());
                     tokens.setText("没有生成有效 tokens");
@@ -720,6 +763,27 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> { working = false; refresh(); });
             }
         });
+    }
+
+    // Called on the existing inference worker once per input frame, not UI thread.
+    // A bounded AudioTrack buffer provides backpressure; no unbounded audio queue.
+    private void onNativeFrame(int consumed, int emitted, double milliseconds, short[] pcm) {
+        if (streamTrack != null && pcm.length > 0) {
+            int offset = 0;
+            while (offset < pcm.length) {
+                int count = streamTrack.write(pcm, offset, pcm.length - offset, AudioTrack.WRITE_BLOCKING);
+                if (count <= 0) throw new IllegalStateException("流式音频写入失败：" + count);
+                offset += count;
+            }
+            streamedSamples += pcm.length;
+        }
+        runOnUiThread(() -> status.setText(String.format(Locale.US,
+                "已处理输入 %d 帧，输出 %d 帧；刚完成一帧 %.1f ms。模型与状态继续复用。",
+                consumed, emitted, milliseconds)));
+    }
+
+    private void stopStream() {
+        if (streamTrack != null) { streamTrack.release(); streamTrack = null; }
     }
 
     private String readCodes() throws IOException {
@@ -774,6 +838,7 @@ public final class MainActivity extends Activity {
         recording = false;
         stopPlayer();
         worker.execute(() -> {
+            stopStream();
             long handle = sessionHandle;
             sessionHandle = 0;
             if (handle != 0) nativeRelease(handle);
@@ -794,6 +859,9 @@ public final class MainActivity extends Activity {
                 saveDownload(codesFile(), "mimi-" + suffix + "-tokens.csv", "text/csv");
                 if (moshiMode.isChecked() && textTokensFile().isFile())
                     saveDownload(textTokensFile(), "moshi-" + suffix + "-text-token-ids.csv", "text/csv");
+                File performance = new File(outputFile().getAbsolutePath() + ".performance.csv");
+                if (performance.isFile())
+                    saveDownload(performance, "moshi-" + suffix + "-performance.csv", "text/csv");
                 runOnUiThread(() -> status.setText("已保存到 Downloads/MimiDemo"));
             } catch (Exception error) {
                 runOnUiThread(() -> status.setText("保存失败：" + error.getMessage()));
@@ -828,6 +896,10 @@ public final class MainActivity extends Activity {
     }
 
     private void refresh() {
+        if (working || recording) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (streamPlayback != null) streamPlayback.setEnabled(!working && !recording);
+        if (htpPerformance != null) htpPerformance.setEnabled(!working && !recording);
         scanModelsButton.setEnabled(!working && !recording);
         moshiMode.setEnabled(!working && !recording);
         lmFrameLimit.setEnabled(!working && !recording && moshiMode.isChecked());
