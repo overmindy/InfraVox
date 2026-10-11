@@ -133,16 +133,25 @@ the two copies matched by SHA256 and were preserved. Copies were placed in
 the default `models/mimi/` directory, and the complete LM bundle was copied
 to `models/lm-guarded-v2/`. All 26 on-phone LM hashes passed.
 
-The initial directory UI scan and private-directory Mimi graph loading were
-tested on the phone. Loading the external-storage Mimi file through the SDK
-file API returned `QNN_COMMON_ERROR_MEM_ALLOC` (1002), despite matching file
-hashes, while the private copy loaded successfully. `Graph` now retries this
-specific error with a read-only POSIX mapping and `systemDlcCreateFromBinary`,
-retaining the mapping until the DLC handle is freed. This avoids a separate
-full model copy. This fallback was build-checked but its phone execution is
-still pending: installing that update was rejected while the phone was locked.
-Do not treat transfer/hash checks as proof that external DLC loading or the
-full LM chain has executed successfully.
+The initial external Mimi load returned SDK status 1002. A diagnostic binary
+loader retry exposed the real cause: `open()` returned `Permission denied`.
+ADB-created files belonged to `shell` (UID 2000), with modes 660/640, while the
+app's UID was 10327. Nested `dlc/` directories also needed traverse permission
+(755 rather than 770 owned by shell). After setting model file modes to 644, both Mimi graphs
+loaded through the original file API in 3.4 seconds. The binary retry was
+removed; `Graph` now checks readability before calling the SDK so a permission
+problem is not mistaken for a numerical/model problem. Use the placement tool
+below to fix file modes automatically. The app's parent model directory remains
+app-specific; no broad storage permission is added.
+
+```sh
+bash scripts/moshi_android_model_permissions.sh \
+  /Users/e1ainay/Android/platform-tools/adb
+```
+
+This changes file modes (644) and directory modes (755) only under the two known default model subdirectories
+and checks all 26 LM hashes. It does not transfer, delete or overwrite models.
+Full LM execution remains a separate test from successful Mimi loading.
 
 Use the environment documented in `README.md`, then preserve the existing
 signing key if upgrading an installed demo (never uninstall just to bypass a
