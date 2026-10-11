@@ -2,6 +2,7 @@ package com.overmindy.mimicodecdemo;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -40,6 +41,9 @@ import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.security.MessageDigest;
@@ -69,6 +73,9 @@ public final class MainActivity extends Activity {
     private Button exportButton;
     private Switch moshiMode;
     private EditText lmFrameLimit;
+    private File selectedEncoder, selectedDecoder, selectedLm;
+    private boolean localLmVerified;
+    private Button scanModelsButton;
     private MediaPlayer player;
     private boolean working;
     private volatile boolean recording;
@@ -93,6 +100,10 @@ public final class MainActivity extends Activity {
         files[PICK_AUDIO] = new File(getFilesDir(), "input.wav");
         files[PICK_ENCODER] = new File(getFilesDir(), "mimi_encoder.dlc");
         files[PICK_DECODER] = new File(getFilesDir(), "mimi_decoder.dlc");
+        defaultModelsDirectory();
+        selectedEncoder = rememberedModel("encoder");
+        selectedDecoder = rememberedModel("decoder");
+        selectedLm = rememberedModel("lm");
 
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -112,6 +123,12 @@ public final class MainActivity extends Activity {
         label(steps, "① 导入并加载模型", 19, Color.WHITE, true);
         label(steps, "两个 DLC 只需导入一次。点击加载，等 QNN 图就绪后再录音或推理。",
               14, Color.rgb(176, 193, 210), false);
+        label(steps, "默认模型目录（ADB 直接放入，无需重复导入）：\n"
+              + defaultModelsDirectory().getAbsolutePath()
+              + "\nMimi：同一子目录放 mimi_encoder.dlc 与 mimi_decoder.dlc。"
+              + "\nLM：子目录内放 dlc_inventory.json 与 dlc/。", 13,
+              Color.rgb(176, 193, 210), false);
+        scanModelsButton = button(steps, "扫描默认目录并选择模型", this::chooseDefaultModels);
         button(steps, "导入 Encoder DLC", () -> pick(PICK_ENCODER));
         button(steps, "导入 Decoder DLC", () -> pick(PICK_DECODER));
         button(steps, "导入完整 LM 模型目录（26 DLC + inventory）", this::pickLm);
@@ -163,20 +180,164 @@ public final class MainActivity extends Activity {
               14, Color.rgb(176, 193, 210), false);
         tokens = label(tokenCard, "运行后显示编码结果", 13, ACCENT, false);
         tokens.setTypeface(Typeface.MONOSPACE);
-        if (files[PICK_ENCODER].isFile() && files[PICK_DECODER].isFile()) {
-            modelStatus.setText("DLC 已导入；点击加载两个 DLC 到 QNN");
+        if (encoderFile().isFile() && decoderFile().isFile()) {
+            modelStatus.setText("已有 Mimi：\n" + encoderFile().getAbsolutePath()
+                + "\n" + decoderFile().getAbsolutePath() + "\n点击加载即可");
         }
         if (files[PICK_AUDIO].isFile()) audioStatus.setText("已有输入音频，可直接推理");
         refresh();
         scroll.setFocusableInTouchMode(true);
         scroll.requestFocus();
         scroll.post(() -> scroll.scrollTo(0, 0));
+        if (selectedLm != null) verifyLocalLm(selectedLm);
     }
 
     private File outputFile() { return new File(getFilesDir(), "reconstructed.wav"); }
     private File codesFile() { return new File(getFilesDir(), "reconstructed.wav.codes.txt"); }
     private File textTokensFile() { return new File(getFilesDir(), "reconstructed.wav.text_tokens.txt"); }
-    private File lmDirectory() { return new File(getFilesDir(), "moshi-lm"); }
+    private File lmDirectory() {
+        return selectedLm != null ? selectedLm : new File(getFilesDir(), "moshi-lm");
+    }
+    private File encoderFile() { return selectedEncoder != null ? selectedEncoder : files[PICK_ENCODER]; }
+    private File decoderFile() { return selectedDecoder != null ? selectedDecoder : files[PICK_DECODER]; }
+
+    private File defaultModelsDirectory() {
+        File root = getExternalFilesDir("models");
+        if (root == null) root = new File(getFilesDir(), "models");
+        root.mkdirs();
+        return root;
+    }
+
+    private File rememberedModel(String key) {
+        String value = getPreferences(MODE_PRIVATE).getString("model_" + key, "");
+        if (value.isEmpty()) return null;
+        File path = new File(value);
+        try {
+            String candidate = path.getCanonicalPath();
+            String root = defaultModelsDirectory().getCanonicalPath();
+            if ((candidate.startsWith(root + "/") || (key.equals("lm") && candidate.equals(root)))
+                    && path.exists()) return path;
+        } catch (IOException ignored) { }
+        return null;
+    }
+
+    private void releaseSelectedSession() {
+        long previous = sessionHandle; sessionHandle = 0;
+        if (previous != 0) worker.execute(() -> nativeRelease(previous));
+    }
+
+    private void chooseDefaultModels() {
+        if (working || recording) return;
+        File root = defaultModelsDirectory();
+        ArrayList<File> folders = new ArrayList<>(); folders.add(root);
+        File[] children = root.listFiles(File::isDirectory);
+        if (children != null) {
+            Arrays.sort(children, Comparator.comparing(File::getName));
+            folders.addAll(Arrays.asList(children));
+        }
+        ArrayList<String> labels = new ArrayList<>();
+        ArrayList<Runnable> choices = new ArrayList<>();
+        if (files[PICK_ENCODER].isFile() && files[PICK_DECODER].isFile()) {
+            labels.add("Mimi：之前导入的私有模型");
+            choices.add(() -> selectMimi(null, null));
+        }
+        File privateLm = new File(getFilesDir(), "moshi-lm");
+        if (new File(privateLm, "READY").isFile()) {
+            labels.add("LM：之前导入的私有模型");
+            choices.add(() -> {
+                releaseSelectedSession(); selectedLm = null; localLmVerified = false;
+                getPreferences(MODE_PRIVATE).edit().remove("model_lm").apply();
+                modelStatus.setText("已选择私有 LM，请重新加载"); refresh();
+            });
+        }
+        for (File folder : folders) {
+            File encoder = new File(folder, "mimi_encoder.dlc");
+            File decoder = new File(folder, "mimi_decoder.dlc");
+            if (encoder.isFile() && encoder.length() > 0 && decoder.isFile() && decoder.length() > 0) {
+                labels.add("Mimi：" + folder.getName());
+                choices.add(() -> selectMimi(encoder, decoder));
+            }
+            if (new File(folder, "dlc_inventory.json").isFile() && new File(folder, "dlc").isDirectory()) {
+                labels.add("LM：" + folder.getName() + "（校验后直接使用）");
+                choices.add(() -> verifyLocalLm(folder));
+            }
+        }
+        if (labels.isEmpty()) {
+            status.setText("没有发现模型。请放入：\n" + root.getAbsolutePath()); return;
+        }
+        new AlertDialog.Builder(this).setTitle("选择 Mimi 或 LM；可分别选择")
+            .setItems(labels.toArray(new String[0]), (dialog, which) -> choices.get(which).run())
+            .setNegativeButton("取消", null).show();
+    }
+
+    private void selectMimi(File encoder, File decoder) {
+        releaseSelectedSession(); selectedEncoder = encoder; selectedDecoder = decoder;
+        getPreferences(MODE_PRIVATE).edit()
+            .putString("model_encoder", encoder == null ? "" : encoder.getAbsolutePath())
+            .putString("model_decoder", decoder == null ? "" : decoder.getAbsolutePath()).apply();
+        modelStatus.setText("已选择 Mimi：\n" + encoderFile().getAbsolutePath()
+            + "\n" + decoderFile().getAbsolutePath() + "\n请点击加载");
+        refresh();
+    }
+
+    private void verifyLocalLm(File folder) {
+        if (working || recording) return;
+        releaseSelectedSession(); working = true; localLmVerified = false; refresh();
+        status.setText("正在校验默认目录中的 26 个 LM DLC（不复制文件）…");
+        worker.execute(() -> {
+            try {
+                File root = defaultModelsDirectory().getCanonicalFile();
+                File canonical = folder.getCanonicalFile();
+                if (!canonical.equals(root) && !canonical.getPath().startsWith(root.getPath() + "/"))
+                    throw new IOException("LM 目录必须位于默认模型目录内");
+                File inventoryFile = new File(canonical, "dlc_inventory.json");
+                if (inventoryFile.length() > 1024 * 1024) throw new IOException("模型清单过大");
+                byte[] bytes;
+                try (InputStream input = new FileInputStream(inventoryFile);
+                     ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                    byte[] buffer = new byte[8192]; int count;
+                    while ((count = input.read(buffer)) != -1) {
+                        output.write(buffer, 0, count);
+                        if (output.size() > 1024 * 1024) throw new IOException("模型清单过大");
+                    }
+                    bytes = output.toByteArray();
+                }
+                JSONObject inventory = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
+                JSONObject graphs = inventory.getJSONObject("graphs");
+                if (!inventory.getBoolean("all_graphs_verified") || graphs.length() != 26)
+                    throw new IOException("需要完整的 26 图验证清单");
+                ArrayList<String> names = new ArrayList<>(); names.add("frontend"); names.add("head");
+                for (int i = 0; i < 32; i += 2) names.add("temporal_layers_" + i + "_" + (i+1));
+                for (int i = 0; i < 8; i++) names.add("depformer_codebook_" + i);
+                for (int i = 0; i < names.size(); i++) {
+                    String name = names.get(i); JSONObject graph = graphs.getJSONObject(name);
+                    String relative = "dlc/" + name + ".dlc";
+                    if (!relative.equals(graph.getString("file"))) throw new IOException("模型路径不匹配：" + name);
+                    File model = new File(canonical, relative);
+                    if (!model.getCanonicalPath().startsWith(canonical.getPath() + "/")
+                            || !model.isFile() || model.length() == 0) throw new IOException("模型缺失：" + name);
+                    final int index = i + 1;
+                    runOnUiThread(() -> status.setText("校验 " + index + "/26：" + name));
+                    MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                    try (InputStream input = new FileInputStream(model)) {
+                        byte[] buffer = new byte[1024 * 1024]; int count;
+                        while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+                    }
+                    StringBuilder hex = new StringBuilder();
+                    for (byte b : digest.digest()) hex.append(String.format(Locale.US, "%02x", b & 255));
+                    if (!hex.toString().equals(graph.getString("sha256"))) throw new IOException("SHA256 不匹配：" + name);
+                }
+                runOnUiThread(() -> {
+                    selectedLm = canonical; localLmVerified = true;
+                    getPreferences(MODE_PRIVATE).edit().putString("model_lm", canonical.getAbsolutePath()).apply();
+                    modelStatus.setText("LM 26 文件校验通过，直接使用：\n" + canonical.getAbsolutePath());
+                    status.setText("模型已选择；无需重复导入。请点击加载。");
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> status.setText("LM 校验失败：" + error.getMessage()));
+            } finally { runOnUiThread(() -> { working = false; refresh(); }); }
+        });
+    }
 
     private void pickLm() {
         if (working || recording) return;
@@ -201,6 +362,13 @@ public final class MainActivity extends Activity {
         if (result != RESULT_OK || data == null || data.getData() == null ||
             request < PICK_AUDIO || request > PICK_DECODER) return;
         Uri uri = data.getData();
+        if (request == PICK_ENCODER) {
+            selectedEncoder = null;
+            getPreferences(MODE_PRIVATE).edit().remove("model_encoder").apply();
+        } else if (request == PICK_DECODER) {
+            selectedDecoder = null;
+            getPreferences(MODE_PRIVATE).edit().remove("model_decoder").apply();
+        }
         doCopy(() -> getContentResolver().openInputStream(uri), files[request],
                request == PICK_AUDIO ? "音频已导入" : "DLC 已导入");
     }
@@ -287,13 +455,16 @@ public final class MainActivity extends Activity {
                     out.write("26 DLC SHA256 verified\n".getBytes(StandardCharsets.UTF_8));
                 }
                 File old = new File(getFilesDir(), "lm-previous-" + System.currentTimeMillis());
-                boolean hadOld = lmDirectory().exists();
-                if (hadOld && !lmDirectory().renameTo(old)) throw new IOException("无法保留原模型目录");
-                if (!incoming.renameTo(lmDirectory())) {
-                    if (hadOld && !old.renameTo(lmDirectory())) throw new IOException("切换失败；原模型保留在 " + old);
+                File privateTarget = new File(getFilesDir(), "moshi-lm");
+                boolean hadOld = privateTarget.exists();
+                if (hadOld && !privateTarget.renameTo(old)) throw new IOException("无法保留原模型目录");
+                if (!incoming.renameTo(privateTarget)) {
+                    if (hadOld && !old.renameTo(privateTarget)) throw new IOException("切换失败；原模型保留在 " + old);
                     throw new IOException("无法切换模型目录");
                 }
                 runOnUiThread(() -> {
+                    selectedLm = null; localLmVerified = false;
+                    getPreferences(MODE_PRIVATE).edit().remove("model_lm").apply();
                     moshiMode.setChecked(true);
                     modelStatus.setText("26 个 LM DLC 校验完成；原模型（如有）已保留。请加载模型后运行短音频");
                 });
@@ -360,8 +531,8 @@ public final class MainActivity extends Activity {
                 sessionHandle = 0;
                 if (previous != 0) nativeRelease(previous);
                 sessionHandle = nativePrepare(getApplicationInfo().nativeLibraryDir,
-                        files[PICK_ENCODER].getAbsolutePath(),
-                        files[PICK_DECODER].getAbsolutePath(),
+                        encoderFile().getAbsolutePath(),
+                        decoderFile().getAbsolutePath(),
                         useLm ? lmDirectory().getAbsolutePath() : "");
                 double seconds = (System.nanoTime() - start) / 1e9;
                 runOnUiThread(() -> modelStatus.setText(String.format(Locale.US,
@@ -651,11 +822,13 @@ public final class MainActivity extends Activity {
     }
 
     private boolean modelFilesReady() {
-        return files[PICK_ENCODER].isFile() && files[PICK_DECODER].isFile()
-                && (!moshiMode.isChecked() || new File(lmDirectory(), "READY").isFile());
+        return encoderFile().isFile() && decoderFile().isFile()
+                && (!moshiMode.isChecked() || (selectedLm != null ? localLmVerified
+                    : new File(lmDirectory(), "READY").isFile()));
     }
 
     private void refresh() {
+        scanModelsButton.setEnabled(!working && !recording);
         moshiMode.setEnabled(!working && !recording);
         lmFrameLimit.setEnabled(!working && !recording && moshiMode.isChecked());
         loadButton.setText(moshiMode.isChecked() ? "准备 Mimi + Moshi LM" : "加载两个 Mimi DLC 到 QNN");

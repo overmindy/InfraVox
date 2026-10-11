@@ -98,6 +98,52 @@ Greedy decoding and a short numerical check do not establish speech quality.
 
 ## Build and use
 
+### Default on-phone model directory (no repeated import)
+
+The app creates its own external files directory, without requesting broad
+storage access:
+
+```text
+/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/
+  mimi/
+    mimi_encoder.dlc
+    mimi_decoder.dlc
+  lm-guarded-v2/
+    dlc_inventory.json
+    dlc/                          # all 26 DLCs
+```
+
+Use **扫描默认目录并选择模型** to select the Mimi pair and the LM bundle
+separately. The app scans the root and its immediate child directories and
+loads these files in place; it does not copy the 12 GB bundle into private
+storage again. Selected paths are remembered. The selected LM bundle is
+SHA256-checked on selection and again when the app is recreated before it can
+be used; changing files while a native session is running is unsupported.
+Old SAF import buttons and previously imported private models remain usable.
+
+After installation and opening the app once, populate this directory with
+`adb push`. Some Android file managers cannot browse `Android/data`; that is
+an Android restriction, not a missing storage permission. ADB is the reliable
+placement method. Uninstalling the app deletes its app-specific models, so
+retain the verified local bundle and upgrade with `adb install -r`.
+
+For this BKQ-AN20 phone, existing Mimi files were found in both
+`/sdcard/Download/MimiDemo/` and `/data/local/tmp/moshi-mimi-codec-v1/`;
+the two copies matched by SHA256 and were preserved. Copies were placed in
+the default `models/mimi/` directory, and the complete LM bundle was copied
+to `models/lm-guarded-v2/`. All 26 on-phone LM hashes passed.
+
+The initial directory UI scan and private-directory Mimi graph loading were
+tested on the phone. Loading the external-storage Mimi file through the SDK
+file API returned `QNN_COMMON_ERROR_MEM_ALLOC` (1002), despite matching file
+hashes, while the private copy loaded successfully. `Graph` now retries this
+specific error with a read-only POSIX mapping and `systemDlcCreateFromBinary`,
+retaining the mapping until the DLC handle is freed. This avoids a separate
+full model copy. This fallback was build-checked but its phone execution is
+still pending: installing that update was rejected while the phone was locked.
+Do not treat transfer/hash checks as proof that external DLC loading or the
+full LM chain has executed successfully.
+
 Use the environment documented in `README.md`, then preserve the existing
 signing key if upgrading an installed demo (never uninstall just to bypass a
 signature mismatch; that would erase its imported models):

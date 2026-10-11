@@ -2,6 +2,11 @@
 // Uses the QAIRT 2.45 public QNN interfaces. Each graph owns its streaming state.
 
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
 
 #include <algorithm>
 #include <array>
@@ -190,8 +195,34 @@ class Graph {
     try {
     check(runtime_.qnn.contextCreate(runtime_.backend, runtime_.device, nullptr, &context_),
           "contextCreate " + dlcPath);
-    check(runtime_.system.systemDlcCreateFromFile(nullptr, dlcPath.c_str(), &dlc_),
-          "systemDlcCreateFromFile " + dlcPath);
+    const auto fileStatus = runtime_.system.systemDlcCreateFromFile(nullptr, dlcPath.c_str(), &dlc_);
+    if (fileStatus == QNN_COMMON_ERROR_MEM_ALLOC && runtime_.system.systemDlcCreateFromBinary) {
+      // Retry a read-only mapping for SDK file-loader failures on external storage.
+      // The binary buffer must stay alive until the DLC handle has been freed.
+      std::cerr << "DLC file loader returned " << fileStatus
+                << "; retrying read-only mapped binary: " << dlcPath << '\n';
+      if (dlc_) { runtime_.system.systemDlcFree(dlc_); dlc_ = nullptr; }
+      const int fd = open(dlcPath.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd < 0) throw std::runtime_error("Cannot open DLC: " + dlcPath + ": " + std::strerror(errno));
+      struct stat info{};
+      if (fstat(fd, &info) != 0 || info.st_size <= 0 ||
+          static_cast<uint64_t>(info.st_size) > SIZE_MAX) {
+        close(fd); throw std::runtime_error("Invalid DLC size: " + dlcPath);
+      }
+      mappedSize_ = static_cast<size_t>(info.st_size);
+      mappedDlc_ = mmap(nullptr, mappedSize_, PROT_READ, MAP_PRIVATE, fd, 0);
+      const int mapError = errno;
+      close(fd);
+      if (mappedDlc_ == MAP_FAILED) {
+        mappedDlc_ = nullptr;
+        throw std::runtime_error("Cannot map DLC: " + dlcPath + ": " + std::strerror(mapError));
+      }
+      check(runtime_.system.systemDlcCreateFromBinary(nullptr,
+                static_cast<const uint8_t*>(mappedDlc_), mappedSize_, &dlc_),
+            "systemDlcCreateFromBinary " + dlcPath);
+    } else {
+      check(fileStatus, "systemDlcCreateFromFile " + dlcPath);
+    }
     uint32_t count = 0;
     check(runtime_.system.systemDlcComposeGraphs(
               dlc_, nullptr, 0, runtime_.backend, context_, runtime_.provider(),
@@ -226,6 +257,7 @@ class Graph {
     if (context_ && runtime_.qnn.contextFree) runtime_.qnn.contextFree(context_, nullptr);
     if (graphs_) std::free(graphs_);
     if (dlc_ && runtime_.system.systemDlcFree) runtime_.system.systemDlcFree(dlc_);
+    if (mappedDlc_) munmap(mappedDlc_, mappedSize_);
   }
 
  public:
@@ -317,6 +349,8 @@ class Graph {
   Runtime& runtime_;
   Qnn_ContextHandle_t context_ = nullptr;
   QnnSystemDlc_Handle_t dlc_ = nullptr;
+  void* mappedDlc_ = nullptr;
+  size_t mappedSize_ = 0;
   QnnSystemContext_GraphInfo_t* graphs_ = nullptr;
   Qnn_GraphHandle_t graph_ = nullptr;
   std::string name_;
