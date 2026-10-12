@@ -322,6 +322,29 @@ class Runtime {
   bool hasPowerConfig_ = false;
 };
 
+// Independent deserialization experiments: binary storage remains mapped until
+// contextFree; initialization and graph execution stay serial in this runner.
+struct ContextRestoreOptions {
+  QnnHtpContext_CustomConfig_t accelerated{};
+  QnnContext_Config_t acceleration{}, persistent{};
+  std::vector<const QnnContext_Config_t*> values;
+  ContextRestoreOptions() {
+    if (enabledEnvironment("MOSHI_CONTEXT_INIT_ACCELERATION")) {
+      accelerated.option = QNN_HTP_CONTEXT_CONFIG_OPTION_INIT_ACCELERATION;
+      accelerated.initAcceleration = true;
+      acceleration.option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
+      acceleration.customConfig = &accelerated;
+      values.push_back(&acceleration);
+    }
+    if (enabledEnvironment("MOSHI_CONTEXT_PERSISTENT_BINARY")) {
+      persistent.option = QNN_CONTEXT_CONFIG_PERSISTENT_BINARY;
+      persistent.isPersistentBinary = 1;
+      values.push_back(&persistent);
+    }
+    if (!values.empty()) values.push_back(nullptr);
+  }
+};
+
 class Graph {
  public:
   Graph(Runtime& runtime, const std::string& dlcPath, const std::string& cachePath = "",
@@ -422,7 +445,10 @@ class Graph {
         graphInfo.graphName = g.graphName; graphInfo.graphInputs = g.graphInputs; graphInfo.numGraphInputs = g.numGraphInputs;
         graphInfo.graphOutputs = g.graphOutputs; graphInfo.numGraphOutputs = g.numGraphOutputs;
       } else throw std::runtime_error("Unsupported cached graph metadata");
-      check(runtime_.qnn.contextCreateFromBinary(runtime_.backend, runtime_.device, nullptr, binary_.data, binary_.size, &context_, nullptr), "contextCreateFromBinary");
+      ContextRestoreOptions options;
+      check(runtime_.qnn.contextCreateFromBinary(runtime_.backend, runtime_.device,
+          options.values.empty() ? nullptr : options.values.data(), binary_.data, binary_.size,
+          &context_, nullptr), "contextCreateFromBinary");
       name_ = graphInfo.graphName;
       check(runtime_.qnn.graphRetrieve(context_, name_.c_str(), &graph_), "cached graphRetrieve");
       prepare(graphInfo.graphInputs, graphInfo.numGraphInputs, inputs_, inputTensors_, "input");
