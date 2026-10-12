@@ -38,8 +38,11 @@ backend guarantees and a device correctness test.
 - Existing real 6_7 guarded model, clean-000 frame 0 and 1: 1000-slot scatter
   CPU ORT hidden and retained cache outputs exactly equal the 3000-slot source.
 - Host ring C++ unit test passes. These are state-storage tests, not model tests.
-- Full-cache scatter DLC conversion and delta-output CPU comparison were started
-  on the remote host. A started job is not a successful conversion or HTP test.
+- Delta-output CPU ORT comparison also passed: hidden and newly written K/V
+  slots match the original guarded QDQ model exactly at clean-000 frames 0/1.
+  These are independent captured-input probes, not a recurrent chain test.
+- Full-cache scatter DLC conversion was started on the remote host. A started
+  job is not a successful conversion or HTP test.
 - 1000 slots correspond to about 80 seconds at 12.5 frames/s. After wrap, this
   model intentionally has a shorter history than the original 3000-slot model.
   Early-frame parity does not prove long-context quality or wrap correctness.
