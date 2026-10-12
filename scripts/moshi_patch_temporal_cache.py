@@ -15,7 +15,7 @@ import onnx
 from onnx import helper, numpy_helper
 
 
-def patch(model, capacity, update, cache_output="full"):
+def patch(model, capacity, update, cache_output="full", scatter_encoding="source"):
     result = copy.deepcopy(model)
     cache_inputs = [v for v in result.graph.input if v.name.startswith("layer_")]
     if len(cache_inputs) != 4:
@@ -66,6 +66,25 @@ def patch(model, capacity, update, cache_output="full"):
             if len(mods) != 1:
                 raise ValueError("Expected position modulo capacity")
             tag = "cache_scatter_" + str(len(replaced))
+            scatter_data, scatter_update = node.input[2], node.input[1]
+            if scatter_encoding == "aligned":
+                quantizers = [n for n in result.graph.node if n.op_type == "QuantizeLinear"
+                              and n.input[0] == node.output[0]]
+                if len(quantizers) != 1:
+                    raise ValueError("Expected one cache output quantizer for encoding alignment")
+                encoding = list(quantizers[0].input[1:])
+                if len(encoding) != 2:
+                    raise ValueError("Expected explicit cache output scale and zero point")
+                # A scatter copies quantized payloads. Explicitly requantize
+                # both cache and new values to its OUTPUT encoding beforehand.
+                # This keeps all weight encodings untouched.
+                for label, value in (("data", scatter_data), ("update", scatter_update)):
+                    name = tag + "_aligned_" + label
+                    nodes.extend([
+                        helper.make_node("QuantizeLinear", [value, *encoding], [name + "_q"], name=name + "_quantize"),
+                        helper.make_node("DequantizeLinear", [name + "_q", *encoding], [name], name=name + "_dequantize"),
+                    ])
+                scatter_data, scatter_update = tag + "_aligned_data", tag + "_aligned_update"
             result.graph.initializer.extend([
                 numpy_helper.from_array(np.array([1, 1, 1, 1], np.int64), tag + "_scalar_shape"),
                 numpy_helper.from_array(np.array([1, 32, 1, 128], np.int64), tag + "_index_shape"),
@@ -74,7 +93,7 @@ def patch(model, capacity, update, cache_output="full"):
                 helper.make_node("Cast", [mods[0].output[0]], [tag + "_slot"], to=onnx.TensorProto.INT64),
                 helper.make_node("Reshape", [tag + "_slot", tag + "_scalar_shape"], [tag + "_index_scalar"]),
                 helper.make_node("Expand", [tag + "_index_scalar", tag + "_index_shape"], [tag + "_indices"]),
-                helper.make_node("ScatterElements", [node.input[2], tag + "_indices", node.input[1]],
+                helper.make_node("ScatterElements", [scatter_data, tag + "_indices", scatter_update],
                                  list(node.output), name=tag, axis=2),
             ])
             replaced.append(node.name)
@@ -105,6 +124,7 @@ def patch(model, capacity, update, cache_output="full"):
             output.type.tensor_type.shape.dim[2].dim_value = 1
     return result, {"old_capacity": old, "capacity": capacity, "update": update,
                     "cache_output": cache_output,
+                    "scatter_encoding": scatter_encoding,
                     "changed_constants": changes, "replaced_where": replaced,
                     "in_place_runtime_verified": False}
 
@@ -116,11 +136,20 @@ def main():
     parser.add_argument("--capacity", type=int, default=1000)
     parser.add_argument("--update", choices=("scatter", "where"), default="scatter")
     parser.add_argument("--cache-output", choices=("full", "delta"), default="full")
+    parser.add_argument("--scatter-encoding", choices=("source", "aligned"), default="aligned",
+                        help="source is diagnostic; aligned requantizes Scatter I/O to a common encoding")
     parser.add_argument("--samples", nargs="*", type=Path, default=[])
+    parser.add_argument("--validate-existing", action="store_true",
+                        help="Validate an existing identical candidate without rewriting its model")
     args = parser.parse_args()
     source = onnx.load(str(args.model), load_external_data=False)
-    changed, report = patch(source, args.capacity, args.update, args.cache_output)
-    args.output_dir.mkdir(parents=True, exist_ok=False)
+    changed, report = patch(source, args.capacity, args.update, args.cache_output, args.scatter_encoding)
+    if args.validate_existing:
+        existing = onnx.load(str(args.output_dir / "model.onnx"), load_external_data=False)
+        if existing.SerializeToString() != changed.SerializeToString():
+            raise ValueError("Existing candidate differs from requested patch")
+    else:
+        args.output_dir.mkdir(parents=True, exist_ok=False)
     for tensor in source.graph.initializer:
         metadata = {entry.key: entry.value for entry in tensor.external_data}
         if "location" not in metadata:
@@ -133,7 +162,8 @@ def main():
         if not target.exists():
             os.link(args.model.parent / rel, target)
     destination = args.output_dir / "model.onnx"
-    onnx.save(changed, str(destination))
+    if not args.validate_existing:
+        onnx.save(changed, str(destination))
     onnx.checker.check_model(str(destination))
     report["samples"] = []
     if args.samples:
@@ -154,15 +184,27 @@ def main():
             expected = original.run(None, feed)
             actual = modified.run(None, smaller)
             metrics = {}
+            tolerances = {}
             for output, got, ref in zip(original.get_outputs(), actual, expected):
                 if output.name.startswith("output_layer_"):
                     ref = (ref[:, :, position:position + 1, :] if args.cache_output == "delta"
                            else ref[:, :, :args.capacity, :])
                 if not np.isfinite(got).all():
                     raise ValueError(f"Nonfinite {output.name}")
-                np.testing.assert_allclose(got, ref, rtol=2e-4, atol=2e-5)
+                atol = 2e-5
+                if args.scatter_encoding == "aligned" and output.name.startswith("output_layer_"):
+                    scales = [v for v in source.graph.initializer if v.name == output.name + "_scale"]
+                    if len(scales) != 1:
+                        raise ValueError("Cannot establish output cache quantization LSB")
+                    # Explicit Q/DQ introduces an extra float rounding boundary:
+                    # allow at most one existing output quantization step, never
+                    # a broad percentage tolerance that masks scale/offset bugs.
+                    atol = max(atol, 1.1 * float(numpy_helper.to_array(scales[0]).max()))
+                np.testing.assert_allclose(got, ref, rtol=2e-4, atol=atol)
                 metrics[output.name] = float(np.max(np.abs(got - ref)))
-            report["samples"].append({"sample": str(sample), "position": position, "max_abs": metrics})
+                tolerances[output.name] = atol
+            report["samples"].append({"sample": str(sample), "position": position,
+                                      "max_abs": metrics, "allowed_absolute_error": tolerances})
     report["passed"] = True
     (args.output_dir / "patch_report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2), flush=True)

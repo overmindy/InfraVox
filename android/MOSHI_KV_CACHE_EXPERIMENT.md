@@ -67,3 +67,50 @@ no re-download or weight requantization. Patch output directories must be new.
    position absolute. Use a small operator/state test first; then real-model test.
 6. Make runner capacity manifest-driven, integrate delta ABI and registered
    buffers, then test the complete LM/Mimi chain before replacing app models.
+
+## Official references and HTP checkpoint (2026-10-12)
+
+The pinned Moshi `external_repos/moshi/moshi/moshi/modules/transformer.py`
+defines `RingKVCache.complete`: preallocate cache, modulo slot indices, and
+`scatter_` / `index_copy_` the new K/V. Its absolute-position bookkeeping is
+independent of physical slot order. `scripts/moshi_test_ring_cache_reference.py`
+tests the actual upstream classes against our slot/mask formulas. Positions
+0, 1, 998, 999, 1000, 1001 and reset pass at capacity 1000. This is a state unit
+test, not a 1000-frame full-model accuracy test.
+
+The Qualcomm implementation `templates/llm/sha_dynamic_kvcache.py` already
+returns new K/V values only, leaving accumulation to the caller. This is a useful
+local reference for the delta-output ABI, not an interchangeable Moshi cache.
+
+The initial UNALIGNED Scatter DLC successfully composed/executed on the phone
+and retained four ScatterElements ops in DLC info. Adjacent no-profile warm
+medians were 131.336 ms (3000/Where) and 42.9319 ms (1000/Scatter). However its
+HTP accuracy FAILED: hidden relative RMS 0.02089; written cache relative RMS
+0.454, 6.152, 0.829, 14.509 vs guarded QDQ CPU. These timings are diagnostic,
+not validated deployment speedups. It must not replace app models.
+
+The cache input, new K/V update and output use DIFFERENT quantization encodings.
+For layer_6_value an example newly written value is about 0.0021. Quantizing
+with update scale 0.00035295 / zero point 31285 yields integer 31291. Copying
+that integer and decoding with output scale 0.000055024710 / zero point 32768
+yields -0.08127149667, matching the observed HTP -0.0812714994. This strongly
+indicates unaligned encoded-payload copying, not harmless FP16 roundoff.
+
+The patch now defaults to `--scatter-encoding aligned`: explicit Q/DQ converts
+both data and updates into the EXISTING output encoding before Scatter. No
+weight encoding is changed. `--scatter-encoding source` retains the failing
+diagnostic construction for reproducibility. The aligned candidate passed
+captured-input CPU checks at frame 0 exactly. At frame 1 hidden max error is
+1.7844e-5 and four cache elements differ by one existing output quantization
+step (max 6.0588e-5). Validation explicitly allows 1.1 output LSB for aligned
+cache outputs, rather than a large relative tolerance. Converted-encoding and
+phone checks are still needed before deployment claims.
+
+SDK 2.45 references on remote:
+
+    docs/QAIRT-Docs/QNN/OpDef/HtpOpDefSupplement.html#scatterelements
+    docs/QAIRT-Docs/QNN/general/htp/htp_shared_buffer_tutorial.html
+
+The shared-buffer tutorial uses `memRegister`, MEMHANDLE tensors and explicit
+buffer lifetime management; it does not make a RAW-buffer graph in-place by
+changing its ONNX operator alone.
