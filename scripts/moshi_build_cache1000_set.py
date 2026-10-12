@@ -86,6 +86,8 @@ def main():
     parser.add_argument("--reuse-six-seven", type=Path)
     parser.add_argument("--reuse-build-root", type=Path,
                         help="Reuse matching source snapshots and converted candidates from a prior revision")
+    parser.add_argument("--fallback-where", action="store_true",
+                        help="Try capacity1000 Where only after Scatter numerical checkpoint failure")
     args = parser.parse_args()
     if not 1 <= args.workers <= 4:
         raise ValueError("Use 1..4 workers")
@@ -103,6 +105,7 @@ def main():
     plan = {"format": "moshi-cache1000-set-plan-v1", "baseline": str(args.baseline_root),
             "capacity": 1000, "cache_output": "delta", "update": "scatter",
             "patcher_sha256": digest(helpers / "moshi_patch_temporal_cache.py"),
+            "fallback_where": args.fallback_where,
             "sdk": str(args.sdk_root), "numpy_dir": str(args.numpy_dir),
             "calibration": str(args.calibration_dir)}
     if (root / "plan.json").exists() and json.loads((root / "plan.json").read_text()) != plan:
@@ -190,7 +193,26 @@ def main():
                 and json.loads(cpu_report.read_text()).get("passed")
                 and len(json.loads(cpu_report.read_text()).get("samples", [])) == 2)
             if not cpu_complete:
-                run(command, log, 1800)
+                try:
+                    run(command, log, 1800)
+                except subprocess.CalledProcessError as exc:
+                    if not (args.fallback_where and exc.returncode == 2 and cpu_report.is_file()
+                            and json.loads(cpu_report.read_text()).get("passed") is False):
+                        raise
+                    # Retain failed Scatter candidate/report. Never hide a
+                    # shape, converter, or runtime exception behind fallback.
+                    candidate = directory / "candidate_where"
+                    fallback = list(command)
+                    fallback[fallback.index("--output-dir") + 1] = str(candidate)
+                    if "--validate-existing" in fallback:
+                        fallback.remove("--validate-existing")
+                    if (candidate / "model.onnx").is_file():
+                        fallback += ["--validate-existing"]
+                    fallback += ["--update", "where"]
+                    stage("where_fallback_cpu_validate", scatter_report=str(cpu_report))
+                    run(fallback, log, 1800)
+                    status["selected_update"] = "where"
+                    reused = None
                 write(cpu_signature, signature)
             candidate_model = onnx.load(str(candidate / "model.onnx"), load_external_data=False)
             if reused and semantic_bytes(candidate_model) != semantic_bytes(onnx.load(str(reused / "model.onnx"), load_external_data=False)):
