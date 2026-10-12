@@ -37,11 +37,15 @@ for layer in $(seq 0 2 30); do
   [ "$actual" = "$expected" ] || { echo "Phone SHA256 failed: $graph"; exit 2; }
 done
 for graph in frontend head depformer_codebook_{0..7}; do
-  "$adb_bin" shell "test -f $baseline_root/dlc/$graph.dlc; if ! test -e $phone_root/dlc/$graph.dlc; then ln -s $baseline_root/dlc/$graph.dlc $phone_root/dlc/$graph.dlc; fi"
+  "$adb_bin" shell "test -f $baseline_root/dlc/$graph.dlc || exit 1; if ! test -e $phone_root/dlc/$graph.dlc; then ln -s $baseline_root/dlc/$graph.dlc $phone_root/dlc/$graph.dlc; fi"
 done
 "$adb_bin" push "$native_binary" "$phone_root/runner"
 echo "Starting real two-frame full candidate chain. No maximum/all-resident mode."
-"$adb_bin" shell "env MOSHI_TEMPORAL_BUDGET_MIB=3072 MOSHI_QNN_PROFILE=1 MOSHI_HTP_PERFORMANCE=1 MOSHI_CONTEXT_CACHE_DIR=/data/local/tmp/moshi_context_chain_f2_v1.wav.contexts-v1 LD_LIBRARY_PATH=$library_dir ADSP_LIBRARY_PATH=$library_dir $phone_root/runner $library_dir /data/local/tmp/moshi-mimi-codec-v1/mimi_encoder.dlc /data/local/tmp/moshi-mimi-codec-v1/mimi_decoder.dlc /data/local/tmp/moshi-mimi-codec-v1/input.wav $phone_root/full_f2.wav 2 $phone_root --repeat > $phone_root/run.log 2>&1"
+if ! "$adb_bin" shell "env MOSHI_TEMPORAL_BUDGET_MIB=3072 MOSHI_QNN_PROFILE=1 MOSHI_HTP_PERFORMANCE=1 MOSHI_CONTEXT_CACHE_DIR=/data/local/tmp/moshi_context_chain_f2_v1.wav.contexts-v1 LD_LIBRARY_PATH=$library_dir ADSP_LIBRARY_PATH=$library_dir $phone_root/runner $library_dir /data/local/tmp/moshi-mimi-codec-v1/mimi_encoder.dlc /data/local/tmp/moshi-mimi-codec-v1/mimi_decoder.dlc /data/local/tmp/moshi-mimi-codec-v1/input.wav $phone_root/full_f2.wav 2 $phone_root --repeat > $phone_root/run.log 2>&1"; then
+  "$adb_bin" pull "$phone_root/run.log" "$result_root/" || true
+  echo "Native candidate failed; log retained. App default unchanged."
+  exit 2
+fi
 for file in run.log full_f2.wav full_f2.wav.repeat.wav full_f2.wav.repeat.wav.performance.csv full_f2.wav.repeat.wav.performance.csv.qnn.csv full_f2.wav.repeat.wav.codes.txt; do
   "$adb_bin" pull "$phone_root/$file" "$result_root/"
 done

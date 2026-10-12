@@ -256,3 +256,53 @@ the original/candidate `*_repeat6.csv` files under the candidate download root.
 Next: finish/verify download hashes; device checks for remaining shards; full
 candidate chain/token comparison; same-device whole-chain timing; only then
 publish a validated App inventory and replace its default model selection.
+
+## 2026-10-13: whole-chain QNN profile and bounded residency experiment
+
+Same phone/input and the 4_5-only candidate bundle; two input frames, warm repeat.
+The 3072/4096 runs enable QNN BASIC profiling. The 3584 run uses a clean indexed
+build with only the independent residency-budget change and no QNN profiler.
+These are single adjacent trials, not statistically established improvements.
+
+| Source-weight budget MiB | Warm wall s | Restore s | Restore calls | Sampled minimum MemAvailable MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 3072 | 27.9973 | 20.3315 | 18 | 3029.48 |
+| 3584 | 28.8274 | 21.1649 | 16 | 2505.92 |
+| 4096 | 26.3460 | 18.8302 | 14 | 1581.25 |
+
+All three repeat WAVs match the baseline SHA256 above. The 4096 trial saves
+about 5.9% wall time versus 3072 but has less memory headroom; 3584 does not
+improve wall time. Keep the 3072 default. Actual allocations are NOT bounded
+by source file sizes, and planned residency is not guaranteed by nominal RAM.
+
+`MOSHI_TEMPORAL_BUDGET_MIB` explicitly requests an experiment budget, capped
+at 6144 MiB and initial available memory minus 6 GiB; existing per-admission
+checks still apply. It is independent of unverified maximum/shared-context
+experiments, which are NOT included in the committed change or enabled here.
+
+QNN BASIC profiles show 55 graphExecute calls per warm run. For 3072/4096,
+summed accelerator event time is 3.6094/3.5481 s; native execute phase totals
+are 5.9036/5.7052 s. Event 8001 reports eight HVX threads per call. This confirms
+the reported QNN execution path, not HMX occupancy, NPU-wide utilization, or
+a device clock frequency. RPC/accelerator/parent events overlap and must not
+be added as independent elapsed-time components.
+
+The clean profiling build also ran a three-repeat DETAILED probe on 4_5.
+Excluding first, top reported node-cycle medians are gating_1/MatMul 18.605M,
+gating/MatMul 18.599M, input projections 10.186M/10.130M; cache Where and
+FP32-to-uint16 conversions also appear among the top nodes. Cycle values rank
+nodes within this capture; they are not converted to milliseconds or summed
+as a fabricated utilization percentage.
+
+Reproducible source entrypoints:
+- `Runtime`: opt-in profileCreate/collectProfile/profileFree and QNN CSV export.
+- `PagedMoshiLm`: independent bounded source-weight residency experiment.
+- `scripts/moshi_summarize_runtime_profile.py`: phases, restore counts, QNN units,
+  and sampled memory; reports overlap explicitly.
+- `scripts/moshi_profile_cache1000_phone.sh`: wait for verified complete downloads,
+  preserve existing phone models, push/check SHA256, native full candidate run,
+  warm profile capture. Does not publish an App-ready inventory or change defaults.
+
+Local evidence: `lm-cache1000-candidate-v1/profile_budget/budget*.json` and
+`cache1000_4_5_detailed.csv.qnn.csv`. Full candidate driver status is recorded
+in `profile_full_driver.log`, with eventual artifacts in `profile_full_v1/`.
