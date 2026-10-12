@@ -20,10 +20,38 @@ def sha256(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--build-root", type=Path, action="append", required=True,
+    parser.add_argument("--verify-dir", type=Path,
+                        help="Locally verify downloaded candidate hashes; missing files remain pending")
+    parser.add_argument("--build-root", type=Path, action="append",
                         help="Preferred build first; retain only successfully checked graphs")
-    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path)
     args = parser.parse_args()
+    if args.verify_dir:
+        inventory = json.loads((args.verify_dir / "temporal_candidate_inventory.json").read_text())
+        names = {f"temporal_layers_{i}_{i + 1}" for i in range(0, 32, 2)}
+        if inventory.get("format") != "moshi-temporal-cache1000-candidate-set-v1" or set(inventory["graphs"]) != names:
+            raise ValueError("Unexpected candidate inventory")
+        result = {"verified": [], "pending": [], "failed": [], "device_verified": False}
+        for name, item in inventory["graphs"].items():
+            if item["file"] != f"dlc/{name}.dlc":
+                raise ValueError("Unexpected model path")
+            file = args.verify_dir / item["file"]
+            if not file.is_file() or file.stat().st_size != item["bytes"]:
+                result["pending"].append(name)
+            elif sha256(file) != item["sha256"]:
+                result["failed"].append(name)
+            else:
+                result["verified"].append(name)
+        result["passed"] = not result["pending"] and not result["failed"]
+        (args.verify_dir / "DOWNLOAD_VERIFIED.json").write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result, indent=2))
+        if result["failed"]:
+            raise SystemExit(2)
+        if result["pending"]:
+            raise SystemExit(3)
+        return
+    if not args.build_root or not args.output_root:
+        parser.error("Collection requires --build-root and --output-root")
     selected = {}
     for layer in range(0, 32, 2):
         name = f"temporal_layers_{layer}_{layer + 1}"
