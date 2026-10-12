@@ -306,3 +306,77 @@ Reproducible source entrypoints:
 Local evidence: `lm-cache1000-candidate-v1/profile_budget/budget*.json` and
 `cache1000_4_5_detailed.csv.qnn.csv`. Full candidate driver status is recorded
 in `profile_full_driver.log`, with eventual artifacts in `profile_full_v1/`.
+
+## Full replacement and lifecycle optimization: verified device results
+
+500-cache construction was deferred at the user's request to focus on the
+dominant overhead. All 16 1000-cache Temporal candidates are now downloaded,
+SHA256 checked, and installed in a separate native-test bundle on this phone:
+`/data/local/tmp/moshi-cache1000-full-profile-v1`. App defaults/APK are unchanged.
+
+The first mixed cold-build/resident run failed at 14_15 with graphExecute 6001
+(QNN_GRAPH_ERROR_INVALID_HANDLE). The exact saved 14_15 context subsequently
+passed an isolated two-frame replay. A nonresident run prepared the remaining
+contexts and passed the complete chain. Subsequent cached resident runs pass.
+This isolates the cold/multiple-context lifecycle boundary but does NOT establish
+a universal SDK root cause. Preserve generated caches; don't reconvert DLCs.
+
+| Complete new Temporal set, warm two-frame run | Wall s | Restore s | Restore calls |
+| --- | ---: | ---: | ---: |
+| No Temporal residency, init acceleration | 24.9774 | 20.1454 | 32 |
+| 3 GiB DLC proxy budget | 19.1252 | 15.1597 | 18 |
+| 6 GiB DLC proxy budget | 11.0792 | 6.8788 | 6 |
+| Codec cached, 6 GiB DLC proxy | 8.3896 | 5.4108 | 6 |
+| Codec cached, shared workspace, 6 GiB DLC proxy | 4.8200 | 2.7433 | 6 |
+| Codec cached, shared workspace, 8 GiB binary proxy | 1.7180 | 0 | 0 |
+
+These are observed short trials, not statistically isolated effects of each
+flag. The final warm run really retains all 16 Temporal contexts, not merely
+a planned admission list. Total execute time is 1.4307 s for two input frames;
+sampled minimum MemAvailable is 2.730 GiB. First/repeat WAV, audio codes, and
+text tokens match the existing baseline (text `0,3`, audio codes recorded above).
+
+A longer independent adjacent four-frame control also passes byte comparisons:
+- Original 3000-cache bundle, 3 GiB budget, no context group: warm 36.5433 s,
+  restore 25.2419 s (36 calls), execute 9.2417 s.
+- Full 1000-cache set + shared workspace + binary proxy: warm 3.42445 s,
+  restore 0 (0 calls), execute 2.8637 s; about 10.67x wall speedup in this trial.
+- Text and audio-code files compare byte-identical. Optimized first/repeat WAV
+  SHA256 both match baseline repeat:
+  `2701e5b3b339e135c9a4a55cb776b76f82732329c24099d4a65c486a739b64e1`.
+- Sampled minimum MemAvailable 3.000 GiB, peak process RSS 6.655 GiB.
+
+Why the selected changes work:
+1. `MOSHI_CONTEXT_GROUP=1`: inspect all 26 cached HTP graph blobs and register
+   contexts to one sequential group using the maximum declared spill/fill size,
+   50,790,400 bytes. Frontend group leader remains alive until all members free.
+   This uses register-multi-contexts, NOT unverified asynchronous batch loading.
+2. `MOSHI_RESIDENT_COST_USE_BINARY=1`: replan using actual device-context file
+   sizes, still only a RAM proxy. 2_3/30_31 DLCs are ~1.64 GB each, but their
+   contexts ~824 MB each. Using raw DLC size had overestimated their cost.
+   The experiment supports up to 8 GiB with initial headroom and per-admission
+   checks. Resource allocation failures retire completed Temporal contexts,
+   preserving host KV and refusing expensive verified-DLC rebuilds.
+3. `MOSHI_CODEC_CONTEXT_CACHE_DIR`: cache encoder/decoder contexts too. Their
+   constructor cost occurs BEFORE pipeline wall_total. Priming measured
+   native_session_prepare_ms=8813.32; a new process with cached codecs measured
+   556.925 ms. Explicit preparation timing prevents hiding startup latency.
+
+Rejected/default-off experiments: persistent binary did not clearly improve
+wall time; direct RAW ring binding removed explicit copy but did not demonstrate
+whole-chain speedup in its trial (different admission count). Keep the pooled
+copy path for this verified fast configuration. Ring binding is an opt-in
+experiment, not NPU zero-copy; its cache storage outlives bound contexts.
+
+Reproduce with the new clean native binary and
+`MOSHI_FAST_PROFILE=1 bash scripts/moshi_profile_cache1000_phone.sh CANDIDATE_ROOT BINARY LIB_DIR`.
+On a fresh device/cache set, first use `MOSHI_PREPARE_ONLY=1` with the same script;
+this uses nonresident preparation and preserves all models. Fast mode refuses
+missing binary-cost metadata rather than guessing readiness.
+
+Evidence directories under local `lm-cache1000-candidate-v1`:
+`full_budget0`, `full_budget3`, `full_budget6`, `codec_normal`, `codec_persistent`,
+`group6`, `group_binary8`, `f4_baseline`, `f4_optimized`.
+This is a real native phone-chain proof, NOT an updated installed-App/UI proof,
+long-context wrap proof, sustained thermal benchmark, or real-time result.
+Four inputs emit three 80 ms chunks; 3.424 s for 240 ms output is still not real time.
