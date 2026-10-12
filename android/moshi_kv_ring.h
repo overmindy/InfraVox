@@ -34,6 +34,7 @@ class MoshiKvRing {
     ++next_;
   }
   const std::vector<uint8_t>& bytes() const { return bytes_; }
+  size_t capacity() const { return capacity_; }
   uint64_t nextPosition() const { return next_; }
   size_t validSlots() const { return static_cast<size_t>(std::min<uint64_t>(next_, capacity_)); }
  private:

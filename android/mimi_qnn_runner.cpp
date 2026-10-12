@@ -29,8 +29,11 @@
 #include "QnnInterface.h"
 #include "System/QnnSystemInterface.h"
 #include "HTP/QnnHtpDevice.h"
+#include "HTP/QnnHtpContext.h"
+#include "HTP/QnnHtpSystemContext.h"
 #include "moshi_lm_scheduler.h"
 #include "moshi_cache_prefix.h"
+#include "moshi_kv_ring.h"
 #include "moshi_graph_io_pool.h"
 
 namespace {
@@ -434,6 +437,9 @@ class Graph {
  public:
 
   Buffer& input(const std::string& name) { return find(inputs_, name); }
+  bool hasOutput(const std::string& name) const {
+    return std::any_of(outputs_.begin(), outputs_.end(), [&](const Buffer& b) { return b.name == name; });
+  }
   const std::vector<Buffer>& benchmarkOutputs() const { return outputs_; }
   Buffer& output(const std::string& name) {
     resumeIo();
@@ -755,6 +761,7 @@ class PagedMoshiLm {
   void reset() {
     ring_.reset();
     for (auto& cache : temporalCache_) std::vector<uint8_t>().swap(cache);
+    for (auto& cache : temporalRing_) if (cache) cache->reset();
   }
 
   std::optional<std::array<int32_t, 9>> step(const std::array<int32_t, 8>& user,
@@ -777,27 +784,54 @@ class PagedMoshiLm {
       for (int j = 0; j < 4; ++j) {
         const std::string name = cacheName(layer + j / 2, j % 2);
         auto& input = graph.input(name);
-        expect(input, QNN_DATATYPE_FLOAT_32, 1ULL * 32 * 3000 * 128 * sizeof(float));
+        const size_t capacity = cacheCapacity(input);
+        auto& output = temporalOutput(graph, layer, j);
+        const size_t outputCapacity = cacheCapacity(output);
+        if (outputCapacity != 1 && outputCapacity != capacity)
+          throw std::runtime_error("Temporal cache input/output capacity mismatch");
+        auto& ring = temporalRing_[2 * layer + j];
+        if (capacity <= 1000 || outputCapacity == 1) {
+          if (!ring) ring = std::make_unique<MoshiKvRing>(32, capacity, 128 * sizeof(float));
+          if (position < 0 || ring->capacity() != capacity || ring->nextPosition() != static_cast<uint64_t>(position))
+            throw std::runtime_error("Temporal ring position or model capacity changed without reset");
+          std::memcpy(input.bytes.data(), ring->bytes().data(), input.bytes.size());
+          continue;
+        }
         auto& cache = temporalCache_[2 * layer + j];
-        // No wrap in this <=3000-frame host. Store only slots already written;
-        // restore each head's prefix into a fresh zero-filled full ABI tensor.
-        MoshiCachePrefix::restore(input.bytes, cache, 32, 3000, 128 * sizeof(float), position);
+        // Preserve the delivered full-cache ABI and compact-prefix behavior.
+        // Optimized/smaller models above use preallocated ring state instead.
+        MoshiCachePrefix::restore(input.bytes, cache, 32, capacity, 128 * sizeof(float), position);
       }
       runtime_.timing(shardName(layer), "restore_kv", elapsedMs(hostStart));
       graph.execute();
       // This delivered 0_1 DLC alone uses numbered outputs. The verified source
       // order is hidden, layer_0_key, layer_0_value, layer_1_key, layer_1_value.
-      auto& nextHidden = graph.output(layer == 0 ? "output_0" : "output_hidden");
+      if (!graph.hasOutput("output_hidden") && layer != 0)
+        throw std::runtime_error("Unexpected numbered Temporal hidden output");
+      auto& nextHidden = graph.output(graph.hasOutput("output_hidden") ? "output_hidden" : "output_0");
       expect(nextHidden, QNN_DATATYPE_FLOAT_32, 4096 * sizeof(float));
       finite(nextHidden);
       hidden = nextHidden.bytes;
       const auto packStart = std::chrono::steady_clock::now();
       for (int j = 0; j < 4; ++j) {
-        auto& output = graph.output(layer == 0 ? "output_" + std::to_string(j + 1)
-            : "output_" + cacheName(layer + j / 2, j % 2));
-        expect(output, QNN_DATATYPE_FLOAT_32, 1ULL * 32 * 3000 * 128 * sizeof(float));
+        auto& output = temporalOutput(graph, layer, j);
+        const size_t outputCapacity = cacheCapacity(output);
+        auto& ring = temporalRing_[2 * layer + j];
+        if (ring) {
+          std::array<uint8_t, 32 * 128 * sizeof(float)> delta{};
+          for (size_t head = 0; head < 32; ++head)
+            std::memcpy(delta.data() + head * 128 * sizeof(float),
+                        output.bytes.data() + (head * outputCapacity + position % outputCapacity) * 128 * sizeof(float),
+                        128 * sizeof(float));
+          for (size_t offset = 0; offset < delta.size(); offset += sizeof(float)) {
+            float value; std::memcpy(&value, delta.data() + offset, sizeof(value));
+            if (!std::isfinite(value)) throw std::runtime_error("Nonfinite new K/V: " + output.name);
+          }
+          ring->append(position, delta.data(), delta.size());
+          continue;
+        }
         auto& cache = temporalCache_[2 * layer + j];
-        MoshiCachePrefix::pack(output.bytes, cache, 32, 3000, 128 * sizeof(float), position + 1);
+        MoshiCachePrefix::pack(output.bytes, cache, 32, outputCapacity, 128 * sizeof(float), position + 1);
       }
       runtime_.timing(shardName(layer), "pack_kv", elapsedMs(packStart));
       graph.suspendIo(); // Context may remain resident; scratch buffers do not.
@@ -902,6 +936,20 @@ class PagedMoshiLm {
   static std::string cacheName(int layer, int value) {
     return "layer_" + std::to_string(layer) + (value ? "_value" : "_key");
   }
+  static size_t cacheCapacity(Buffer& buffer) {
+    const auto* shape = tensorDimensions(buffer.tensor);
+    if (tensorRank(buffer.tensor) != 4 || shape[0] != 1 || shape[1] != 32 ||
+        !shape[2] || shape[2] > 3000 || shape[3] != 128)
+      throw std::runtime_error("Unsupported Temporal cache layout: " + buffer.name);
+    expect(buffer, QNN_DATATYPE_FLOAT_32, 32ULL * shape[2] * 128 * sizeof(float));
+    return shape[2];
+  }
+  static Buffer& temporalOutput(Graph& graph, int layer, int index) {
+    const std::string name = "output_" + cacheName(layer + index / 2, index % 2);
+    if (graph.hasOutput(name)) return graph.output(name);
+    if (layer == 0) return graph.output("output_" + std::to_string(index + 1));
+    throw std::runtime_error("Missing named Temporal cache output: " + name);
+  }
   static std::string shardName(int layer) {
     return "temporal_layers_" + std::to_string(layer) + "_" + std::to_string(layer + 1);
   }
@@ -919,6 +967,7 @@ class PagedMoshiLm {
   std::map<std::string, std::unique_ptr<Graph>> residentGraphs_;
   MoshiDelayRing ring_;
   std::array<std::vector<uint8_t>, 64> temporalCache_;
+  std::array<std::unique_ptr<MoshiKvRing>, 64> temporalRing_;
 };
 
 using FrameCallback = std::function<void(size_t, size_t, double, const std::vector<int16_t>&)>;

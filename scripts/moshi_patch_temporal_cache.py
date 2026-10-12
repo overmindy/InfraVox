@@ -8,11 +8,48 @@ import argparse
 import copy
 import json
 import os
+import errno
+import shutil
 from pathlib import Path
 
 import numpy as np
 import onnx
 from onnx import helper, numpy_helper
+
+
+def public_encoding(model, name):
+    producers = {o: n for n in model.graph.node for o in n.output}
+    seen = set()
+    while name in producers and name not in seen:
+        seen.add(name)
+        node = producers[name]
+        if node.op_type == "DequantizeLinear":
+            return list(node.input[1:])
+        if node.op_type not in ("Identity", "Cast"):
+            break
+        name = node.input[0]
+    return None
+
+
+def cache_input_for_output(model, name):
+    """Prove numbered-cache mapping by tracing the old-cache edge of Where."""
+    producers = {o: n for n in model.graph.node for o in n.output}
+    caches = {v.name for v in model.graph.input if v.name.startswith("layer_")}
+    seen, update_seen = set(), False
+    while name not in seen:
+        if name in caches and update_seen:
+            return name
+        seen.add(name)
+        node = producers.get(name)
+        if node is None:
+            break
+        if node.op_type == "Where" and not update_seen:
+            name, update_seen = node.input[2], True
+        elif node.op_type in ("Identity", "Cast", "QuantizeLinear", "DequantizeLinear"):
+            name = node.input[0]
+        else:
+            break
+    raise ValueError("Cannot prove numbered cache output mapping")
 
 
 def patch(model, capacity, update, cache_output="full", scatter_encoding="source"):
@@ -24,6 +61,19 @@ def patch(model, capacity, update, cache_output="full", scatter_encoding="source
     old = shapes[0][2]
     if any(s != [1, 32, old, 128] for s in shapes) or not 1 <= capacity <= old:
         raise ValueError("Unexpected cache shape or capacity")
+    aliases = {}
+    if [v.name for v in result.graph.output] == [f"output_{i}" for i in range(5)]:
+        output_shapes = [[d.dim_value for d in v.type.tensor_type.shape.dim] for v in result.graph.output]
+        if output_shapes != [[1, 1, 4096], *shapes]:
+            raise ValueError("Numbered output shapes do not match the verified Temporal ABI")
+        mapped = [cache_input_for_output(result, v.name) for v in result.graph.output[1:]]
+        if set(mapped) != {v.name for v in cache_inputs} or len(set(mapped)) != 4:
+            raise ValueError("Numbered outputs do not cover each cache exactly once")
+        names = ["output_hidden", *("output_" + name for name in mapped)]
+        for output, name in zip(result.graph.output, names):
+            aliases[output.name] = name
+            result.graph.node.append(helper.make_node("Identity", [output.name], [name], name="canonical_" + name))
+            output.name = name
     producers = {o: n for n in result.graph.node for o in n.output}
     changes = []
     # Fail closed for unrelated constant tensors containing the old capacity.
@@ -70,21 +120,40 @@ def patch(model, capacity, update, cache_output="full", scatter_encoding="source
             if scatter_encoding == "aligned":
                 quantizers = [n for n in result.graph.node if n.op_type == "QuantizeLinear"
                               and n.input[0] == node.output[0]]
-                if len(quantizers) != 1:
-                    raise ValueError("Expected one cache output quantizer for encoding alignment")
-                encoding = list(quantizers[0].input[1:])
-                if len(encoding) != 2:
-                    raise ValueError("Expected explicit cache output scale and zero point")
+                if not quantizers:
+                    # Lite-MP FP16 100% graphs have floating cache paths. Do
+                    # not invent quantizers/encodings for these valid graphs.
+                    if any(producers.get(v) is not None and producers[v].op_type == "DequantizeLinear"
+                           for v in (scatter_data, scatter_update)):
+                        raise ValueError("Mixed quantized/float Scatter without an output encoding")
+                    encoding = None
+                elif len(quantizers) == 1:
+                    encoding = list(quantizers[0].input[1:])
+                    if len(encoding) != 2:
+                        raise ValueError("Expected explicit cache output scale and zero point")
+                else:
+                    raise ValueError("Ambiguous cache output quantizers")
                 # A scatter copies quantized payloads. Explicitly requantize
                 # both cache and new values to its OUTPUT encoding beforehand.
                 # This keeps all weight encodings untouched.
-                for label, value in (("data", scatter_data), ("update", scatter_update)):
+                for label, value in (("data", scatter_data), ("update", scatter_update)) if encoding else ():
                     name = tag + "_aligned_" + label
-                    nodes.extend([
-                        helper.make_node("QuantizeLinear", [value, *encoding], [name + "_q"], name=name + "_quantize"),
-                        helper.make_node("DequantizeLinear", [name + "_q", *encoding], [name], name=name + "_dequantize"),
-                    ])
-                scatter_data, scatter_update = tag + "_aligned_data", tag + "_aligned_update"
+                    quantizer = quantizers[0]
+                    q = helper.make_node("QuantizeLinear", [value, *encoding], [name + "_q"],
+                                         name=name + "_quantize", domain=quantizer.domain)
+                    q.attribute.extend(copy.deepcopy(quantizer.attribute))
+                    # Preserve contrib-domain uint16 support when present in
+                    # older cloud ONNX files; don't silently change QDQ dialect.
+                    downstream = [n for n in result.graph.node if n.op_type == "DequantizeLinear"
+                                  and n.input[0] == quantizer.output[0]]
+                    dq_domain = downstream[0].domain if downstream else quantizer.domain
+                    dq = helper.make_node("DequantizeLinear", [name + "_q", *encoding], [name],
+                                          name=name + "_dequantize", domain=dq_domain)
+                    if downstream:
+                        dq.attribute.extend(copy.deepcopy(downstream[0].attribute))
+                    nodes.extend([q, dq])
+                if encoding:
+                    scatter_data, scatter_update = tag + "_aligned_data", tag + "_aligned_update"
             result.graph.initializer.extend([
                 numpy_helper.from_array(np.array([1, 1, 1, 1], np.int64), tag + "_scalar_shape"),
                 numpy_helper.from_array(np.array([1, 32, 1, 128], np.int64), tag + "_index_shape"),
@@ -125,6 +194,7 @@ def patch(model, capacity, update, cache_output="full", scatter_encoding="source
     return result, {"old_capacity": old, "capacity": capacity, "update": update,
                     "cache_output": cache_output,
                     "scatter_encoding": scatter_encoding,
+                    "output_aliases": aliases,
                     "changed_constants": changes, "replaced_where": replaced,
                     "in_place_runtime_verified": False}
 
@@ -141,6 +211,8 @@ def main():
     parser.add_argument("--samples", nargs="*", type=Path, default=[])
     parser.add_argument("--validate-existing", action="store_true",
                         help="Validate an existing identical candidate without rewriting its model")
+    parser.add_argument("--copy-external-data", action="store_true",
+                        help="Allow one-time copy when source weights and output reside on different filesystems")
     args = parser.parse_args()
     source = onnx.load(str(args.model), load_external_data=False)
     changed, report = patch(source, args.capacity, args.update, args.cache_output, args.scatter_encoding)
@@ -160,7 +232,12 @@ def main():
         target = args.output_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
-            os.link(args.model.parent / rel, target)
+            try:
+                os.link(args.model.parent / rel, target)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV or not args.copy_external_data:
+                    raise
+                shutil.copy2(args.model.parent / rel, target)
     destination = args.output_dir / "model.onnx"
     if not args.validate_existing:
         onnx.save(changed, str(destination))
@@ -175,7 +252,9 @@ def main():
         modified = ort.InferenceSession(str(destination), options, providers=["CPUExecutionProvider"])
         for sample in args.samples:
             with np.load(sample) as data:
-                feed = {v.name: data[v.name] for v in original.get_inputs()}
+                dtypes = {"tensor(float)": np.float32, "tensor(float16)": np.float16,
+                          "tensor(int64)": np.int64, "tensor(int32)": np.int32}
+                feed = {v.name: data[v.name].astype(dtypes[v.type], copy=False) for v in original.get_inputs()}
             position = int(feed["position"].item())
             if position >= args.capacity:
                 raise ValueError("Early-prefix parity test cannot compare different sliding windows")
@@ -186,23 +265,26 @@ def main():
             metrics = {}
             tolerances = {}
             for output, got, ref in zip(original.get_outputs(), actual, expected):
-                if output.name.startswith("output_layer_"):
+                canonical = report["output_aliases"].get(output.name, output.name)
+                if canonical.startswith("output_layer_"):
                     ref = (ref[:, :, position:position + 1, :] if args.cache_output == "delta"
                            else ref[:, :, :args.capacity, :])
                 if not np.isfinite(got).all():
                     raise ValueError(f"Nonfinite {output.name}")
                 atol = 2e-5
-                if args.scatter_encoding == "aligned" and output.name.startswith("output_layer_"):
-                    scales = [v for v in source.graph.initializer if v.name == output.name + "_scale"]
-                    if len(scales) != 1:
+                if args.scatter_encoding == "aligned" and canonical.startswith("output_layer_"):
+                    encoding = public_encoding(source, output.name)
+                    scales = [v for v in source.graph.initializer if encoding and v.name == encoding[0]]
+                    if encoding and len(scales) != 1:
                         raise ValueError("Cannot establish output cache quantization LSB")
                     # Explicit Q/DQ introduces an extra float rounding boundary:
                     # allow at most one existing output quantization step, never
                     # a broad percentage tolerance that masks scale/offset bugs.
-                    atol = max(atol, 1.1 * float(numpy_helper.to_array(scales[0]).max()))
+                    if scales:
+                        atol = max(atol, 1.1 * float(numpy_helper.to_array(scales[0]).max()))
                 np.testing.assert_allclose(got, ref, rtol=2e-4, atol=atol)
-                metrics[output.name] = float(np.max(np.abs(got - ref)))
-                tolerances[output.name] = atol
+                metrics[canonical] = float(np.max(np.abs(got - ref)))
+                tolerances[canonical] = atol
             report["samples"].append({"sample": str(sample), "position": position,
                                       "max_abs": metrics, "allowed_absolute_error": tolerances})
     report["passed"] = True
