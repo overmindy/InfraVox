@@ -171,3 +171,49 @@ than Where in this short control. Do not extrapolate to sustained App speed.
 Next deployment checks: manifest-driven capacities and delta feedback in
 PagedMoshiLm, remaining Temporal graph ABI variants (including numbered 0_1
 outputs), whole-chain parity, then long-context/wrap and registered-buffer work.
+
+## 2026-10-13: batch ABI repair and strict numerical fallback
+
+`PagedMoshiLm` now reads cache capacity and output shape from graph metadata.
+A preallocated `MoshiKvRing` stores each delta slot; the complete input cache
+still crosses the RAW tensor ABI. This is not zero-copy or proven in-place HTP
+memory updating. A two-frame full Mimi/LM/Mimi run with only Temporal 6_7
+replaced completed; first/repeat WAV hashes match the deployed baseline.
+Warm whole-chain times were 21.349 s mixed versus 21.153 s control: no overall
+speedup demonstrated by this single replacement.
+
+The first 16-graph remote batch converted six graphs, without device validation.
+The 0_1 source hoists 3000-slot range/reshape constants into external integer
+initializers. `moshi_patch_temporal_cache.py::patch` now changes these metadata
+tensors while preserving weight and encoding initializers. Its new two-frame
+CPU check passes; hidden outputs are exact at both frames. Cache layer-0 key
+maximum differences are about 0.0002203, within the existing output-LSB bound.
+
+`semantic_bytes` ignores only the presence of an empty default operator domain,
+not arbitrary model differences. This fixes false rejection of the verified
+6_7 prototype. `--reuse-build-root` reuses matching data3 source snapshots and
+structurally identical converted candidates. Reports now retain failed numerical
+checks instead of terminating before writing their metrics.
+
+| Captured input graph | Frame-1 aligned Scatter hidden relative RMS | Capacity1000 Where outputs vs baseline, frames 0/1 |
+| --- | ---: | --- |
+| 4_5 | 0.0040933904 | All outputs elementwise exact |
+| 8_9 | 0.0002559016 | All outputs elementwise exact |
+
+The Scatter errors therefore are not caused solely by shrinking capacity in
+these two tests. Additional Q/DQ boundaries remain the suspect, not a proven
+universal backend fault. Strict checks were not loosened. Optional
+`moshi_build_cache1000_set.py --fallback-where` tries a separate Where candidate
+ONLY after Scatter exits with a numerical checkpoint failure (exit 2); shape,
+conversion, or runtime failures do not silently fall back. Both candidates and
+reports remain available. A converted fallback is still not a device pass.
+
+Remote roots:
+- `/data3/yejialei/moshi-cache1000-scatter-delta-lm-v2`
+- `/data3/yejialei/moshi-cache1000-where-fallback-lm-v1`
+- `/data3/yejialei/moshi-performance-inspect-v1/cache1000_where_diag_4_5`
+- `/data3/yejialei/moshi-performance-inspect-v1/cache1000_where_diag_8_9`
+
+Next gates: collect all strict reports; device same-input/delta recurrence;
+short mixed/full-chain token and audio checks; same-device timing; long-context
+and wrap checks before default App model replacement.
