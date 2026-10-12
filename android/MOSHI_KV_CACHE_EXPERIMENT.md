@@ -106,6 +106,13 @@ step (max 6.0588e-5). Validation explicitly allows 1.1 output LSB for aligned
 cache outputs, rather than a large relative tolerance. Converted-encoding and
 phone checks are still needed before deployment claims.
 
+The 1000/Where control also composed/executed on device: warm median 38.7228 ms
+(six same-input repeats, exclude first). Frame-0 hidden and all four written
+cache slots are byte-identical to the deployed 3000/Where DLC. Full-cache
+preservation across recurrent device frames is not checked by these dumps.
+This separates the clear capacity benefit from the unproven Scatter benefit:
+the unaligned Scatter is not faster than this control and is numerically wrong.
+
 SDK 2.45 references on remote:
 
     docs/QAIRT-Docs/QNN/OpDef/HtpOpDefSupplement.html#scatterelements
