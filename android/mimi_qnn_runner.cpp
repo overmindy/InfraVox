@@ -53,6 +53,16 @@ uint64_t availableMemoryBytes() {
   return 0; // No reliable budget: do not expand residency.
 }
 
+bool enabledEnvironment(const char* name) {
+  const char* value = std::getenv(name);
+  return value && std::string(value) == "1";
+}
+
+class ContextAllocationError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 // Context binaries are device/runtime-specific caches, not replacement model files.
 // Keep the mapping alive until contextFree, including backends which retain it.
 struct MappedBinary {
@@ -424,6 +434,7 @@ class Graph {
  public:
 
   Buffer& input(const std::string& name) { return find(inputs_, name); }
+  const std::vector<Buffer>& benchmarkOutputs() const { return outputs_; }
   Buffer& output(const std::string& name) {
     resumeIo();
     for (auto& buffer : outputs_) {
@@ -1071,6 +1082,60 @@ size_t runMimiCodec(const std::string& libraryDir, const std::string& encoderDlc
 #ifndef MIMI_CODEC_LIBRARY
 int main(int argc, char** argv) {
   try {
+    if (argc == 8 && std::string(argv[1]) == "--benchmark-temporal") {
+      Runtime runtime(argv[2]);
+      Graph graph(runtime, argv[3], argv[4]);
+      std::ifstream file(argv[5], std::ios::binary);
+      std::vector<uint8_t> hidden((std::istreambuf_iterator<char>(file)), {});
+      if (!file.eof() && !file) throw std::runtime_error("Cannot read captured hidden tensor");
+      auto& input = graph.input("hidden"); expect(input, QNN_DATATYPE_FLOAT_32, 4096 * sizeof(float));
+      if (hidden.size() != input.bytes.size()) throw std::runtime_error("Captured hidden has incorrect size");
+      std::memcpy(input.bytes.data(), hidden.data(), hidden.size());
+      auto& position = graph.input("position"); expect(position, QNN_DATATYPE_INT_32, sizeof(int32_t));
+      const int32_t zero = 0; std::memcpy(position.bytes.data(), &zero, sizeof(zero));
+      // Real captured frame-0 input: all incoming K/V caches are initially zero.
+      const size_t repeats = std::stoul(argv[7]);
+      if (!repeats || repeats > 20) throw std::runtime_error("Use 1..20 benchmark repetitions");
+      std::vector<uint8_t> reference;
+      if (enabledEnvironment("MOSHI_HTP_PERFORMANCE")) runtime.beginPerformanceVote();
+      for (size_t i = 0; i < repeats; ++i) {
+        graph.execute();
+        auto& output = graph.output("output_hidden");
+        expect(output, QNN_DATATYPE_FLOAT_32, 4096 * sizeof(float));
+        for (size_t j = 0; j < output.bytes.size(); j += sizeof(float)) {
+          float value; std::memcpy(&value, output.bytes.data() + j, sizeof(value));
+          if (!std::isfinite(value)) throw std::runtime_error("Nonfinite Temporal benchmark output");
+        }
+        if (reference.empty()) reference = output.bytes;
+        else if (reference != output.bytes) throw std::runtime_error("Repeated captured-input output changed");
+        if (i == 0 && enabledEnvironment("MOSHI_BENCH_DUMP")) {
+          // Small parity artifacts, outside the timed execute: hidden plus the
+          // written slot of each cache. Never dump megabytes of unwritten slots.
+          const auto save = [&](const std::string& name, const std::vector<uint8_t>& bytes) {
+            std::ofstream stream(std::string(argv[6]) + "." + name + ".raw", std::ios::binary);
+            stream.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            if (!stream) throw std::runtime_error("Cannot save benchmark output");
+          };
+          save("hidden", output.bytes);
+          for (const auto& buffer : graph.benchmarkOutputs()) {
+            if (buffer.name.find("layer_") == std::string::npos) continue;
+            const auto* shape = tensorDimensions(buffer.tensor);
+            if (tensorRank(buffer.tensor) != 4 || shape[0] != 1 || shape[1] != 32 ||
+                shape[3] != 128 || tensorType(buffer.tensor) != QNN_DATATYPE_FLOAT_32)
+              throw std::runtime_error("Unexpected cache benchmark output ABI");
+            std::vector<uint8_t> slot(32 * 128 * sizeof(float));
+            for (size_t head = 0; head < 32; ++head)
+              std::memcpy(slot.data() + head * 128 * sizeof(float),
+                          buffer.bytes.data() + head * shape[2] * 128 * sizeof(float),
+                          128 * sizeof(float));
+            save(buffer.name, slot);
+          }
+        }
+      }
+      runtime.endPerformanceVote(); runtime.writeTimings(argv[6]);
+      std::cout << "Captured-input resident Temporal benchmark: PASS\n";
+      return 0;
+    }
     if (argc == 5 && std::string(argv[1]) == "--benchmark-frontend") {
       Runtime runtime(argv[2]);
       // Same deterministic streaming initial input, same DLC; change only lifecycle.
