@@ -78,6 +78,7 @@ public final class MainActivity extends Activity {
     private Switch htpPerformance;
     private AudioTrack streamTrack; // Worker thread owns creation/write/release.
     private int streamedSamples;
+    private int streamThresholdBefore, streamThresholdAfter, streamCallbacks, streamChunks;
     private EditText lmFrameLimit;
     private File selectedEncoder, selectedDecoder, selectedLm;
     private File contextCacheDirectory;
@@ -143,7 +144,7 @@ public final class MainActivity extends Activity {
         button(steps, "导入 Decoder DLC", () -> pick(PICK_DECODER));
         button(steps, "导入完整 LM 模型目录（26 DLC + inventory）", this::pickLm);
         moshiMode = new Switch(this);
-        moshiMode.setText("启用 Moshi LM（低内存逐图加载，非实时）");
+        moshiMode.setText("启用 Moshi LM（预算内常驻＋context 缓存，非实时）");
         moshiMode.setTextColor(Color.WHITE);
         steps.addView(moshiMode);
         moshiMode.setOnCheckedChangeListener((button, enabled) -> {
@@ -710,6 +711,7 @@ public final class MainActivity extends Activity {
         outputFile().delete();
         codesFile().delete();
         textTokensFile().delete();
+        new File(outputFile().getAbsolutePath() + ".playback.csv").delete();
         tokens.setText("正在执行 QNN 图…");
         status.setText(moshiMode.isChecked() ? "正在流式递进 Encoder → LM → Decoder；首次建立 context 缓存，之后复用…"
                                             : "正在逐帧执行 Encoder → Decoder…");
@@ -722,6 +724,7 @@ public final class MainActivity extends Activity {
             try {
                 stopStream();
                 streamedSamples = 0;
+                streamCallbacks = 0; streamChunks = 0;
                 if (enableStreamPlayback) {
                     int minimum = AudioTrack.getMinBufferSize(SAMPLE_RATE,
                             AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
@@ -734,23 +737,27 @@ public final class MainActivity extends Activity {
                                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
                             .setBufferSizeInBytes(Math.max(minimum, FRAME_SAMPLES * 2 * 4))
                             .setTransferMode(AudioTrack.MODE_STREAM).build();
+                    if (android.os.Build.VERSION.SDK_INT >= 31) {
+                        streamThresholdBefore = streamTrack.getStartThresholdInFrames();
+                        streamThresholdAfter = streamTrack.setStartThresholdInFrames(FRAME_SAMPLES);
+                    } else {
+                        streamThresholdBefore = streamTrack.getBufferSizeInFrames();
+                        streamTrack.setBufferSizeInFrames(FRAME_SAMPLES);
+                        streamThresholdAfter = streamTrack.getBufferSizeInFrames();
+                    }
                     streamTrack.play();
                 }
                 int frames = nativeRunPrepared(sessionHandle,
                                        files[PICK_AUDIO].getAbsolutePath(),
                                        outputFile().getAbsolutePath(), requestedFrames, this, enableHtpPerformance);
-                // Drain only the bounded final playback buffer, not an unbounded queue.
-                long deadline = android.os.SystemClock.uptimeMillis() + 500;
-                while (streamTrack != null && streamTrack.getPlaybackHeadPosition() < streamedSamples
-                        && android.os.SystemClock.uptimeMillis() < deadline) Thread.sleep(10);
-                stopStream();
+                final String playbackResult = finishStreamPlayback();
                 String codeText = readCodes();
                 double seconds = (System.nanoTime() - start) / 1e9;
                 runOnUiThread(() -> {
                     status.setText(String.format(Locale.US,
                             "推理完成：%d 帧 / %.2f 秒输出音频；本次运行 %.2f 秒，输出 RTF %.2f（小于 1 才达到实时）。详细计时可导出。",
                             frames, frames * 0.08, seconds,
-                            seconds / Math.max(frames * 0.08, 1e-9)));
+                            seconds / Math.max(frames * 0.08, 1e-9)) + playbackResult);
                     tokens.setText(codeText);
                 });
             } catch (Exception error) {
@@ -768,6 +775,7 @@ public final class MainActivity extends Activity {
     // Called on the existing inference worker once per input frame, not UI thread.
     // A bounded AudioTrack buffer provides backpressure; no unbounded audio queue.
     private void onNativeFrame(int consumed, int emitted, double milliseconds, short[] pcm) {
+        ++streamCallbacks;
         if (streamTrack != null && pcm.length > 0) {
             int offset = 0;
             while (offset < pcm.length) {
@@ -776,6 +784,7 @@ public final class MainActivity extends Activity {
                 offset += count;
             }
             streamedSamples += pcm.length;
+            ++streamChunks;
         }
         runOnUiThread(() -> status.setText(String.format(Locale.US,
                 "已处理输入 %d 帧，输出 %d 帧；刚完成一帧 %.1f ms。模型与状态继续复用。",
@@ -784,6 +793,26 @@ public final class MainActivity extends Activity {
 
     private void stopStream() {
         if (streamTrack != null) { streamTrack.release(); streamTrack = null; }
+    }
+
+    private String finishStreamPlayback() throws IOException, InterruptedException {
+        if (streamTrack == null) return "";
+        // A bounded final queue; do not call consumption a proof of audible quality.
+        long deadline = android.os.SystemClock.uptimeMillis() + 2000;
+        while (streamTrack.getPlaybackHeadPosition() < streamedSamples
+                && android.os.SystemClock.uptimeMillis() < deadline) Thread.sleep(10);
+        int played = streamTrack.getPlaybackHeadPosition();
+        boolean timedOut = played < streamedSamples;
+        String header = "callbacks,pcm_chunks,written_samples,played_samples,capacity_frames,threshold_before,threshold_after,underruns,drain_timeout\n";
+        String row = String.format(Locale.US, "%d,%d,%d,%d,%d,%d,%d,%d,%s\n",
+                streamCallbacks, streamChunks, streamedSamples, played, streamTrack.getBufferCapacityInFrames(),
+                streamThresholdBefore, streamThresholdAfter, streamTrack.getUnderrunCount(), timedOut);
+        try (FileOutputStream output = new FileOutputStream(outputFile().getAbsolutePath() + ".playback.csv")) {
+            output.write((header + row).getBytes(StandardCharsets.UTF_8));
+        }
+        stopStream();
+        return String.format(Locale.US, " 播放头消费 %d/%d 样本%s。", played, streamedSamples,
+                timedOut ? "（等待超时，请检查音频输出）" : "");
     }
 
     private String readCodes() throws IOException {
@@ -862,6 +891,9 @@ public final class MainActivity extends Activity {
                 File performance = new File(outputFile().getAbsolutePath() + ".performance.csv");
                 if (performance.isFile())
                     saveDownload(performance, "moshi-" + suffix + "-performance.csv", "text/csv");
+                File playback = new File(outputFile().getAbsolutePath() + ".playback.csv");
+                if (playback.isFile())
+                    saveDownload(playback, "moshi-" + suffix + "-playback.csv", "text/csv");
                 runOnUiThread(() -> status.setText("已保存到 Downloads/MimiDemo"));
             } catch (Exception error) {
                 runOnUiThread(() -> status.setText("保存失败：" + error.getMessage()));

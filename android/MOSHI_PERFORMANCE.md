@@ -95,4 +95,26 @@ CPU/NPU 流水线必须遵守帧与 cache 所有权，不能用多个线程同�
 最后一次暖运行有 55 次 execute（52 LM +2 Encoder +1 Decoder），
 18 次分页恢复、34 次 resident_reuse；执行约 4.93 s，context 恢复约 11.41 s。
 因此后续优先研究剩余 context 的常驻/RSS 和更小的 cache ABI，不是盲目增加线程。
-App 2.3 已构建签名；USB 安装本轮被手机拒绝，尚未验证 Java 播放回调与 App 计时。
+2026-10-12 App 2.3 已安装并执行：两帧首次运行 22.02 s、同会话热运行
+16.41 s；导出 WAV 与 2.2/原生基线逐字节相同，文本/音频 tokens 也相同。
+CSV 确认没有 compose/finalize，热运行 18 次 context 恢复、34 次常驻复用。
+进程本次生命周期 VmHWM 为 4,764,472 KiB（约 4.54 GiB），不是全手机/DSP内存峰值。
+
+实际测试还发现 2.3 播放启动阈值的问题：AudioTrack 的默认启动阈值是缓冲容量，
+而代码保留四帧缓冲，两帧测试却只生成一帧。因此 write 成功和释放前等待结束，
+不能证明实际开始播放。2.3.1 对 Android API 31+ 显式设置一帧启动阈值；
+旧 Android 缩小有效缓冲作为兼容路径（尚未在旧系统验证）。同时新增 playback CSV，
+记录 callback 数、PCM chunk 数、写入/播放头消费样本、阈值、underrun 和等待超时。
+消费通过也不是声音听感或真正无间断实时性的证明。
+参考 Android 官方 AudioTrack 文档：
+https://developer.android.com/reference/android/media/AudioTrack#setStartThresholdInFrames(int)
+
+2.3.1 已在该手机覆盖安装并通过两帧测试：启动阈值 7680 -> 1920，
+2 次帧回调、1 个 PCM chunk，写入 1920 / 播放头消费 1920 样本，underrun=0、
+drain_timeout=false。App 耗时 21.35 s（升级后第一次准备会话、已有磁盘缓存）；
+WAV 的 SHA256 仍与全部旧基线相同。导出新增 `-playback.csv` 便于复核。
+
+同会话四输入帧短测也完成：31.63 s、4 次回调、3 个 PCM chunk，
+写入/消费 5760/5760 样本，drain_timeout=false，WAV 为 24 kHz 单声道 240 ms。
+underrun=2：模型计算慢导致音频块之间断粮，不能描述成无间隙流式播放。
+这四帧是状态/有限值/播放消费 smoke test，尚未逐张量对比 FP32 或评估声音质量。
