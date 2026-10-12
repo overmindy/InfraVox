@@ -217,3 +217,42 @@ Remote roots:
 Next gates: collect all strict reports; device same-input/delta recurrence;
 short mixed/full-chain token and audio checks; same-device timing; long-context
 and wrap checks before default App model replacement.
+
+## 2026-10-13: complete candidate collection and real 4_5 device checkpoint
+
+Both builds finished. Eight Scatter and eight strictly checked Where fallback
+graphs cover all 16 Temporal shards. `moshi_collect_cache1000_candidates.py`
+checks successful state/receipt and strict two-frame reports, hashes each DLC,
+and creates data3 symlinks without duplicating weights. It deliberately emits
+`temporal_candidate_inventory.json` with `device_verified=false` and
+`all_graphs_verified=false`, NOT a misleading App-ready inventory.
+Collection: `/data3/yejialei/moshi-cache1000-selected-temporal-v1`.
+Local resumable download: `/Users/e1ainay/d_personal/moshi-models/lm-cache1000-candidate-v1`.
+
+The 4_5 Where/delta DLC remote/local SHA256 agrees:
+`50906c6b422b0bc7fef7d7f7ff01d219c7433adb52e559847f584093cd2737f9`.
+Real captured hidden frames 0/1 were replayed on the connected SM8850 phone.
+Each run feeds its OWN new slot into its next input cache; baseline and candidate
+start from zero state. `moshi_compare_recurrent_dumps.py` compares hidden and
+the four newly written K/V slices, not megabytes of unwritten zero slots.
+
+- Frame 0: all five outputs byte-identical to baseline DLC.
+- Frame 1: hidden relative RMS 0.0067021823, max abs 0.0011291504;
+  layer4 K/V exact; layer5 key/value relative RMS 0.0002838911/0.0007203285.
+- All finite; passes the explicit 0.02 experimental device checkpoint, but
+  NOT byte-identical and NOT a long-context/whole-LM quality pass.
+- Independent same-frame resident six-repeat control, maximum HTP requests,
+  no detailed profiler, exclude first: baseline median 182.486 ms versus
+  candidate 39.0936 ms (4.668x execute-only speedup).
+
+A separate full Mimi/LM/Mimi two-frame run replacing ONLY 4_5 completed first
+and repeat. Both generated WAV hashes equal the baseline:
+`ea84d9bc97ac46c32d9726a2175ed288c2f333951eee2eb98cb27c51b9b72da4`.
+Wall totals: 75.599 s first / 33.3944 s repeat. This is NOT whole-App speedup
+evidence; other 25 graphs are unchanged and context/lifecycle costs remain.
+Artifacts: local `device_4_5/report.json`, `chain_f2.log`, `chain_f2.wav`, and
+the original/candidate `*_repeat6.csv` files under the candidate download root.
+
+Next: finish/verify download hashes; device checks for remaining shards; full
+candidate chain/token comparison; same-device whole-chain timing; only then
+publish a validated App inventory and replace its default model selection.
