@@ -121,3 +121,17 @@ SDK 2.45 references on remote:
 The shared-buffer tutorial uses `memRegister`, MEMHANDLE tensors and explicit
 buffer lifetime management; it does not make a RAW-buffer graph in-place by
 changing its ONNX operator alone.
+
+Aligned full-cache and aligned delta DLC conversion receipts are now successful.
+DLC info confirms layer_6_value Scatter data/update/output have the same scale
+0.000055024710 and offset -32768. The aligned full-cache model was downloaded,
+hash-verified (SHA256 7ffd1c521b67940a9daeaf1e1a544e4625004998228b3f5fff4bdb4174b6a6e0)
+and pushed to the phone. Its redirected benchmark command returned exit 0,
+but adb disconnected before output/timing retrieval; device accuracy is NOT
+confirmed. Retrieve `/data/local/tmp/moshi_cache1000_scatter_aligned_6_7.log`
+and `moshi_cache1000_scatter_aligned_timing.csv*` after reconnection.
+
+The aligned delta candidate also passed independent captured-input CPU probes:
+frame 0 all outputs exact; frame 1 all four newly written slots exact, hidden
+max error 1.7844e-5. This still does not establish recurrent device state parity.
+Remote directory: `/data3/yejialei/moshi-cache-1000-scatter-aligned-delta-6-7-v1`.
