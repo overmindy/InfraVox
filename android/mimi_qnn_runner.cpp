@@ -222,10 +222,15 @@ class Runtime {
       check(deviceStatus, "deviceCreate");
     }
     std::cerr << "QNN HTP and System DLC interfaces ready\n";
+    if (enabledEnvironment("MOSHI_QNN_PROFILE") && qnn.profileCreate) {
+      const auto level = enabledEnvironment("MOSHI_QNN_PROFILE_DETAILED") ? QNN_PROFILE_LEVEL_DETAILED : QNN_PROFILE_LEVEL_BASIC;
+      check(qnn.profileCreate(backend, level, &profile), "profileCreate");
+    }
   }
 
   ~Runtime() {
     endPerformanceVote();
+    if (profile && qnn.profileFree) qnn.profileFree(profile);
     if (device && qnn.deviceFree) qnn.deviceFree(device);
     if (backend && qnn.backendFree) qnn.backendFree(backend);
     // The HTP backend can retain process-wide cleanup hooks, so leave its SO loaded.
@@ -272,9 +277,37 @@ class Runtime {
     file << "graph,phase,milliseconds\n";
     for (const auto& row : timings) file << row.graph << ',' << row.phase << ',' << row.ms << '\n';
     if (!file) throw std::runtime_error("Cannot finish performance CSV: " + path);
+    if (!profileRows.empty()) {
+      std::ofstream events(path + ".qnn.csv");
+      if (!events) throw std::runtime_error("Cannot write QNN profile CSV");
+      events << "graph,event_type,event_unit,event_value,identifier\n";
+      for (const auto& row : profileRows) {
+        std::string label;
+        for (char c : row.identifier) { if (c == '"') label += '"'; label += c; }
+        events << row.graph << ',' << row.type << ',' << row.unit << ',' << row.value << ",\"" << label << "\"\n";
+      }
+    }
+  }
+  void collectProfile(const std::string& graph) {
+    if (!profile || !qnn.profileGetEvents || !qnn.profileGetEventData) return;
+    const QnnProfile_EventId_t* events = nullptr; uint32_t count = 0;
+    if (qnn.profileGetEvents(profile, &events, &count) != QNN_SUCCESS) return;
+    std::function<void(QnnProfile_EventId_t, int)> visit = [&](QnnProfile_EventId_t id, int depth) {
+      QnnProfile_EventData_t data{};
+      if (qnn.profileGetEventData(id, &data) == QNN_SUCCESS)
+        profileRows.push_back({graph, data.type, data.unit, data.value, data.identifier ? data.identifier : ""});
+      const QnnProfile_EventId_t* children = nullptr; uint32_t number = 0;
+      if (depth < 4 && qnn.profileGetSubEvents && qnn.profileGetSubEvents(id, &children, &number) == QNN_SUCCESS)
+        for (uint32_t i = 0; i < number; ++i) visit(children[i], depth + 1);
+    };
+    for (uint32_t i = 0; i < count; ++i) visit(events[i], 0);
   }
   struct Timing { std::string graph, phase; double ms; };
   std::vector<Timing> timings;
+  struct ProfileRow { std::string graph; uint32_t type, unit; uint64_t value; std::string identifier; };
+  std::vector<ProfileRow> profileRows;
+  Qnn_ProfileHandle_t profile = nullptr;
+
   QNN_INTERFACE_VER_TYPE qnn{};
   QNN_SYSTEM_INTERFACE_VER_TYPE system{};
   Qnn_BackendHandle_t backend = nullptr;
@@ -458,12 +491,13 @@ class Graph {
     resumeIo();
     const auto start = std::chrono::steady_clock::now();
     check(runtime_.qnn.graphExecute(graph_, inputTensors_.data(), inputTensors_.size(),
-                                    outputTensors_.data(), outputTensors_.size(), nullptr,
+                                    outputTensors_.data(), outputTensors_.size(), runtime_.profile,
                                     nullptr),
           "graphExecute " + name_);
     const auto end = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(end - start).count();
     runtime_.timing(label_, "execute", ms);
+    runtime_.collectProfile(label_);
     return ms;
   }
 
@@ -737,6 +771,12 @@ class PagedMoshiLm {
     // Keep OS/headroom; never automatically try to fill all physical RAM.
     const uint64_t available = availableMemoryBytes();
     uint64_t budget = available >= (8ULL << 30) ? std::min<uint64_t>(3ULL << 30, available / 4) : 0;
+    if (const char* experiment = std::getenv("MOSHI_TEMPORAL_BUDGET_MIB")) {
+      const uint64_t requested = std::stoull(experiment);
+      if (requested > 6144) throw std::runtime_error("Temporal experiment budget exceeds 6144 MiB");
+      const uint64_t headroom = 6ULL << 30;
+      budget = available > headroom ? std::min<uint64_t>(requested << 20, available - headroom) : 0;
+    }
     if (const char* limit = std::getenv("MOSHI_TEMPORAL_RESIDENT_MIB"))
       budget = std::min<uint64_t>(budget, std::stoull(limit) << 20);
     std::vector<std::pair<uint64_t, int>> candidates;
@@ -1055,6 +1095,7 @@ class PreparedMimiCodec {
   size_t run(const std::string& inputWav, const std::string& outputWav,
              size_t requestedFrames, const FrameCallback& callback = {}, bool highPerformance = false) {
     runtime_.timings.clear();
+    runtime_.profileRows.clear();
     const auto start = std::chrono::steady_clock::now();
     if (lm_) lm_->configureCache(outputWav + ".contexts-v1");
     const char* boost = std::getenv("MOSHI_HTP_PERFORMANCE");
