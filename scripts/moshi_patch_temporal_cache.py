@@ -52,7 +52,7 @@ def cache_input_for_output(model, name):
     raise ValueError("Cannot prove numbered cache output mapping")
 
 
-def patch(model, capacity, update, cache_output="full", scatter_encoding="source"):
+def patch(model, capacity, update, cache_output="full", scatter_encoding="source", external_base_dir=None):
     result = copy.deepcopy(model)
     cache_inputs = [v for v in result.graph.input if v.name.startswith("layer_")]
     if len(cache_inputs) != 4:
@@ -76,9 +76,13 @@ def patch(model, capacity, update, cache_output="full", scatter_encoding="source
             output.name = name
     producers = {o: n for n in result.graph.node for o in n.output}
     changes = []
+    encoding_names = {v for n in result.graph.node if n.op_type in ("QuantizeLinear", "DequantizeLinear")
+                      for v in n.input[1:]}
     # Fail closed for unrelated constant tensors containing the old capacity.
     for node in result.graph.node:
         if node.op_type != "Constant":
+            continue
+        if any(name in encoding_names for name in node.output):
             continue
         for attr in node.attribute:
             if attr.name != "value":
@@ -94,6 +98,33 @@ def patch(model, capacity, update, cache_output="full", scatter_encoding="source
                 continue
             attr.t.CopyFrom(numpy_helper.from_array(new))
             changes.append(node.name)
+    # Optimized cloud files hoist range/reshape constants into initializers.
+    # Load only small integer metadata, never all external weight tensors.
+    for tensor in result.graph.initializer:
+        if tensor.name in encoding_names:
+            continue
+        elements = int(np.prod(tensor.dims or [1]))
+        if elements > 4 and old not in tensor.dims:
+            continue
+        if tensor.data_type not in (onnx.TensorProto.INT32, onnx.TensorProto.INT64):
+            if old in tensor.dims:
+                raise ValueError(f"Unsupported non-integer capacity-dependent initializer {tensor.name}")
+            continue
+        if tensor.external_data:
+            if external_base_dir is None:
+                raise ValueError("External integer capacity metadata requires its source directory")
+        value = numpy_helper.to_array(tensor, base_dir=str(external_base_dir or ""))
+        if value.shape == (old,) and np.array_equal(value, np.arange(old)):
+            new = np.arange(capacity, dtype=value.dtype)
+        elif value.size <= 4 and np.any(value == old):
+            new = np.where(value == old, capacity, value).astype(value.dtype)
+        elif old in value.shape:
+            raise ValueError(f"Unsupported capacity-dependent initializer {tensor.name}")
+        else:
+            continue
+        name = tensor.name
+        tensor.CopyFrom(numpy_helper.from_array(new, name))
+        changes.append("initializer:" + name)
     for value in list(result.graph.input) + list(result.graph.output):
         if value.name.startswith(("layer_", "output_layer_")):
             value.type.tensor_type.shape.dim[2].dim_value = capacity
@@ -140,7 +171,7 @@ def patch(model, capacity, update, cache_output="full", scatter_encoding="source
                     name = tag + "_aligned_" + label
                     quantizer = quantizers[0]
                     q = helper.make_node("QuantizeLinear", [value, *encoding], [name + "_q"],
-                                         name=name + "_quantize", domain=quantizer.domain)
+                                         name=name + "_quantize", **({"domain": quantizer.domain} if quantizer.domain else {}))
                     q.attribute.extend(copy.deepcopy(quantizer.attribute))
                     # Preserve contrib-domain uint16 support when present in
                     # older cloud ONNX files; don't silently change QDQ dialect.
@@ -148,7 +179,7 @@ def patch(model, capacity, update, cache_output="full", scatter_encoding="source
                                   and n.input[0] == quantizer.output[0]]
                     dq_domain = downstream[0].domain if downstream else quantizer.domain
                     dq = helper.make_node("DequantizeLinear", [name + "_q", *encoding], [name],
-                                          name=name + "_dequantize", domain=dq_domain)
+                                          name=name + "_dequantize", **({"domain": dq_domain} if dq_domain else {}))
                     if downstream:
                         dq.attribute.extend(copy.deepcopy(downstream[0].attribute))
                     nodes.extend([q, dq])
@@ -199,6 +230,16 @@ def patch(model, capacity, update, cache_output="full", scatter_encoding="source
                     "in_place_runtime_verified": False}
 
 
+def semantic_bytes(model):
+    """Ignore only protobuf presence of the default ONNX operator domain."""
+    normalized = onnx.ModelProto()
+    normalized.CopyFrom(model)
+    for node in normalized.graph.node:
+        if node.domain == "":
+            node.ClearField("domain")
+    return normalized.SerializeToString()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
@@ -213,12 +254,16 @@ def main():
                         help="Validate an existing identical candidate without rewriting its model")
     parser.add_argument("--copy-external-data", action="store_true",
                         help="Allow one-time copy when source weights and output reside on different filesystems")
+    parser.add_argument("--max-relative-rms", type=float,
+                        help="Optional explicit RMS checkpoint; reports strict elementwise result separately")
     args = parser.parse_args()
     source = onnx.load(str(args.model), load_external_data=False)
-    changed, report = patch(source, args.capacity, args.update, args.cache_output, args.scatter_encoding)
+    if args.max_relative_rms is not None and not 0 < args.max_relative_rms <= 0.01:
+        raise ValueError("Diagnostic RMS checkpoint must be in (0, 0.01]")
+    changed, report = patch(source, args.capacity, args.update, args.cache_output, args.scatter_encoding, args.model.parent)
     if args.validate_existing:
         existing = onnx.load(str(args.output_dir / "model.onnx"), load_external_data=False)
-        if existing.SerializeToString() != changed.SerializeToString():
+        if semantic_bytes(existing) != semantic_bytes(changed):
             raise ValueError("Existing candidate differs from requested patch")
     else:
         args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -243,6 +288,8 @@ def main():
         onnx.save(changed, str(destination))
     onnx.checker.check_model(str(destination))
     report["samples"] = []
+    report["max_relative_rms_checkpoint"] = args.max_relative_rms
+    passed = True
     if args.samples:
         import onnxruntime as ort
         options = ort.SessionOptions()
@@ -264,6 +311,7 @@ def main():
             actual = modified.run(None, smaller)
             metrics = {}
             tolerances = {}
+            details = {}
             for output, got, ref in zip(original.get_outputs(), actual, expected):
                 canonical = report["output_aliases"].get(output.name, output.name)
                 if canonical.startswith("output_layer_"):
@@ -282,14 +330,24 @@ def main():
                     # a broad percentage tolerance that masks scale/offset bugs.
                     if scales:
                         atol = max(atol, 1.1 * float(numpy_helper.to_array(scales[0]).max()))
-                np.testing.assert_allclose(got, ref, rtol=2e-4, atol=atol)
+                error = got.astype(np.float64) - ref.astype(np.float64)
+                rmse = float(np.sqrt(np.mean(error * error)))
+                rms = float(np.sqrt(np.mean(ref.astype(np.float64) ** 2)))
+                relative = rmse / max(rms, 1e-12)
+                strict = bool(np.allclose(got, ref, rtol=2e-4, atol=atol))
+                accepted = strict if args.max_relative_rms is None else relative <= args.max_relative_rms
+                passed = passed and accepted
                 metrics[canonical] = float(np.max(np.abs(got - ref)))
                 tolerances[canonical] = atol
+                details[canonical] = {"rmse": rmse, "relative_rms": relative,
+                                      "strict_elementwise_passed": strict, "checkpoint_passed": accepted}
             report["samples"].append({"sample": str(sample), "position": position,
-                                      "max_abs": metrics, "allowed_absolute_error": tolerances})
-    report["passed"] = True
+                                      "max_abs": metrics, "allowed_absolute_error": tolerances, "metrics": details})
+    report["passed"] = passed
     (args.output_dir / "patch_report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2), flush=True)
+    if not passed:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

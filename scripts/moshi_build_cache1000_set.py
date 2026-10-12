@@ -17,6 +17,7 @@ import sys
 import time
 
 import onnx
+from moshi_patch_temporal_cache import semantic_bytes
 
 
 def write(path, data):
@@ -83,6 +84,8 @@ def main():
     parser.add_argument("--minimum-free-gib", type=int, default=20)
     parser.add_argument("--graph", action="append")
     parser.add_argument("--reuse-six-seven", type=Path)
+    parser.add_argument("--reuse-build-root", type=Path,
+                        help="Reuse matching source snapshots and converted candidates from a prior revision")
     args = parser.parse_args()
     if not 1 <= args.workers <= 4:
         raise ValueError("Use 1..4 workers")
@@ -125,7 +128,17 @@ def main():
             model = onnx.load(str(source), load_external_data=False)
             inputs = {v.name: [d.dim_value for d in v.type.tensor_type.shape.dim] for v in model.graph.input}
             original = directory / "reference" / "model.onnx"
-            copy_once(source, original)
+            prior = args.reuse_build_root / "graphs" / graph if args.reuse_build_root else None
+            snapshot = source
+            if prior and (prior / "signature.json").is_file():
+                old_signature = json.loads((prior / "signature.json").read_text())
+                if (old_signature["source"] == str(source)
+                        and old_signature["source_size"] == source.stat().st_size
+                        and old_signature["source_mtime_ns"] == source.stat().st_mtime_ns
+                        and old_signature["receipt"] == digest(receipt)
+                        and digest(prior / "reference/model.onnx") == digest(source)):
+                    snapshot = prior / "reference/model.onnx"
+            copy_once(snapshot, original)
             external = {}
             for tensor in model.graph.initializer:
                 metadata = {v.key: v.value for v in tensor.external_data}
@@ -136,7 +149,10 @@ def main():
                     raise ValueError("Unsafe external-data path")
                 info = (source.parent / relative).stat()
                 external[str(relative)] = {"bytes": info.st_size, "mtime_ns": info.st_mtime_ns}
-                copy_once(source.parent / relative, original.parent / relative)
+                snapshot_weight = snapshot.parent / relative
+                if snapshot != source and old_signature["external_files"].get(str(relative)) != external[str(relative)]:
+                    raise ValueError("Prior external-data snapshot signature differs from source")
+                copy_once(snapshot_weight, original.parent / relative)
             signature = {"source": str(source), "source_size": source.stat().st_size,
                          "source_mtime_ns": source.stat().st_mtime_ns, "receipt": digest(receipt),
                          "inputs": inputs, "external_files": external, "plan": plan}
@@ -177,8 +193,15 @@ def main():
                 run(command, log, 1800)
                 write(cpu_signature, signature)
             candidate_model = onnx.load(str(candidate / "model.onnx"), load_external_data=False)
-            if reused and candidate_model.SerializeToString() != onnx.load(str(reused / "model.onnx"), load_external_data=False).SerializeToString():
+            if reused and semantic_bytes(candidate_model) != semantic_bytes(onnx.load(str(reused / "model.onnx"), load_external_data=False)):
                 raise ValueError("Reused prototype is not identical to requested patched model")
+            if not reused and prior and (prior / "conversion.json").is_file():
+                old_conversion = json.loads((prior / "conversion.json").read_text())
+                if (old_conversion.get("status") == "success" and (prior / "model.dlc").is_file()
+                        and semantic_bytes(candidate_model) == semantic_bytes(onnx.load(
+                            str(prior / "candidate/model.onnx"), load_external_data=False))):
+                    copy_once(prior / "model.dlc", directory / "model.dlc")
+                    reused = prior
             if shutil.disk_usage(root).free < args.minimum_free_gib * 1024**3:
                 raise RuntimeError("Insufficient data3 headroom; leave prior results intact")
             conversion = directory / "conversion.json"
