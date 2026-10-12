@@ -135,3 +135,39 @@ The aligned delta candidate also passed independent captured-input CPU probes:
 frame 0 all outputs exact; frame 1 all four newly written slots exact, hidden
 max error 1.7844e-5. This still does not establish recurrent device state parity.
 Remote directory: `/data3/yejialei/moshi-cache-1000-scatter-aligned-delta-6-7-v1`.
+
+## Reconnected phone: results retrieved and recurrent probe passed
+
+Aligned full-cache frame-0 HTP hidden/value slots are byte-identical to the
+deployed original; key relative RMS is 0.000830 / 0.000909 (max one output LSB).
+The preceding large unaligned errors are fixed at this checkpoint.
+
+`MOSHI_BENCH_RECURRENT=1` changes `--benchmark-temporal` into a captured-hidden
+replay probe. Its raw input contains N consecutive 4096-float hidden frames.
+The Graph/input caches stay allocated. Each execute advances absolute position;
+only the newly written per-head slot is copied into persistent input buffers.
+Full-cache or delta-cache outputs are supported. No RAW input/output aliasing
+is used; the full input ABI and its transfer still exist.
+
+`scripts/moshi_pack_temporal_hidden.py` packs the real frame-0/1 calibration
+hidden values remotely (32 KiB). On-device original, 1000/Where, aligned full
+and aligned delta variants all completed this two-frame probe. For BOTH frames:
+Where hidden/written slots are byte-identical to original; aligned full and
+aligned delta are byte-identical to each other. Aligned-vs-original frame-1
+hidden relative RMS is 0.0008097; written-cache relative RMS is <=0.0009364.
+This is an isolated graph-state test, NOT complete LM/token/audio parity.
+
+An adjacent six-repeat no-detailed-profile control (same frame-0 input and
+maximum requests, exclude first) gave warm medians:
+
+| 1000-slot variant | Execute median |
+| --- | ---: |
+| Where, complete cache output | 37.7561 ms |
+| Aligned Scatter, complete cache output | 40.8009 ms |
+| Aligned Scatter, delta cache output | 32.7374 ms |
+
+Delta is about 19.8% less execute time than aligned full output, and 13.3% less
+than Where in this short control. Do not extrapolate to sustained App speed.
+Next deployment checks: manifest-driven capacities and delta feedback in
+PagedMoshiLm, remaining Temporal graph ABI variants (including numbered 0_1
+outputs), whole-chain parity, then long-context/wrap and registered-buffer work.

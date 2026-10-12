@@ -1089,16 +1089,19 @@ int main(int argc, char** argv) {
       std::vector<uint8_t> hidden((std::istreambuf_iterator<char>(file)), {});
       if (!file.eof() && !file) throw std::runtime_error("Cannot read captured hidden tensor");
       auto& input = graph.input("hidden"); expect(input, QNN_DATATYPE_FLOAT_32, 4096 * sizeof(float));
-      if (hidden.size() != input.bytes.size()) throw std::runtime_error("Captured hidden has incorrect size");
-      std::memcpy(input.bytes.data(), hidden.data(), hidden.size());
       auto& position = graph.input("position"); expect(position, QNN_DATATYPE_INT_32, sizeof(int32_t));
-      const int32_t zero = 0; std::memcpy(position.bytes.data(), &zero, sizeof(zero));
       // Real captured frame-0 input: all incoming K/V caches are initially zero.
       const size_t repeats = std::stoul(argv[7]);
       if (!repeats || repeats > 20) throw std::runtime_error("Use 1..20 benchmark repetitions");
+      const bool recurrent = enabledEnvironment("MOSHI_BENCH_RECURRENT");
+      if (hidden.size() != input.bytes.size() * (recurrent ? repeats : 1))
+        throw std::runtime_error("Captured hidden has incorrect size");
       std::vector<uint8_t> reference;
       if (enabledEnvironment("MOSHI_HTP_PERFORMANCE")) runtime.beginPerformanceVote();
       for (size_t i = 0; i < repeats; ++i) {
+        const int32_t absolute = recurrent ? static_cast<int32_t>(i) : 0;
+        std::memcpy(position.bytes.data(), &absolute, sizeof(absolute));
+        std::memcpy(input.bytes.data(), hidden.data() + (recurrent ? i * input.bytes.size() : 0), input.bytes.size());
         graph.execute();
         auto& output = graph.output("output_hidden");
         expect(output, QNN_DATATYPE_FLOAT_32, 4096 * sizeof(float));
@@ -1106,13 +1109,16 @@ int main(int argc, char** argv) {
           float value; std::memcpy(&value, output.bytes.data() + j, sizeof(value));
           if (!std::isfinite(value)) throw std::runtime_error("Nonfinite Temporal benchmark output");
         }
-        if (reference.empty()) reference = output.bytes;
-        else if (reference != output.bytes) throw std::runtime_error("Repeated captured-input output changed");
-        if (i == 0 && enabledEnvironment("MOSHI_BENCH_DUMP")) {
+        if (!recurrent) {
+          if (reference.empty()) reference = output.bytes;
+          else if (reference != output.bytes) throw std::runtime_error("Repeated captured-input output changed");
+        }
+        if ((i == 0 || recurrent) && enabledEnvironment("MOSHI_BENCH_DUMP")) {
           // Small parity artifacts, outside the timed execute: hidden plus the
           // written slot of each cache. Never dump megabytes of unwritten slots.
           const auto save = [&](const std::string& name, const std::vector<uint8_t>& bytes) {
-            std::ofstream stream(std::string(argv[6]) + "." + name + ".raw", std::ios::binary);
+            const std::string frame = recurrent ? ".frame_" + std::to_string(i) : "";
+            std::ofstream stream(std::string(argv[6]) + frame + "." + name + ".raw", std::ios::binary);
             stream.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             if (!stream) throw std::runtime_error("Cannot save benchmark output");
           };
@@ -1126,14 +1132,36 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> slot(32 * 128 * sizeof(float));
             for (size_t head = 0; head < 32; ++head)
               std::memcpy(slot.data() + head * 128 * sizeof(float),
-                          buffer.bytes.data() + head * shape[2] * 128 * sizeof(float),
+                          buffer.bytes.data() + (head * shape[2] + absolute % shape[2]) * 128 * sizeof(float),
                           128 * sizeof(float));
             save(buffer.name, slot);
           }
         }
+        if (recurrent) {
+          // Inputs remain allocated across frames. Scatter only the newly
+          // written per-head slice back into the persistent input cache.
+          // Do not alias RAW QNN input/output pointers or copy full history.
+          for (const auto& buffer : graph.benchmarkOutputs()) {
+            if (buffer.name.rfind("output_layer_", 0) != 0) continue;
+            auto& cache = graph.input(buffer.name.substr(7));
+            const auto* inShape = tensorDimensions(cache.tensor);
+            const auto* outShape = tensorDimensions(buffer.tensor);
+            if (tensorRank(cache.tensor) != 4 || tensorRank(buffer.tensor) != 4 ||
+                inShape[0] != 1 || inShape[1] != 32 || !inShape[2] || inShape[3] != 128 ||
+                outShape[0] != 1 || outShape[1] != 32 || outShape[3] != 128 ||
+                (outShape[2] != 1 && outShape[2] != inShape[2]) ||
+                tensorType(cache.tensor) != QNN_DATATYPE_FLOAT_32 || tensorType(buffer.tensor) != QNN_DATATYPE_FLOAT_32)
+              throw std::runtime_error("Unexpected recurrent cache ABI");
+            for (size_t head = 0; head < 32; ++head)
+              std::memcpy(cache.bytes.data() + (head * inShape[2] + absolute % inShape[2]) * 128 * sizeof(float),
+                          buffer.bytes.data() + (head * outShape[2] + absolute % outShape[2]) * 128 * sizeof(float),
+                          128 * sizeof(float));
+          }
+        }
       }
       runtime.endPerformanceVote(); runtime.writeTimings(argv[6]);
-      std::cout << "Captured-input resident Temporal benchmark: PASS\n";
+      std::cout << (recurrent ? "Captured-hidden recurrent Temporal probe: PASS\n"
+                             : "Captured-input resident Temporal benchmark: PASS\n");
       return 0;
     }
     if (argc == 5 && std::string(argv[1]) == "--benchmark-frontend") {
