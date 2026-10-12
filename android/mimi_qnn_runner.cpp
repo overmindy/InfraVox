@@ -31,6 +31,7 @@
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpContext.h"
 #include "HTP/QnnHtpSystemContext.h"
+#include "HTP/QnnHtpSystemContext.h"
 #include "moshi_lm_scheduler.h"
 #include "moshi_cache_prefix.h"
 #include "moshi_kv_ring.h"
@@ -65,6 +66,12 @@ class ContextAllocationError : public std::runtime_error {
  public:
   using std::runtime_error::runtime_error;
 };
+
+class ContextConfigError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
+};
+
 
 // Context binaries are device/runtime-specific caches, not replacement model files.
 // Keep the mapping alive until contextFree, including backends which retain it.
@@ -175,6 +182,8 @@ struct Buffer {
   Qnn_Tensor_t tensor{};
   std::vector<uint8_t> bytes;
   std::string name;
+  bool externalInput = false;
+  const uint8_t* externalData = nullptr;
 };
 
 class Runtime {
@@ -307,6 +316,8 @@ class Runtime {
   struct ProfileRow { std::string graph; uint32_t type, unit; uint64_t value; std::string identifier; };
   std::vector<ProfileRow> profileRows;
   Qnn_ProfileHandle_t profile = nullptr;
+  Qnn_ContextHandle_t groupLeader = nullptr;
+  uint64_t sharedSpillBytes = 0;
 
   QNN_INTERFACE_VER_TYPE qnn{};
   QNN_SYSTEM_INTERFACE_VER_TYPE system{};
@@ -328,7 +339,9 @@ struct ContextRestoreOptions {
   QnnHtpContext_CustomConfig_t accelerated{};
   QnnContext_Config_t acceleration{}, persistent{};
   std::vector<const QnnContext_Config_t*> values;
-  ContextRestoreOptions() {
+  QnnHtpContext_CustomConfig_t grouped{};
+  QnnContext_Config_t groupConfig{};
+  explicit ContextRestoreOptions(Runtime& runtime) {
     if (enabledEnvironment("MOSHI_CONTEXT_INIT_ACCELERATION")) {
       accelerated.option = QNN_HTP_CONTEXT_CONFIG_OPTION_INIT_ACCELERATION;
       accelerated.initAcceleration = true;
@@ -340,6 +353,14 @@ struct ContextRestoreOptions {
       persistent.option = QNN_CONTEXT_CONFIG_PERSISTENT_BINARY;
       persistent.isPersistentBinary = 1;
       values.push_back(&persistent);
+    }
+    if (runtime.sharedSpillBytes) {
+      grouped.option = QNN_HTP_CONTEXT_CONFIG_OPTION_REGISTER_MULTI_CONTEXTS;
+      grouped.groupRegistration.firstGroupHandle = runtime.groupLeader;
+      grouped.groupRegistration.maxSpillFillBuffer = runtime.sharedSpillBytes;
+      groupConfig.option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
+      groupConfig.customConfig = &grouped;
+      values.push_back(&groupConfig);
     }
     if (!values.empty()) values.push_back(nullptr);
   }
@@ -445,15 +466,25 @@ class Graph {
         graphInfo.graphName = g.graphName; graphInfo.graphInputs = g.graphInputs; graphInfo.numGraphInputs = g.numGraphInputs;
         graphInfo.graphOutputs = g.graphOutputs; graphInfo.numGraphOutputs = g.numGraphOutputs;
       } else throw std::runtime_error("Unsupported cached graph metadata");
-      ContextRestoreOptions options;
-      check(runtime_.qnn.contextCreateFromBinary(runtime_.backend, runtime_.device,
+      ContextRestoreOptions options(runtime_);
+      const auto status = runtime_.qnn.contextCreateFromBinary(runtime_.backend, runtime_.device,
           options.values.empty() ? nullptr : options.values.data(), binary_.data, binary_.size,
-          &context_, nullptr), "contextCreateFromBinary");
+          &context_, nullptr);
+      if (status == QNN_COMMON_ERROR_MEM_ALLOC || status == QNN_COMMON_ERROR_RESOURCE_UNAVAILABLE)
+        throw ContextAllocationError("Context resources exhausted: " + label_);
+      if (runtime_.sharedSpillBytes && status != QNN_SUCCESS)
+        throw ContextConfigError("Shared context registration failed: " + label_ + " QNN status " + std::to_string(status));
+      check(status, "contextCreateFromBinary");
+      if (runtime_.sharedSpillBytes && !runtime_.groupLeader) runtime_.groupLeader = context_;
       name_ = graphInfo.graphName;
       check(runtime_.qnn.graphRetrieve(context_, name_.c_str(), &graph_), "cached graphRetrieve");
       prepare(graphInfo.graphInputs, graphInfo.numGraphInputs, inputs_, inputTensors_, "input");
       prepare(graphInfo.graphOutputs, graphInfo.numGraphOutputs, outputs_, outputTensors_, "output");
       return true; // Already finalized: never finalize a deserialized context.
+    } catch (const ContextAllocationError&) {
+      release(); throw;
+    } catch (const ContextConfigError&) {
+      release(); throw;
     } catch (const std::exception& error) {
       std::cerr << "Context cache rejected; rebuilding DLC: " << error.what() << '\n';
       release(); inputs_.clear(); outputs_.clear(); inputTensors_.clear(); outputTensors_.clear();
@@ -515,6 +546,9 @@ class Graph {
 
   double execute() {
     resumeIo();
+    for (const auto& buffer : inputs_)
+      if (buffer.externalInput && !buffer.externalData)
+        throw std::runtime_error("Unbound external input: " + buffer.name);
     const auto start = std::chrono::steady_clock::now();
     check(runtime_.qnn.graphExecute(graph_, inputTensors_.data(), inputTensors_.size(),
                                     outputTensors_.data(), outputTensors_.size(), runtime_.profile,
@@ -557,12 +591,37 @@ class Graph {
     ioActive_ = false;
   }
 
+  void bindInputStorage(const std::string& name, const std::vector<uint8_t>& storage) {
+    resumeIo();
+    for (size_t i = 0; i < inputs_.size(); ++i) {
+      auto& buffer = inputs_[i];
+      if (buffer.name != name) continue;
+      if (!buffer.externalInput || tensorBytes(buffer.tensor) != storage.size() ||
+          (buffer.externalData && buffer.externalData != storage.data()))
+        throw std::runtime_error("External input storage changed: " + name);
+      buffer.externalData = storage.data();
+      // QNN's RAW descriptor uses void*, but this input is read-only during
+      // synchronous execute. Its independent delta output never aliases it.
+      setClientBuffer(buffer.tensor, const_cast<uint8_t*>(buffer.externalData),
+                      static_cast<uint32_t>(storage.size()));
+      inputTensors_[i] = buffer.tensor;
+      return;
+    }
+    throw std::runtime_error("Missing external input: " + name);
+  }
+
   void resumeIo() {
     if (ioActive_) return;
     const auto start = std::chrono::steady_clock::now();
     auto restore = [&](const std::string& role, std::vector<Buffer>& buffers, std::vector<Qnn_Tensor_t>& tensors) {
       for (size_t i = 0; i < buffers.size(); ++i) {
         auto& buffer = buffers[i];
+        if (buffer.externalInput) {
+          setClientBuffer(buffer.tensor, const_cast<uint8_t*>(buffer.externalData),
+                          static_cast<uint32_t>(tensorBytes(buffer.tensor)));
+          tensors[i] = buffer.tensor;
+          continue;
+        }
         ioPool_->take(role, i, tensorBytes(buffer.tensor), buffer.bytes);
         setClientBuffer(buffer.tensor, buffer.bytes.data(), static_cast<uint32_t>(buffer.bytes.size()));
         tensors[i] = buffer.tensor;
@@ -592,6 +651,17 @@ class Graph {
       auto& buffer = buffers[i];
       buffer.tensor = metadata[i];
       buffer.name = tensorName(metadata[i]);
+      const auto* shape = tensorDimensions(metadata[i]);
+      buffer.externalInput = ioPool_ && role == "input" &&
+          enabledEnvironment("MOSHI_TEMPORAL_BIND_RING") &&
+          buffer.name.rfind("layer_", 0) == 0 && tensorRank(metadata[i]) == 4 &&
+          shape[0] == 1 && shape[1] == 32 && shape[2] <= 1000 && shape[3] == 128 &&
+          tensorType(metadata[i]) == QNN_DATATYPE_FLOAT_32;
+      if (buffer.externalInput) {
+        setClientBuffer(buffer.tensor, nullptr, static_cast<uint32_t>(tensorBytes(metadata[i])));
+        tensors[i] = buffer.tensor;
+        continue;
+      }
       if (ioPool_) ioPool_->take(role, i, tensorBytes(metadata[i]), buffer.bytes);
       else buffer.bytes.resize(tensorBytes(metadata[i]));
       if (buffer.bytes.size() > UINT32_MAX) throw std::runtime_error("QNN client buffer exceeds uint32");
@@ -610,7 +680,8 @@ class Graph {
         if (i) std::cerr << ',';
         std::cerr << tensorDimensions(buffer.tensor)[i];
       }
-      std::cerr << "] bytes=" << buffer.bytes.size() << '\n';
+      std::cerr << "] bytes=" << tensorBytes(buffer.tensor)
+                << (buffer.externalInput ? " storage=external_ring" : "") << '\n';
     }
   }
 
@@ -799,12 +870,14 @@ class PagedMoshiLm {
     uint64_t budget = available >= (8ULL << 30) ? std::min<uint64_t>(3ULL << 30, available / 4) : 0;
     if (const char* experiment = std::getenv("MOSHI_TEMPORAL_BUDGET_MIB")) {
       const uint64_t requested = std::stoull(experiment);
-      if (requested > 6144) throw std::runtime_error("Temporal experiment budget exceeds 6144 MiB");
-      const uint64_t headroom = 6ULL << 30;
+      const bool binaryCost = enabledEnvironment("MOSHI_RESIDENT_COST_USE_BINARY");
+      if (requested > (binaryCost ? 8192 : 6144)) throw std::runtime_error("Temporal experiment budget exceeds supported limit");
+      const uint64_t headroom = (binaryCost ? 5ULL : 6ULL) << 30;
       budget = available > headroom ? std::min<uint64_t>(requested << 20, available - headroom) : 0;
     }
     if (const char* limit = std::getenv("MOSHI_TEMPORAL_RESIDENT_MIB"))
       budget = std::min<uint64_t>(budget, std::stoull(limit) << 20);
+    residencyBudget_ = budget;
     std::vector<std::pair<uint64_t, int>> candidates;
     for (int layer = 0; layer < 32; layer += 2) {
       struct stat info{};
@@ -822,6 +895,65 @@ class PagedMoshiLm {
     const char* overrideDirectory = std::getenv("MOSHI_CONTEXT_CACHE_DIR");
     cacheDirectory_ = overrideDirectory && *overrideDirectory ? overrideDirectory : directory;
     mkdir(cacheDirectory_.c_str(), 0700);
+    if (enabledEnvironment("MOSHI_RESIDENT_COST_USE_BINARY")) {
+      std::vector<std::pair<uint64_t, int>> costs;
+      for (int layer = 0; layer < 32; layer += 2) {
+        struct stat info{};
+        if (stat(cachePath(shardName(layer)).c_str(), &info))
+          throw ContextConfigError("Binary-cost planning requires all device context caches");
+        costs.emplace_back(info.st_size, layer);
+      }
+      std::sort(costs.begin(), costs.end());
+      residentTemporal_.clear();
+      uint64_t remaining = residencyBudget_;
+      for (const auto& cost : costs)
+        if (cost.first <= remaining) { residentTemporal_.insert(cost.second); remaining -= cost.first; }
+      std::cerr << "Binary-cost resident plan: " << residentTemporal_.size()
+                << " shards, budget_bytes=" << residencyBudget_
+                << "; proxy only, runtime admission still enforced\n";
+    }
+
+    if (enabledEnvironment("MOSHI_CONTEXT_GROUP")) {
+      std::vector<std::string> graphs = {"frontend", "head"};
+      for (int i = 0; i < 32; i += 2) graphs.push_back(shardName(i));
+      for (int i = 0; i < 8; ++i) graphs.push_back("depformer_codebook_" + std::to_string(i));
+      uint64_t maximumSpill = 0; bool complete = true;
+      for (const auto& graph : graphs) {
+        MappedBinary binary; QnnSystemContext_Handle_t sys = nullptr;
+        const QnnSystemContext_BinaryInfo_t* info = nullptr; Qnn_ContextBinarySize_t size = 0;
+        bool known = false;
+        if (binary.open(cachePath(graph)) && runtime_.system.systemContextCreate(&sys) == QNN_SUCCESS &&
+            runtime_.system.systemContextGetBinaryInfo(sys, binary.data, binary.size, &info, &size) == QNN_SUCCESS) {
+          if (info->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3) {
+            const auto& metadata = info->contextBinaryInfoV3;
+            if (metadata.numGraphs == 1 && metadata.graphs[0].version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3) {
+              const auto& g = metadata.graphs[0].graphInfoV3;
+              if (g.graphBlobInfo && g.graphBlobInfoSize >= sizeof(QnnHtpSystemContext_GraphBlobInfo_t)) {
+                const auto* htp = static_cast<const QnnHtpSystemContext_GraphBlobInfo_t*>(g.graphBlobInfo);
+                if (htp->version == QNN_SYSTEM_CONTEXT_HTP_GRAPH_INFO_BLOB_VERSION_V1) {
+                  maximumSpill = std::max(maximumSpill, htp->contextBinaryGraphBlobInfoV1.spillFillBufferSize);
+                  known = true;
+                }
+              }
+            }
+          }
+        }
+        if (sys) runtime_.system.systemContextFree(sys);
+        complete = complete && known;
+      }
+      runtime_.sharedSpillBytes = complete ? maximumSpill : 0;
+      std::cerr << "Shared context group: spill_bytes=" << runtime_.sharedSpillBytes << " metadata_complete=" << complete << '\n';
+      if (!complete) throw ContextConfigError("Missing HTP group metadata; sharing not enabled");
+    }
+  }
+
+  ~PagedMoshiLm() {
+    // Release contexts before the externally bound KV storage is destroyed.
+    temporalGraphs_.clear();
+    auto frontend = residentGraphs_.find("frontend");
+    std::unique_ptr<Graph> leader;
+    if (frontend != residentGraphs_.end()) { leader = std::move(frontend->second); residentGraphs_.erase(frontend); }
+    residentGraphs_.clear(); leader.reset(); runtime_.groupLeader = nullptr;
   }
 
   void reset() {
@@ -860,7 +992,8 @@ class PagedMoshiLm {
           if (!ring) ring = std::make_unique<MoshiKvRing>(32, capacity, 128 * sizeof(float));
           if (position < 0 || ring->capacity() != capacity || ring->nextPosition() != static_cast<uint64_t>(position))
             throw std::runtime_error("Temporal ring position or model capacity changed without reset");
-          std::memcpy(input.bytes.data(), ring->bytes().data(), input.bytes.size());
+          if (input.externalInput) graph.bindInputStorage(name, ring->bytes());
+          else std::memcpy(input.bytes.data(), ring->bytes().data(), input.bytes.size());
           continue;
         }
         auto& cache = temporalCache_[2 * layer + j];
@@ -959,13 +1092,29 @@ class PagedMoshiLm {
       return *found->second;
     }
     if (residentTemporal_.count(layer) && availableMemoryBytes() >= (4ULL << 30)) {
-      auto graph = std::make_unique<Graph>(runtime_, path(name), cachePath(name), &temporalIoPool_);
+      auto graph = createTemporal(name);
       auto& result = *graph;
       temporalGraphs_[layer] = std::move(graph);
       return result;
     }
-    paged = std::make_unique<Graph>(runtime_, path(name), cachePath(name), &temporalIoPool_);
+    paged = createTemporal(name);
     return *paged;
+  }
+  std::unique_ptr<Graph> createTemporal(const std::string& name) {
+    for (;;) {
+      try {
+        return std::make_unique<Graph>(runtime_, path(name), cachePath(name), &temporalIoPool_);
+      } catch (const ContextAllocationError&) {
+        if (temporalGraphs_.empty()) throw;
+        // Execution is synchronous and previous outputs/KV have been consumed.
+        // KV lives in temporalRing_/temporalCache_, not the retired context.
+        const int victim = temporalGraphs_.begin()->first;
+        const auto start = std::chrono::steady_clock::now();
+        temporalGraphs_.erase(victim);
+        residentTemporal_.erase(victim); // Do not repeatedly re-admit it this session.
+        runtime_.timing(shardName(victim), "resident_resource_evict", elapsedMs(start));
+      }
+    }
   }
   Graph& resident(const std::string& name) {
     auto& graph = residentGraphs_[name];
@@ -1007,7 +1156,11 @@ class PagedMoshiLm {
     if (tensorRank(buffer.tensor) != 4 || shape[0] != 1 || shape[1] != 32 ||
         !shape[2] || shape[2] > 3000 || shape[3] != 128)
       throw std::runtime_error("Unsupported Temporal cache layout: " + buffer.name);
-    expect(buffer, QNN_DATATYPE_FLOAT_32, 32ULL * shape[2] * 128 * sizeof(float));
+    const size_t size = 32ULL * shape[2] * 128 * sizeof(float);
+    if (buffer.externalInput) {
+      if (tensorType(buffer.tensor) != QNN_DATATYPE_FLOAT_32 || tensorBytes(buffer.tensor) != size)
+        throw std::runtime_error("Unexpected external cache contract: " + buffer.name);
+    } else expect(buffer, QNN_DATATYPE_FLOAT_32, size);
     return shape[2];
   }
   static Buffer& temporalOutput(Graph& graph, int layer, int index) {
@@ -1028,6 +1181,7 @@ class PagedMoshiLm {
   std::string directory_;
   std::string cacheDirectory_;
   GraphIoPool temporalIoPool_;
+  uint64_t residencyBudget_ = 0;
   std::set<int> residentTemporal_;
   std::map<int, std::unique_ptr<Graph>> temporalGraphs_;
   std::map<std::string, std::unique_ptr<Graph>> residentGraphs_;
@@ -1109,12 +1263,28 @@ size_t runMoshiFrames(Graph& encoder, Graph& decoder, PagedMoshiLm& lm,
   return emitted;
 }
 
+std::string codecContextCachePath(Runtime& runtime, const std::string& dlc,
+                                  const std::string& name) {
+  const char* directory = std::getenv("MOSHI_CODEC_CONTEXT_CACHE_DIR");
+  if (!directory || !*directory) return "";
+  mkdir(directory, 0700);
+  struct stat source{}, folder{};
+  if (stat(dlc.c_str(), &source) || stat(directory, &folder) || !S_ISDIR(folder.st_mode) ||
+      access(directory, W_OK)) throw std::runtime_error("Codec context cache directory is unavailable");
+  const auto& api = runtime.provider().apiVersion;
+  return std::string(directory) + "/" + name + "-" + std::to_string(source.st_size) + "-" +
+      std::to_string(source.st_mtime) + "-" + std::to_string(api.coreApiVersion.major) + "." +
+      std::to_string(api.coreApiVersion.minor) + "." + std::to_string(api.coreApiVersion.patch) + "-" +
+      std::to_string(api.backendApiVersion.major) + "." + std::to_string(api.backendApiVersion.minor) + "." +
+      std::to_string(api.backendApiVersion.patch) + ".bin";
+}
+
 class PreparedMimiCodec {
  public:
   PreparedMimiCodec(const std::string& libraryDir, const std::string& encoderDlc,
                     const std::string& decoderDlc, const std::string& lmDirectory = "")
-      : runtime_(libraryDir), encoder_(runtime_, encoderDlc),
-        decoder_(runtime_, decoderDlc) {
+      : runtime_(libraryDir), encoder_(runtime_, encoderDlc, codecContextCachePath(runtime_, encoderDlc, "mimi_encoder")),
+        decoder_(runtime_, decoderDlc, codecContextCachePath(runtime_, decoderDlc, "mimi_decoder")) {
     if (!lmDirectory.empty()) lm_ = std::make_unique<PagedMoshiLm>(runtime_, lmDirectory);
   }
 
@@ -1308,7 +1478,9 @@ int main(int argc, char** argv) {
       return 2;
     }
     if (argc >= 8) {
+      const auto prepareStart = std::chrono::steady_clock::now();
       PreparedMimiCodec session(argv[1], argv[2], argv[3], argv[7]);
+      std::cerr << "native_session_prepare_ms=" << elapsedMs(prepareStart) << '\n';
       session.run(argv[4], argv[5], std::stoul(argv[6]));
       if (argc == 9) session.run(argv[4], std::string(argv[5]) + ".repeat.wav", std::stoul(argv[6]));
     } else {

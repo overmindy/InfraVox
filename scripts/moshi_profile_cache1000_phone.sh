@@ -9,6 +9,23 @@ library_dir="${3:?Pass the currently installed App native library directory}"
 phone_root=/data/local/tmp/moshi-cache1000-full-profile-v1
 baseline_root=/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-guarded-v2
 result_root="$candidate_root/profile_full_v1"
+fast_options=""
+budget=3072
+output_name=full_f2.wav
+log_name=run.log
+if [ "${MOSHI_PREPARE_ONLY:-0}" = 1 ]; then
+  result_root="$candidate_root/profile_prepare_v1"
+  budget=0
+  output_name=prepare_f2.wav
+  log_name=prepare_run.log
+  fast_options="MOSHI_CONTEXT_INIT_ACCELERATION=1 MOSHI_CODEC_CONTEXT_CACHE_DIR=/data/local/tmp/moshi-codec-context-v1"
+elif [ "${MOSHI_FAST_PROFILE:-0}" = 1 ]; then
+  result_root="$candidate_root/profile_fast_v1"
+  budget=8192
+  output_name=fast_f2.wav
+  log_name=fast_run.log
+  fast_options="MOSHI_RESIDENT_COST_USE_BINARY=1 MOSHI_CONTEXT_GROUP=1 MOSHI_CONTEXT_INIT_ACCELERATION=1 MOSHI_CODEC_CONTEXT_CACHE_DIR=/data/local/tmp/moshi-codec-context-v1"
+fi
 mkdir -p "$result_root"
 # Bound the wait and keep incomplete downloads, rather than restarting them.
 for attempt in $(seq 1 240); do
@@ -40,18 +57,18 @@ for graph in frontend head depformer_codebook_{0..7}; do
   "$adb_bin" shell "test -f $baseline_root/dlc/$graph.dlc || exit 1; if ! test -e $phone_root/dlc/$graph.dlc; then ln -s $baseline_root/dlc/$graph.dlc $phone_root/dlc/$graph.dlc; fi"
 done
 "$adb_bin" push "$native_binary" "$phone_root/runner"
-echo "Starting real two-frame full candidate chain. No maximum/all-resident mode."
-if ! "$adb_bin" shell "env MOSHI_TEMPORAL_BUDGET_MIB=3072 MOSHI_QNN_PROFILE=1 MOSHI_HTP_PERFORMANCE=1 MOSHI_CONTEXT_CACHE_DIR=/data/local/tmp/moshi_context_chain_f2_v1.wav.contexts-v1 LD_LIBRARY_PATH=$library_dir ADSP_LIBRARY_PATH=$library_dir $phone_root/runner $library_dir /data/local/tmp/moshi-mimi-codec-v1/mimi_encoder.dlc /data/local/tmp/moshi-mimi-codec-v1/mimi_decoder.dlc /data/local/tmp/moshi-mimi-codec-v1/input.wav $phone_root/full_f2.wav 2 $phone_root --repeat > $phone_root/run.log 2>&1"; then
-  "$adb_bin" pull "$phone_root/run.log" "$result_root/" || true
+echo "Starting real two-frame candidate chain, budget=$budget; no maximum/batch mode."
+if ! "$adb_bin" shell "env $fast_options MOSHI_TEMPORAL_BUDGET_MIB=$budget MOSHI_QNN_PROFILE=1 MOSHI_HTP_PERFORMANCE=1 MOSHI_CONTEXT_CACHE_DIR=/data/local/tmp/moshi_context_chain_f2_v1.wav.contexts-v1 LD_LIBRARY_PATH=$library_dir ADSP_LIBRARY_PATH=$library_dir $phone_root/runner $library_dir /data/local/tmp/moshi-mimi-codec-v1/mimi_encoder.dlc /data/local/tmp/moshi-mimi-codec-v1/mimi_decoder.dlc /data/local/tmp/moshi-mimi-codec-v1/input.wav $phone_root/$output_name 2 $phone_root --repeat > $phone_root/$log_name 2>&1"; then
+  "$adb_bin" pull "$phone_root/$log_name" "$result_root/" || true
   echo "Native candidate failed; log retained. App default unchanged."
   exit 2
 fi
-for file in run.log full_f2.wav full_f2.wav.repeat.wav full_f2.wav.repeat.wav.performance.csv full_f2.wav.repeat.wav.performance.csv.qnn.csv full_f2.wav.repeat.wav.codes.txt; do
+for file in "$log_name" "$output_name" "$output_name.repeat.wav" "$output_name.repeat.wav.performance.csv" "$output_name.repeat.wav.performance.csv.qnn.csv" "$output_name.repeat.wav.codes.txt" "$output_name.repeat.wav.text_tokens.txt"; do
   "$adb_bin" pull "$phone_root/$file" "$result_root/"
 done
 python3 "$repo_root/scripts/moshi_summarize_runtime_profile.py" \
-  --timing "$result_root/full_f2.wav.repeat.wav.performance.csv" \
-  --qnn "$result_root/full_f2.wav.repeat.wav.performance.csv.qnn.csv" \
+  --timing "$result_root/$output_name.repeat.wav.performance.csv" \
+  --qnn "$result_root/$output_name.repeat.wav.performance.csv.qnn.csv" \
   --report "$result_root/report.json"
-"$adb_bin" shell "sha256sum $phone_root/full_f2.wav $phone_root/full_f2.wav.repeat.wav /data/local/tmp/moshi_context_chain_f2_v1.wav"
+"$adb_bin" shell "sha256sum $phone_root/$output_name $phone_root/$output_name.repeat.wav /data/local/tmp/moshi_context_chain_f2_v1.wav"
 echo "Native candidate profiling complete; inspect accuracy before App deployment."
