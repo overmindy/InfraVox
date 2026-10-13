@@ -380,3 +380,112 @@ Evidence directories under local `lm-cache1000-candidate-v1`:
 This is a real native phone-chain proof, NOT an updated installed-App/UI proof,
 long-context wrap proof, sustained thermal benchmark, or real-time result.
 Four inputs emit three 80 ms chunks; 3.424 s for 240 ms output is still not real time.
+
+## Android App integration (2.5)
+
+`RuntimeSettings` snapshots CLI environment options once per native session.
+`createConfiguredCodecSession` supplies the tested Android profile directly:
+init acceleration, BASIC profiling, codec caches, sequential shared context
+group, and 8192 MiB binary-size residency proxy. Ring RAW binding, persistent
+binary, maximum voltage/HMX, and async batch creation are not enabled.
+This avoids changing global experiment flags underneath a live JNI session.
+
+The Activity's fast switch requires a hash-verified default-directory bundle
+whose inventory declares `runtime_preset=cache1000-shared-v1`. It uses a separate
+`qnn-context-v1/cache1000-v1` directory. Missing binaries or HTP group metadata
+fail preparation; users can explicitly select the ordinary control profile.
+Initial loading and first execution are still different from a warm repeat.
+
+`scripts/moshi_deploy_cache1000_app.py` rechecks the recorded adjacent four-frame
+phone WAV/tokens, local/phone DLC hashes, copies all 26 models and matching
+contexts without external symlinks, preserves model mtimes for cache identity,
+and includes the two Mimi DLCs/caches. It does not overwrite differing files,
+change the original bundle, transfer device context caches between phones,
+or claim long-window quality. The promoted inventory records the precise
+short-chain validation scope; the original candidate manifest stays unchanged.
+
+Example (same previously tested phone only):
+
+```sh
+python3 scripts/moshi_deploy_cache1000_app.py \
+  --candidate /Users/e1ainay/d_personal/moshi-models/lm-cache1000-candidate-v1 \
+  --baseline /Users/e1ainay/d_personal/moshi-models/lm-guarded-v2 \
+  --output /Users/e1ainay/d_personal/moshi-models/lm-cache1000-candidate-v1/app_deployment/dlc_inventory.json \
+  --adb /Users/e1ainay/Android/platform-tools/adb --serial ATWV026602002286
+```
+
+In the App: scan default models; select both `Mimi: lm-cache1000-v1` and
+`LM: lm-cache1000-v1`, enable Moshi, retain the fast/HTP switches, load, use
+the built-in sample, and test four frames twice. Export each run for timing
+and byte comparison. Build with the original signing key (`KEYSTORE_PATH`),
+not a newly generated per-output-directory key; uninstalling would lose data.
+
+### App control result and remaining bottleneck
+
+2.5 was successfully installed over 2.3.1 with the original certificate;
+the default-directory scanner verified/selects the new bundle and its Mimi
+pair. A four-input-frame App run prepared codecs/configuration in about
+0.3 s, then first execution took 23.48 s and same-session repeat 10.86 s.
+The exported WAV SHA256, audio-code CSV, and text-token CSV match the native
+four-frame baseline exactly. Streaming playback was disabled for this timing.
+
+Unlike the earlier full-resident native trial, this App repeat restored
+`temporal_layers_2_3` and `temporal_layers_30_31` four times EACH. Their restore
+time totals 6026.645 ms (55.5% of 10855.6 ms wall_total); execution totals
+3112.446 ms. Therefore 3.424 s is NOT an installed-App speed claim. The next
+target is admission/lifetime of these two large contexts, not cache500.
+Planning/admission depend on live available memory; the exact reason for
+omission requires the captured plan and retained list, not nominal phone RAM.
+
+2.5.1 adds `.runtime.json` diagnostics: constructor-time available memory,
+effective proxy budget, shared spill size, planned/retained Temporal names,
+and post-run available memory. The App export button includes this JSON and
+the BASIC QNN CSV. These are separate from phase timing values; counts/budgets
+are never mislabeled as milliseconds. No increased memory thresholds or
+maximum-voltage experiment is included in this diagnostic build.
+
+App evidence: local `lm-cache1000-candidate-v1/phone_app_v2_5/{first,repeat}`.
+
+### Size-aware admission: installed 2.5.2 result
+
+2.5.1's runtime JSON showed a 16-Temporal plan but only 15 retained contexts.
+The final 30_31 was repeatedly paged because the uniform pre-load gate required
+4 GiB available, even for its approximately 824 MB device binary. Four-frame
+warm wall_total was 5984.88 ms with 2086.857 ms in four 30_31 restores.
+
+Only the Android fast profile now uses size-aware admission when binary costs
+and HTP group metadata are present. Pre-load requirement is 2 GiB + binary
+bytes + 12.5% sizing margin + declared shared workspace. This is an ESTIMATE,
+not a guaranteed OS free-memory floor; file size does not equal actual RAM.
+The initial 5 GiB planning headroom, 8 GiB maximum proxy budget, resource-failure
+eviction, ordinary-mode 4 GiB gate, and platform thermal control are retained.
+
+2.5.2 was installed with the original signature. Same App/UI four-frame test:
+- First execution: 13360.7 ms (UI 13.37 s), one restore per context.
+- Warm repeat: 3733.18 ms (UI 3.74 s), zero context restores, 16 Temporal
+  contexts ACTUALLY retained according to exported runtime JSON.
+- Execute: 2995.887 ms (80.3% of wall); restore_kv: 654.494 ms (17.5%).
+  Rows may overlap; do not sum parent/phase/profile values.
+- First/repeat WAV SHA256 equals the recorded baseline four-frame SHA above.
+  Audio/text token CSVs compare byte-identical.
+- One-second system MemAvailable samples in this short first trial reached
+  about 1.87 GiB. This is tighter than the older native trial; no sustained
+  thermal/memory-pressure or long-context proof is claimed.
+
+Evidence: `phone_app_v2_5_1` and `phone_app_v2_5_2` under the local candidate
+root; `app_deployment/v2_5_2_memory.log`. Next profile computation rather than
+context loading; cache500 remains deferred.
+
+An additional same-session run enabled incremental AudioTrack playback:
+UI wall 3.83 s, native pipeline wall 3655.79 ms, zero context restores.
+All four callbacks arrived; three PCM chunks wrote/played 5760/5760 samples,
+threshold was 1920 frames, no drain timeout. Two underruns were recorded:
+audio is delivered incrementally but computation gaps still prevent continuous
+real-time playback. Its WAV hash remains identical. Evidence: `phone_app_v2_5_2/stream`.
+
+Warm execute breakdown from exported phase CSV (111 dependent calls):
+Temporal 64 calls / 2598.611 ms (mean 40.603 ms per two-layer shard);
+DepFormer 32 / 206.842 ms; frontend 4 / 86.046 ms; head 4 / 17.821 ms;
+Mimi encoder 4 / 52.132 ms; decoder 3 / 34.435 ms. Thus Temporal computation
+is the next main target. These host graphExecute timings are not a measurement
+of NPU occupancy or proof of the W8A16 hardware limit.

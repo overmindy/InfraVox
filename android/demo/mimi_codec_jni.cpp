@@ -8,20 +8,12 @@
 #include <functional>
 #include <vector>
 
-void* createMimiCodecSession(const std::string& libraryDir,
-                             const std::string& encoderDlc,
-                             const std::string& decoderDlc);
-size_t runMimiCodecSession(void* session, const std::string& inputWav,
-                           const std::string& outputWav, size_t requestedFrames);
 size_t runMimiCodecSessionStreaming(void* session, const std::string& inputWav,
     const std::string& outputWav, size_t frames,
     const std::function<void(size_t, size_t, double, const std::vector<int16_t>&)>& callback, bool highPerformance);
 void destroyMimiCodecSession(void* session);
-void configureMimiCodecSessionCache(void* session, const std::string& directory);
-void* createMoshiCodecSession(const std::string& libraryDir,
-                              const std::string& encoderDlc,
-                              const std::string& decoderDlc,
-                              const std::string& lmDirectory);
+void* createConfiguredCodecSession(const std::string&, const std::string&,
+    const std::string&, const std::string&, const std::string&, bool);
 
 namespace {
 
@@ -51,18 +43,15 @@ void throwJava(JNIEnv* env, const char* message) {
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_overmindy_mimicodecdemo_MainActivity_nativePrepare(
     JNIEnv* env, jclass, jstring libraryDir, jstring encoderDlc,
-    jstring decoderDlc, jstring lmDirectory, jstring cacheDirectory) {
+    jstring decoderDlc, jstring lmDirectory, jstring cacheDirectory, jboolean fast) {
   try {
     const std::string libraries = JavaString(env, libraryDir).str();
     const std::string encoder = JavaString(env, encoderDlc).str();
     const std::string decoder = JavaString(env, decoderDlc).str();
     const std::string lm = JavaString(env, lmDirectory).str();
     setenv("ADSP_LIBRARY_PATH", libraries.c_str(), 1);
-    void* session = lm.empty()
-        ? createMimiCodecSession(libraries, encoder, decoder)
-        : createMoshiCodecSession(libraries, encoder, decoder, lm);
-    try { configureMimiCodecSessionCache(session, JavaString(env, cacheDirectory).str()); }
-    catch (...) { destroyMimiCodecSession(session); throw; }
+    void* session = createConfiguredCodecSession(libraries, encoder, decoder, lm,
+        JavaString(env, cacheDirectory).str(), fast == JNI_TRUE);
     return reinterpret_cast<jlong>(session);
   } catch (const std::exception& error) {
     throwJava(env, error.what());

@@ -31,7 +31,6 @@
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpContext.h"
 #include "HTP/QnnHtpSystemContext.h"
-#include "HTP/QnnHtpSystemContext.h"
 #include "moshi_lm_scheduler.h"
 #include "moshi_cache_prefix.h"
 #include "moshi_kv_ring.h"
@@ -186,9 +185,33 @@ struct Buffer {
   const uint8_t* externalData = nullptr;
 };
 
+// Snapshot experiment flags once. Android supplies per-session settings rather
+// than mutating process-global environment while contexts are alive.
+struct RuntimeSettings {
+  bool initAcceleration = enabledEnvironment("MOSHI_CONTEXT_INIT_ACCELERATION");
+  bool persistentBinary = enabledEnvironment("MOSHI_CONTEXT_PERSISTENT_BINARY");
+  bool contextGroup = enabledEnvironment("MOSHI_CONTEXT_GROUP");
+  bool binaryCost = enabledEnvironment("MOSHI_RESIDENT_COST_USE_BINARY");
+  bool sizeAwareAdmission = false;  // Android fast profile only; ordinary CLI unchanged.
+  bool bindRing = enabledEnvironment("MOSHI_TEMPORAL_BIND_RING");
+  bool profile = enabledEnvironment("MOSHI_QNN_PROFILE");
+  bool detailedProfile = enabledEnvironment("MOSHI_QNN_PROFILE_DETAILED");
+  bool performance = enabledEnvironment("MOSHI_HTP_PERFORMANCE");
+  std::optional<uint64_t> budgetMib;
+  std::optional<uint64_t> residentLimitMib;
+  std::string contextDirectory, codecDirectory;
+  RuntimeSettings() {
+    if (const char* value = std::getenv("MOSHI_TEMPORAL_BUDGET_MIB")) budgetMib = std::stoull(value);
+    if (const char* value = std::getenv("MOSHI_TEMPORAL_RESIDENT_MIB")) residentLimitMib = std::stoull(value);
+    if (const char* value = std::getenv("MOSHI_CONTEXT_CACHE_DIR")) contextDirectory = value;
+    if (const char* value = std::getenv("MOSHI_CODEC_CONTEXT_CACHE_DIR")) codecDirectory = value;
+  }
+};
+
 class Runtime {
  public:
-  explicit Runtime(const std::string& libraryDir) {
+  explicit Runtime(const std::string& libraryDir, RuntimeSettings options = RuntimeSettings())
+      : settings(std::move(options)) {
     backendLibrary_ = openLibrary(libraryDir + "/libQnnHtp.so");
     systemLibrary_ = openLibrary(libraryDir + "/libQnnSystem.so");
 
@@ -231,8 +254,8 @@ class Runtime {
       check(deviceStatus, "deviceCreate");
     }
     std::cerr << "QNN HTP and System DLC interfaces ready\n";
-    if (enabledEnvironment("MOSHI_QNN_PROFILE") && qnn.profileCreate) {
-      const auto level = enabledEnvironment("MOSHI_QNN_PROFILE_DETAILED") ? QNN_PROFILE_LEVEL_DETAILED : QNN_PROFILE_LEVEL_BASIC;
+    if (settings.profile && qnn.profileCreate) {
+      const auto level = settings.detailedProfile ? QNN_PROFILE_LEVEL_DETAILED : QNN_PROFILE_LEVEL_BASIC;
       check(qnn.profileCreate(backend, level, &profile), "profileCreate");
     }
   }
@@ -315,6 +338,7 @@ class Runtime {
   std::vector<Timing> timings;
   struct ProfileRow { std::string graph; uint32_t type, unit; uint64_t value; std::string identifier; };
   std::vector<ProfileRow> profileRows;
+  const RuntimeSettings settings;
   Qnn_ProfileHandle_t profile = nullptr;
   Qnn_ContextHandle_t groupLeader = nullptr;
   uint64_t sharedSpillBytes = 0;
@@ -342,14 +366,14 @@ struct ContextRestoreOptions {
   QnnHtpContext_CustomConfig_t grouped{};
   QnnContext_Config_t groupConfig{};
   explicit ContextRestoreOptions(Runtime& runtime) {
-    if (enabledEnvironment("MOSHI_CONTEXT_INIT_ACCELERATION")) {
+    if (runtime.settings.initAcceleration) {
       accelerated.option = QNN_HTP_CONTEXT_CONFIG_OPTION_INIT_ACCELERATION;
       accelerated.initAcceleration = true;
       acceleration.option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
       acceleration.customConfig = &accelerated;
       values.push_back(&acceleration);
     }
-    if (enabledEnvironment("MOSHI_CONTEXT_PERSISTENT_BINARY")) {
+    if (runtime.settings.persistentBinary) {
       persistent.option = QNN_CONTEXT_CONFIG_PERSISTENT_BINARY;
       persistent.isPersistentBinary = 1;
       values.push_back(&persistent);
@@ -653,7 +677,7 @@ class Graph {
       buffer.name = tensorName(metadata[i]);
       const auto* shape = tensorDimensions(metadata[i]);
       buffer.externalInput = ioPool_ && role == "input" &&
-          enabledEnvironment("MOSHI_TEMPORAL_BIND_RING") &&
+          runtime_.settings.bindRing &&
           buffer.name.rfind("layer_", 0) == 0 && tensorRank(metadata[i]) == 4 &&
           shape[0] == 1 && shape[1] == 32 && shape[2] <= 1000 && shape[3] == 128 &&
           tensorType(metadata[i]) == QNN_DATATYPE_FLOAT_32;
@@ -854,9 +878,8 @@ size_t runCodecFrames(Graph& encoder, Graph& decoder, const std::string& inputWa
     return requestedFrames;
 }
 
-// Keep one LM graph/context resident at a time. Full resident weights plus
-// 64 full FP32 Temporal caches exceed many phone memory budgets. This is an offline
-// correctness path, not a real-time implementation.
+// Retain budgeted contexts with sequential shared Temporal scratch I/O.
+// Recurrent cache storage is separate from context lifetime and resets per clip.
 class PagedMoshiLm {
  public:
   PagedMoshiLm(Runtime& runtime, std::string directory)
@@ -867,16 +890,17 @@ class PagedMoshiLm {
     // This is a conservative SOURCE-WEIGHT budget, not a claimed hard RSS cap.
     // Keep OS/headroom; never automatically try to fill all physical RAM.
     const uint64_t available = availableMemoryBytes();
+    availableAtPlanning_ = available;
     uint64_t budget = available >= (8ULL << 30) ? std::min<uint64_t>(3ULL << 30, available / 4) : 0;
-    if (const char* experiment = std::getenv("MOSHI_TEMPORAL_BUDGET_MIB")) {
-      const uint64_t requested = std::stoull(experiment);
-      const bool binaryCost = enabledEnvironment("MOSHI_RESIDENT_COST_USE_BINARY");
+    if (runtime_.settings.budgetMib) {
+      const uint64_t requested = *runtime_.settings.budgetMib;
+      const bool binaryCost = runtime_.settings.binaryCost;
       if (requested > (binaryCost ? 8192 : 6144)) throw std::runtime_error("Temporal experiment budget exceeds supported limit");
       const uint64_t headroom = (binaryCost ? 5ULL : 6ULL) << 30;
       budget = available > headroom ? std::min<uint64_t>(requested << 20, available - headroom) : 0;
     }
-    if (const char* limit = std::getenv("MOSHI_TEMPORAL_RESIDENT_MIB"))
-      budget = std::min<uint64_t>(budget, std::stoull(limit) << 20);
+    if (runtime_.settings.residentLimitMib)
+      budget = std::min<uint64_t>(budget, *runtime_.settings.residentLimitMib << 20);
     residencyBudget_ = budget;
     std::vector<std::pair<uint64_t, int>> candidates;
     for (int layer = 0; layer < 32; layer += 2) {
@@ -892,10 +916,9 @@ class PagedMoshiLm {
 
   void configureCache(const std::string& directory) {
     if (!cacheDirectory_.empty()) return;
-    const char* overrideDirectory = std::getenv("MOSHI_CONTEXT_CACHE_DIR");
-    cacheDirectory_ = overrideDirectory && *overrideDirectory ? overrideDirectory : directory;
+    cacheDirectory_ = runtime_.settings.contextDirectory.empty() ? directory : runtime_.settings.contextDirectory;
     mkdir(cacheDirectory_.c_str(), 0700);
-    if (enabledEnvironment("MOSHI_RESIDENT_COST_USE_BINARY")) {
+    if (runtime_.settings.binaryCost) {
       std::vector<std::pair<uint64_t, int>> costs;
       for (int layer = 0; layer < 32; layer += 2) {
         struct stat info{};
@@ -913,7 +936,7 @@ class PagedMoshiLm {
                 << "; proxy only, runtime admission still enforced\n";
     }
 
-    if (enabledEnvironment("MOSHI_CONTEXT_GROUP")) {
+    if (runtime_.settings.contextGroup) {
       std::vector<std::string> graphs = {"frontend", "head"};
       for (int i = 0; i < 32; i += 2) graphs.push_back(shardName(i));
       for (int i = 0; i < 8; ++i) graphs.push_back("depformer_codebook_" + std::to_string(i));
@@ -954,6 +977,26 @@ class PagedMoshiLm {
     std::unique_ptr<Graph> leader;
     if (frontend != residentGraphs_.end()) { leader = std::move(frontend->second); residentGraphs_.erase(frontend); }
     residentGraphs_.clear(); leader.reset(); runtime_.groupLeader = nullptr;
+  }
+
+  std::string residencyJson() const {
+    std::ostringstream out;
+    out << "{\"available_at_planning_bytes\":" << availableAtPlanning_
+        << ",\"residency_budget_bytes\":" << residencyBudget_
+        << ",\"shared_spill_bytes\":" << runtime_.sharedSpillBytes
+        << ",\"planned_temporal\":[";
+    bool separator = false;
+    for (int layer : residentTemporal_) {
+      if (separator) out << ',';
+      out << '"' << shardName(layer) << '"'; separator = true;
+    }
+    out << "],\"retained_temporal\":["; separator = false;
+    for (const auto& graph : temporalGraphs_) {
+      if (separator) out << ',';
+      out << '"' << shardName(graph.first) << '"'; separator = true;
+    }
+    out << "]}";
+    return out.str();
   }
 
   void reset() {
@@ -1091,7 +1134,18 @@ class PagedMoshiLm {
       runtime_.timing(name, "resident_reuse", 0);
       return *found->second;
     }
-    if (residentTemporal_.count(layer) && availableMemoryBytes() >= (4ULL << 30)) {
+    uint64_t required = 4ULL << 30;
+    if (runtime_.settings.sizeAwareAdmission && runtime_.settings.binaryCost && runtime_.sharedSpillBytes) {
+      struct stat binary{};
+      if (!stat(cachePath(name).c_str(), &binary) && binary.st_size > 0) {
+        const uint64_t cost = static_cast<uint64_t>(binary.st_size);
+        // Device binary size remains a proxy, not an exact RAM accounting.
+        // Reserve 2 GiB AFTER the estimated allocation, plus 12.5% sizing
+        // margin and the declared shared workspace. Never bypass allocations.
+        required = (2ULL << 30) + cost + cost / 8 + runtime_.sharedSpillBytes;
+      }
+    }
+    if (residentTemporal_.count(layer) && availableMemoryBytes() >= required) {
       auto graph = createTemporal(name);
       auto& result = *graph;
       temporalGraphs_[layer] = std::move(graph);
@@ -1182,6 +1236,7 @@ class PagedMoshiLm {
   std::string cacheDirectory_;
   GraphIoPool temporalIoPool_;
   uint64_t residencyBudget_ = 0;
+  uint64_t availableAtPlanning_ = 0;
   std::set<int> residentTemporal_;
   std::map<int, std::unique_ptr<Graph>> temporalGraphs_;
   std::map<std::string, std::unique_ptr<Graph>> residentGraphs_;
@@ -1265,8 +1320,8 @@ size_t runMoshiFrames(Graph& encoder, Graph& decoder, PagedMoshiLm& lm,
 
 std::string codecContextCachePath(Runtime& runtime, const std::string& dlc,
                                   const std::string& name) {
-  const char* directory = std::getenv("MOSHI_CODEC_CONTEXT_CACHE_DIR");
-  if (!directory || !*directory) return "";
+  const char* directory = runtime.settings.codecDirectory.c_str();
+  if (!*directory) return "";
   mkdir(directory, 0700);
   struct stat source{}, folder{};
   if (stat(dlc.c_str(), &source) || stat(directory, &folder) || !S_ISDIR(folder.st_mode) ||
@@ -1282,8 +1337,9 @@ std::string codecContextCachePath(Runtime& runtime, const std::string& dlc,
 class PreparedMimiCodec {
  public:
   PreparedMimiCodec(const std::string& libraryDir, const std::string& encoderDlc,
-                    const std::string& decoderDlc, const std::string& lmDirectory = "")
-      : runtime_(libraryDir), encoder_(runtime_, encoderDlc, codecContextCachePath(runtime_, encoderDlc, "mimi_encoder")),
+                    const std::string& decoderDlc, const std::string& lmDirectory = "",
+                    RuntimeSettings options = RuntimeSettings())
+      : runtime_(libraryDir, std::move(options)), encoder_(runtime_, encoderDlc, codecContextCachePath(runtime_, encoderDlc, "mimi_encoder")),
         decoder_(runtime_, decoderDlc, codecContextCachePath(runtime_, decoderDlc, "mimi_decoder")) {
     if (!lmDirectory.empty()) lm_ = std::make_unique<PagedMoshiLm>(runtime_, lmDirectory);
   }
@@ -1294,19 +1350,20 @@ class PreparedMimiCodec {
     runtime_.profileRows.clear();
     const auto start = std::chrono::steady_clock::now();
     if (lm_) lm_->configureCache(outputWav + ".contexts-v1");
-    const char* boost = std::getenv("MOSHI_HTP_PERFORMANCE");
-    if (highPerformance || (boost && std::string(boost) == "1")) runtime_.beginPerformanceVote();
+    if (highPerformance || runtime_.settings.performance) runtime_.beginPerformanceVote();
     try {
       const auto frames = lm_ ? runMoshiFrames(encoder_, decoder_, *lm_, inputWav, outputWav, requestedFrames, callback)
                               : runCodecFrames(encoder_, decoder_, inputWav, outputWav, requestedFrames);
       runtime_.timing("pipeline", "wall_total", elapsedMs(start));
       runtime_.endPerformanceVote();
       runtime_.writeTimings(outputWav + ".performance.csv");
+      writeConfiguration(outputWav + ".runtime.json");
       return frames;
     } catch (...) {
       runtime_.endPerformanceVote();
       runtime_.timing("pipeline", "wall_failed", elapsedMs(start));
       try { runtime_.writeTimings(outputWav + ".performance.csv"); } catch (...) {}
+      try { writeConfiguration(outputWav + ".runtime.json"); } catch (...) {}
       throw;
     }
   }
@@ -1316,6 +1373,18 @@ class PreparedMimiCodec {
   }
 
  private:
+  void writeConfiguration(const std::string& filename) const {
+    std::ofstream file(filename);
+    if (!file) throw std::runtime_error("Cannot write runtime configuration report");
+    file << "{\"format\":\"moshi-runtime-configuration-v1\",\"binary_cost\":"
+         << (runtime_.settings.binaryCost ? "true" : "false")
+         << ",\"context_group\":" << (runtime_.settings.contextGroup ? "true" : "false")
+         << ",\"size_aware_admission\":" << (runtime_.settings.sizeAwareAdmission ? "true" : "false")
+         << ",\"init_acceleration\":" << (runtime_.settings.initAcceleration ? "true" : "false")
+         << ",\"available_after_run_bytes\":" << availableMemoryBytes()
+         << ",\"lm\":" << (lm_ ? lm_->residencyJson() : "null") << "}\n";
+    if (!file) throw std::runtime_error("Failed writing runtime configuration report");
+  }
   Runtime runtime_;
   Graph encoder_;
   Graph decoder_;
@@ -1333,6 +1402,26 @@ void* createMoshiCodecSession(const std::string& libraryDir,
                               const std::string& decoderDlc,
                               const std::string& lmDirectory) {
   return new PreparedMimiCodec(libraryDir, encoderDlc, decoderDlc, lmDirectory);
+}
+
+void* createConfiguredCodecSession(const std::string& libraryDir,
+                                   const std::string& encoderDlc,
+                                   const std::string& decoderDlc,
+                                   const std::string& lmDirectory,
+                                   const std::string& cacheDirectory, bool fast) {
+  if (cacheDirectory.empty()) throw std::runtime_error("A writable context cache directory is required");
+  RuntimeSettings options;
+  options.contextDirectory = options.codecDirectory = cacheDirectory;
+  options.initAcceleration = true;
+  options.contextGroup = options.binaryCost = fast && !lmDirectory.empty();
+  options.sizeAwareAdmission = options.binaryCost;
+  options.budgetMib = options.binaryCost ? std::optional<uint64_t>(8192) : std::nullopt;
+  options.residentLimitMib.reset();
+  options.bindRing = options.persistentBinary = options.detailedProfile = options.performance = false;
+  options.profile = true;  // Basic QNN timing, matching the device control trials.
+  auto session = std::make_unique<PreparedMimiCodec>(libraryDir, encoderDlc, decoderDlc, lmDirectory, options);
+  session->configureCache(cacheDirectory);  // Missing/mismatched fast caches fail closed.
+  return session.release();
 }
 
 size_t runMimiCodecSession(void* session, const std::string& inputWav,

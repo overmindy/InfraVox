@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           package="com.overmindy.mimicodecdemo"
-          android:versionCode="6" android:versionName="2.3.1-stream-start">
+          android:versionCode="10" android:versionName="2.5.2-sized-residency">
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <application android:label="Moshi QNN Demo"

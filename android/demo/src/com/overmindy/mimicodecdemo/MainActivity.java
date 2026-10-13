@@ -76,6 +76,7 @@ public final class MainActivity extends Activity {
     private Switch moshiMode;
     private Switch streamPlayback;
     private Switch htpPerformance;
+    private Switch fastRuntime;
     private AudioTrack streamTrack; // Worker thread owns creation/write/release.
     private int streamedSamples;
     private int streamThresholdBefore, streamThresholdAfter, streamCallbacks, streamChunks;
@@ -91,7 +92,7 @@ public final class MainActivity extends Activity {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     private static native long nativePrepare(String libraryDir, String encoderDlc,
-                                             String decoderDlc, String lmDirectory, String cacheDirectory);
+                                             String decoderDlc, String lmDirectory, String cacheDirectory, boolean fast);
     private static native int nativeRunPrepared(long handle, String inputWav,
                                                  String outputWav, int frames, MainActivity receiver, boolean highPerformance);
     private static native void nativeRelease(long handle);
@@ -171,7 +172,7 @@ public final class MainActivity extends Activity {
 
         LinearLayout result = card(column);
         label(result, "③ 手机本地编码与重建", 19, Color.WHITE, true);
-        label(result, "LM 默认只跑 2 帧（160 ms 输入）。首次建立 context 缓存；后续跳过图编译，小图在会话内常驻。可填 2–3000，或 0 跑整段。",
+        label(result, "先跑 2–4 帧检查。加速版需选择 lm-cache1000-v1，并使用本手机匹配的 context 缓存；首次运行仍要装载权重，重复运行复用。1000 帧窗口的长音频质量尚未验证。",
               14, Color.rgb(176, 193, 210), false);
         lmFrameLimit = new EditText(this);
         lmFrameLimit.setInputType(InputType.TYPE_CLASS_NUMBER);
@@ -187,6 +188,16 @@ public final class MainActivity extends Activity {
         htpPerformance.setTextColor(Color.WHITE);
         htpPerformance.setChecked(true);
         result.addView(htpPerformance);
+        fastRuntime = new Switch(this);
+        fastRuntime.setText("已验证加速：cache1000＋共享工作区＋8 GiB 常驻预算（需完整本机缓存）");
+        fastRuntime.setTextColor(Color.WHITE);
+        fastRuntime.setChecked(true);
+        result.addView(fastRuntime);
+        fastRuntime.setOnCheckedChangeListener((button, enabled) -> {
+            releaseSelectedSession();
+            modelStatus.setText("运行配置已改变，请重新加载；未关闭系统温控。");
+            refresh();
+        });
         runButton = button(result, "运行 QNN Encoder → Decoder", this::runCodec);
         status = label(result, "加载模型并准备音频后可推理", 14,
                        Color.rgb(176, 193, 210), false);
@@ -542,6 +553,7 @@ public final class MainActivity extends Activity {
         if (working || recording || !modelFilesReady()) return;
         working = true;
         final boolean useLm = moshiMode.isChecked();
+        final boolean requestFast = useLm && fastRuntime.isChecked();
         modelStatus.setText("正在加载 Mimi 图；LM 使用本机 context 缓存、预算内常驻和共享缓冲…");
         refresh();
         worker.execute(() -> {
@@ -550,13 +562,27 @@ public final class MainActivity extends Activity {
                 long previous = sessionHandle;
                 sessionHandle = 0;
                 if (previous != 0) nativeRelease(previous);
+                File cache = contextCacheDirectory;
+                if (requestFast) {
+                    // Only the separately hash-verified, short-chain-tested bundle
+                    // opts into the fast profile. Original/SAF imports keep the control path.
+                    if (selectedLm == null || !localLmVerified)
+                        throw new IOException("请先从默认目录校验 lm-cache1000-v1；或关闭加速开关运行普通对照");
+                    JSONObject manifest = new JSONObject(new String(
+                        readSmallFile(new File(selectedLm, "dlc_inventory.json")), StandardCharsets.UTF_8));
+                    if (!"cache1000-shared-v1".equals(manifest.optString("runtime_preset")))
+                        throw new IOException("所选 LM 不是 cache1000 加速包；请选择新包或关闭加速开关");
+                    cache = new File(contextCacheDirectory, "cache1000-v1");
+                    if (!cache.isDirectory()) throw new IOException("缺少 cache1000-v1 本手机编译缓存；请部署缓存后再加载");
+                }
                 sessionHandle = nativePrepare(getApplicationInfo().nativeLibraryDir,
                         encoderFile().getAbsolutePath(),
                         decoderFile().getAbsolutePath(),
-                        useLm ? lmDirectory().getAbsolutePath() : "", contextCacheDirectory.getAbsolutePath());
+                        useLm ? lmDirectory().getAbsolutePath() : "", cache.getAbsolutePath(), requestFast);
                 double seconds = (System.nanoTime() - start) / 1e9;
                 runOnUiThread(() -> modelStatus.setText(String.format(Locale.US,
-                        useLm ? "Mimi 就绪；LM 首次运行建立本机 context 缓存，后续复用。准备用时 %.1f 秒"
+                        requestFast ? "加速配置已就绪；首次运行加载 LM，重复运行复用。准备用时 %.1f 秒"
+                              : useLm ? "Mimi 就绪；普通 LM 缓存对照模式。准备用时 %.1f 秒"
                               : "两个 Mimi DLC 已就绪；本次加载用时 %.1f 秒", seconds)));
             } catch (Exception error) {
                 runOnUiThread(() -> modelStatus.setText("加载失败：" + error.getMessage()));
@@ -891,6 +917,12 @@ public final class MainActivity extends Activity {
                 File performance = new File(outputFile().getAbsolutePath() + ".performance.csv");
                 if (performance.isFile())
                     saveDownload(performance, "moshi-" + suffix + "-performance.csv", "text/csv");
+                File qnnProfile = new File(outputFile().getAbsolutePath() + ".performance.csv.qnn.csv");
+                if (qnnProfile.isFile())
+                    saveDownload(qnnProfile, "moshi-" + suffix + "-qnn-profile.csv", "text/csv");
+                File configuration = new File(outputFile().getAbsolutePath() + ".runtime.json");
+                if (configuration.isFile())
+                    saveDownload(configuration, "moshi-" + suffix + "-runtime.json", "application/json");
                 File playback = new File(outputFile().getAbsolutePath() + ".playback.csv");
                 if (playback.isFile())
                     saveDownload(playback, "moshi-" + suffix + "-playback.csv", "text/csv");
@@ -927,11 +959,24 @@ public final class MainActivity extends Activity {
                     : new File(lmDirectory(), "READY").isFile()));
     }
 
+    private static byte[] readSmallFile(File file) throws IOException {
+        try (InputStream input = new FileInputStream(file);
+             ByteArrayOutputStream bytes = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[8192]; int count;
+            while ((count = input.read(buffer)) != -1) {
+                if (bytes.size() + count > 1024 * 1024) throw new IOException("清单超过 1 MiB");
+                bytes.write(buffer, 0, count);
+            }
+            return bytes.toByteArray();
+        }
+    }
+
     private void refresh() {
         if (working || recording) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (streamPlayback != null) streamPlayback.setEnabled(!working && !recording);
         if (htpPerformance != null) htpPerformance.setEnabled(!working && !recording);
+        if (fastRuntime != null) fastRuntime.setEnabled(!working && !recording);
         scanModelsButton.setEnabled(!working && !recording);
         moshiMode.setEnabled(!working && !recording);
         lmFrameLimit.setEnabled(!working && !recording && moshiMode.isChecked());
