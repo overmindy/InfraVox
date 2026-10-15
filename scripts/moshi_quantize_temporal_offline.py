@@ -39,6 +39,8 @@ def main():
     parser.add_argument("--sdk-root", type=Path, required=True)
     parser.add_argument("--numpy-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--param-calibration", choices=("min-max", "mse", "sqnr"), default="min-max")
+    parser.add_argument("--source-conversion-receipt", type=Path)
     args = parser.parse_args()
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise ValueError("Use a fresh output directory")
@@ -105,7 +107,7 @@ def main():
                "--input_list", str(input_list), "--weights_bitwidth", "4",
                "--act_bitwidth", "16", "--bias_bitwidth", "32",
                "--use_per_row_quantization", "--param_quantizer_schema", "symmetric",
-               "--param_quantizer_calibration", "min-max", "--act_quantizer_calibration", "min-max",
+               "--param_quantizer_calibration", args.param_calibration, "--act_quantizer_calibration", "min-max",
                "--preserve_io_datatype", "--use_native_input_files", "--dump_encoding_json"]
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(args.numpy_dir), str(args.sdk_root / "lib/python")])
@@ -120,6 +122,21 @@ def main():
               "script_sha256": sha256(__file__), "command": command, "status": "quantizing",
               "input_shapes": shapes, "cpu_verified": False, "device_verified": False,
               "default_bundle_replaced": False, "started_at": time.time()}
+    if args.source_conversion_receipt:
+        receipt = json.loads(args.source_conversion_receipt.read_text())
+        if receipt.get("status") != "success":
+            raise ValueError("Source conversion did not succeed")
+        converter_args = receipt["converter_args"]
+        if Path(converter_args[converter_args.index("--input_network") + 1]).resolve() != args.source_onnx.resolve():
+            raise ValueError("Conversion receipt refers to a different ONNX source")
+        if Path(converter_args[converter_args.index("--output_path") + 1]).resolve() != args.source_dlc.resolve():
+            raise ValueError("Conversion receipt refers to a different DLC")
+        report["source_conversion_receipt"] = str(args.source_conversion_receipt)
+        report["source_conversion_receipt_sha256"] = sha256(args.source_conversion_receipt)
+        if "--quantization_overrides" in converter_args:
+            overrides = Path(converter_args[converter_args.index("--quantization_overrides") + 1])
+            report["quantization_overrides"] = str(overrides)
+            report["quantization_overrides_sha256"] = sha256(overrides)
     write(args.output_dir / "quantization.json", report)
     print(f"Quantizing {args.graph}, calibration samples={len(samples)}", flush=True)
     started = time.monotonic()
