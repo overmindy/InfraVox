@@ -24,16 +24,24 @@ def audit(path):
             encoding = t.get_encoding()
             values = []
             axis = None
+            block = {}
             if is_scale_offset_encoding(encoding.type):
                 values = [encoding.encInfo]
             elif is_axis_scale_offset_encoding(encoding.type):
                 values = list(encoding.axisEncInfo.encInfos)
                 axis = encoding.axisEncInfo.axis
+            elif "BLOCKWISE_EXPANSION" in str(encoding.type):
+                info = encoding.lpbqEncInfo
+                values = list(info.encInfos)
+                axis = info.axis
+                block = {"block_size":info.blockSize,"blocks_per_channel":info.numBlocksPerAxis,
+                         "compressed_bitwidth":values[0].bw-info.blockScaleBitwidth,
+                         "block_scale_bitwidth":info.blockScaleBitwidth}
             return {"name": t.name(), "dtype": t.data_type_string(), "shape": t.dims(),
                     "static": t.is_static(), "data_bytes": t.get_data_size() if t.is_static() else None,
                     "encoding": str(encoding.type), "axis": axis,
                     "bitwidths": sorted(set(int(v.bw) for v in values)),
-                    "encoding_count": len(values)}
+                    "encoding_count": len(values), **block}
 
         rows = [{"name": op.name, "type": op.type,
                  "inputs": [tensor(t) for t in op.inputs()],

@@ -21,7 +21,7 @@ def main():
         p.add_argument("--"+name, type=Path, required=True)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--damping-fraction", type=float, default=32.0)
-    p.add_argument("--selection-limit", type=float, default=0.08)
+    p.add_argument("--selection-limit", type=float, default=0.095)
     args = p.parse_args()
     import numpy as np
     import onnx
@@ -65,7 +65,7 @@ def main():
             raise ValueError("Projection sample changed")
         with np.load(path) as data:
             snapshots.append({name:data[name] for name in data.files})
-    candidates, inputs = {}, {}
+    candidates, inputs, alternatives = {}, {}, {}
     result = {"format":"moshi-regularized-calibration-policy-v1", "status":"regularizing_rounding",
               "script_sha256":sha256(__file__), "device":args.device, "damping_fraction":args.damping_fraction,
               "parent_directory":str(awq), "compensated_directory":str(args.compensated_directory),
@@ -97,6 +97,7 @@ def main():
         for index,variant in enumerate(variants[1:],1):
             selected[:,choices==index] = variant[:,choices==index]
         candidates[name] = np.ascontiguousarray(selected)
+        alternatives[name] = [("per_channel_selection", candidates[name]), *list(zip(labels,variants))]
         scale8 = np.asarray(row["scale8"],np.float32)
         inputs[name] = np.ascontiguousarray(np.clip(np.rint(weight/scale8),-128,127)*scale8)
         result["projection_trials"].append({"node":row["node"],"choice_counts":{
@@ -167,23 +168,35 @@ def main():
         write(root/"RESULT.json",result)
         raise SystemExit(2)
     current = {row["name"]:8 for row in rows}
+    selected_methods = {}
     for row in sorted(rows,key=lambda v:-v["parameter_count"]):
         name = row["name"]
         before = inputs[name]
-        inputs[name] = candidates[name]
-        check = evaluate()
-        if check["passed"]:
+        best, trials = None, []
+        for method,weights in alternatives[name]:
+            inputs[name] = weights
+            check = evaluate()
+            maximum = max(v for sample in check["samples"] for v in sample["relative_rms"].values())
+            trials.append({"rounding_method":method,"max_relative_rms":maximum,**check})
+            if check["passed"] and (best is None or maximum < best["error"]):
+                best = {"method":method,"weights":weights,"error":maximum}
+            # Do not compare further rounding choices after a comfortable pass.
+            if best and best["error"] <= 0.05:
+                break
+        if best:
             current[name] = 4
+            inputs[name] = candidates[name] = best["weights"]
+            selected_methods[name] = best["method"]
         else:
             inputs[name] = before
-        result["policy_trials"].append({"node":row["node"],**check})
-        print("gated",row["node"],"W4",check["passed"],flush=True)
+        result["policy_trials"].append({"node":row["node"],"passed":best is not None,"rounding_trials":trials})
+        print("gated",row["node"],"W4",best is not None,"method",best["method"] if best else None,flush=True)
         write(root/"RESULT.json",result)
     for row in rows:
         name = row["name"]
         bits = current[name]
         row["bitwidth"] = bits
-        row["rounding_method"] = "selected_compensation" if bits==4 else "nearest"
+        row["rounding_method"] = selected_methods.get(name,"nearest")
         scale = np.asarray(row["scale"+str(bits)],np.float32)
         policy["param_encodings"][name] = [{"bitwidth":bits,"is_symmetric":"true","scale":float(s),"offset":0,
                                             "min":float(-(2**(bits-1))*s),"max":float((2**(bits-1)-1)*s)} for s in scale]

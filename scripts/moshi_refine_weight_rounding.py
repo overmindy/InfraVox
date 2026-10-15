@@ -33,6 +33,8 @@ def compensated_rounding(weight, inputs, scale, torch, device, damping_fraction=
         del covariance, chol, inverse, x
         work = torch.as_tensor(weight.T.copy(), device=device)[:, order].contiguous()
         scale = torch.as_tensor(scale, device=device)
+        if scale.ndim == 2:
+            scale = scale[:,order]
         quantized = torch.empty_like(work)
         # Block updates reduce launches and retain fixed, per-output-channel scales.
         for start in range(0, work.shape[1], 128):
@@ -42,7 +44,8 @@ def compensated_rounding(weight, inputs, scale, torch, device, damping_fraction=
             for column in range(end-start):
                 index = start+column
                 value = block[:, column].clone()
-                rounded = torch.clamp(torch.round(value/scale), -8, 7)*scale
+                column_scale = scale if scale.ndim==1 else scale[:,index]
+                rounded = torch.clamp(torch.round(value/column_scale), -8, 7)*column_scale
                 quantized[:, index] = rounded
                 correction = (value-rounded)/upper[index, index]
                 errors[:, column] = correction

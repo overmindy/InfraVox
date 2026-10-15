@@ -13,6 +13,21 @@ import sys
 from moshi_quantize_temporal_offline import sha256, write
 
 
+def scalar_encoding_dictionary(document):
+    """Normalize scalar activation entries from QAIRT encoding formats."""
+    if isinstance(document["activation_encodings"],dict):
+        return document["activation_encodings"]
+    result={}
+    for entry in document["activation_encodings"]:
+        if entry["dtype"].upper()=="FLOAT":
+            result[entry["name"]]=[{"dtype":"float","bitwidth":entry["bw"]}]
+        else:
+            if len(entry["scale"])!=1 or len(entry["offset"])!=1:
+                raise ValueError("Expected per-tensor activation encoding")
+            result[entry["name"]]=[{"bitwidth":entry["bw"],"scale":entry["scale"][0],"offset":entry["offset"][0]}]
+    return result
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--directory", required=True, type=Path)
@@ -32,16 +47,24 @@ def main():
     state = json.loads((d / "quantization.json").read_text())
     encodings = json.loads((d / "model.w4a16_encoding.json").read_text())
     source = Path(state["source_onnx"])
+    reference_source = Path(state.get("reference_onnx", str(source)))
     model = onnx.load(str(source))
+    original_reference = onnx.load(str(reference_source), load_external_data=False)
+    original_weights = {t.name:t for t in original_reference.graph.initializer}
     initializers = {t.name: i for i, t in enumerate(model.graph.initializer)}
+    projection_nodes = {n.input[1]:n for n in model.graph.node if n.op_type=="MatMul" and n.input[1] in initializers}
     reader = modeltools.IrDlcReader()
     reader.open(state["output_dlc"])
     graph = reader.get_ir_graph(next(iter(reader.get_ir_graph_names())))
     weights = []
+    aliases = {}
     for op in graph.get_ops():
         if op.type != "FullyConnected":
             continue
         t = op.inputs()[1]
+        source_node = projection_nodes[t.name()]
+        aliases[op.inputs()[0].name()] = source_node.input[0]
+        aliases[op.outputs()[0].name()] = source_node.output[0]
         bits = state.get("expected_projection_bits", {}).get(t.name(), 4)
         if bits == 32:
             if t.data_type_string() != "Float_32":
@@ -51,14 +74,21 @@ def main():
                 raise ValueError("Retained float weight differs from the source")
             weights.append({"name": t.name(), "shape": list(t.dims()), "bitwidth": 32, "relative_rms": 0.0})
             continue
-        info = t.get_encoding().axisEncInfo
+        blockwise = "BLOCKWISE_EXPANSION" in str(t.get_encoding().type)
+        info = t.get_encoding().lpbqEncInfo if blockwise else t.get_encoding().axisEncInfo
         values = list(info.encInfos)
-        if bits not in (4, 8) or info.axis != 0 or any(v.bw != bits for v in values):
+        actual_bits = values[0].bw-info.blockScaleBitwidth if blockwise else values[0].bw
+        if bits not in (4, 8) or info.axis != 0 or actual_bits != bits:
             raise ValueError("Unexpected projection encoding")
         raw = np.asarray(t.get_data()).astype(np.int16)
         lower, upper = -(2**(bits-1)), 2**(bits-1)-1
         signed = np.where(raw > upper, raw - 2**bits, raw).astype(np.float32)
         scales = np.asarray([v.scale for v in values], np.float32)[:, None]
+        if blockwise:
+            expansion = np.asarray(info.blocksScale8 or info.blocksScale16,np.float32).reshape(len(values),info.numBlocksPerAxis)
+            scales = scales*np.repeat(expansion,info.blockSize,axis=1)
+            if scales.shape != signed.shape:
+                raise ValueError("LPBQ expansion shape does not match weights")
         if any(v.offset != 0 for v in values):
             raise ValueError("Unexpected signed weight offset")
         dequantized = np.ascontiguousarray((signed * scales).T)
@@ -72,6 +102,17 @@ def main():
         weights.append({"name": t.name(), "shape": list(dequantized.shape), "bitwidth": bits,
                         "relative_rms": float(np.linalg.norm(dequantized - original) /
                                               max(np.linalg.norm(original), 1e-12))})
+        if reference_source != source:
+            baseline = numpy_helper.to_array(original_weights[t.name()], base_dir=str(reference_source.parent))
+            # AWQ rescales input channels. Undo that scale only for this diagnostic metric.
+            inverse_name = t.name()+"_awq_inverse"
+            if inverse_name in initializers:
+                inverse = numpy_helper.to_array(model.graph.initializer[initializers[inverse_name]])
+                baseline_candidate = dequantized*inverse[:,None]
+            else:
+                baseline_candidate = dequantized
+            weights[-1]["original_reference_relative_rms"] = float(
+                np.linalg.norm(baseline_candidate-baseline)/max(np.linalg.norm(baseline),1e-12))
         model.graph.initializer[initializers[t.name()]].CopyFrom(numpy_helper.from_array(dequantized, t.name()))
     if len(weights) != 8:
         raise ValueError("Expected eight static projection weights")
@@ -80,7 +121,11 @@ def main():
     mapped = {}
     missing = []
     preserved_float = []
-    for name, values in encodings["activation_encodings"].items():
+    mapped_aliases = {}
+    for dlc_name, values in scalar_encoding_dictionary(encodings).items():
+        name = aliases.get(dlc_name,dlc_name)
+        if name != dlc_name:
+            mapped_aliases[dlc_name] = name
         if name not in available:
             missing.append(name)
         elif len(values) == 1 and values[0].get("dtype") == "float":
@@ -132,7 +177,6 @@ def main():
     options = ort.SessionOptions()
     options.intra_op_num_threads = 4
     options.inter_op_num_threads = 1
-    reference_source = Path(state.get("reference_onnx", str(source)))
     if state.get("reference_onnx_sha256") and sha256(reference_source) != state["reference_onnx_sha256"]:
         raise ValueError("Original reference changed after the equivalent transformation")
     for name, digest in state.get("reference_external_sha256", {}).items():
@@ -142,10 +186,12 @@ def main():
     candidate = ort.InferenceSession(str(simulation), options, providers=["CPUExecutionProvider"])
     report = {"format": "moshi-dlc-derived-onnx-cpu-check-v1", "weights": weights,
               "mapped_a16_encodings": sorted(mapped), "unmapped_encodings": missing,
+              "projection_boundary_aliases": mapped_aliases,
               "preserved_float_tensors": preserved_float,
               "actual_dlc_execution": False, "device_verified": False,
               "source_onnx_sha256": sha256(source), "candidate_dlc_sha256": state["output_sha256"],
               "reference_onnx": str(reference_source), "reference_onnx_sha256": sha256(reference_source),
+              "weight_relative_rms_reference": "Converter input weights. The optional original-reference metric undoes AWQ input scaling.",
               "relative_rms_limit": 0.10, "samples": [],
               "scope": "Two teacher-forced source-graph simulations. QNN-only transforms are not reproduced."}
     for sample in state["samples"][:2]:
