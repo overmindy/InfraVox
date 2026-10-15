@@ -46,6 +46,9 @@ def main():
         if bits == 32:
             if t.data_type_string() != "Float_32":
                 raise ValueError("Expected a retained float projection")
+            original_float = numpy_helper.to_array(model.graph.initializer[initializers[t.name()]])
+            if not np.array_equal(np.asarray(t.get_data()).T, original_float):
+                raise ValueError("Retained float weight differs from the source")
             weights.append({"name": t.name(), "shape": list(t.dims()), "bitwidth": 32, "relative_rms": 0.0})
             continue
         info = t.get_encoding().axisEncInfo
