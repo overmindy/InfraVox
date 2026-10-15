@@ -76,7 +76,9 @@ def main():
                 array = arrays[name]
                 if name.startswith("layer_"):
                     array = array[:, :, :1000, :]
-                array = np.ascontiguousarray(array, dtype=dtypes[value.type.tensor_type.elem_type])
+                # The verified converter overrides ONNX int64 position to DLC int32.
+                dtype = np.int32 if name == "position" else dtypes[value.type.tensor_type.elem_type]
+                array = np.ascontiguousarray(array, dtype=dtype)
                 if list(array.shape) != shapes[name] or not np.isfinite(array).all():
                     raise ValueError(f"Invalid calibration input: {source}, {name}")
                 target = raw / f"{index:03d}_{name}.raw"
