@@ -132,13 +132,20 @@ def main():
     options = ort.SessionOptions()
     options.intra_op_num_threads = 4
     options.inter_op_num_threads = 1
-    reference = ort.InferenceSession(str(source), options, providers=["CPUExecutionProvider"])
+    reference_source = Path(state.get("reference_onnx", str(source)))
+    if state.get("reference_onnx_sha256") and sha256(reference_source) != state["reference_onnx_sha256"]:
+        raise ValueError("Original reference changed after the equivalent transformation")
+    for name, digest in state.get("reference_external_sha256", {}).items():
+        if sha256(reference_source.parent/name) != digest:
+            raise ValueError("Original reference weights changed")
+    reference = ort.InferenceSession(str(reference_source), options, providers=["CPUExecutionProvider"])
     candidate = ort.InferenceSession(str(simulation), options, providers=["CPUExecutionProvider"])
     report = {"format": "moshi-dlc-derived-onnx-cpu-check-v1", "weights": weights,
               "mapped_a16_encodings": sorted(mapped), "unmapped_encodings": missing,
               "preserved_float_tensors": preserved_float,
               "actual_dlc_execution": False, "device_verified": False,
               "source_onnx_sha256": sha256(source), "candidate_dlc_sha256": state["output_sha256"],
+              "reference_onnx": str(reference_source), "reference_onnx_sha256": sha256(reference_source),
               "relative_rms_limit": 0.10, "samples": [],
               "scope": "Two teacher-forced source-graph simulations. QNN-only transforms are not reproduced."}
     for sample in state["samples"][:2]:

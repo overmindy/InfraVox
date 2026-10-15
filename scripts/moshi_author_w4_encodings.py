@@ -1,4 +1,4 @@
-"""Author bounded rowwise W4 MSE encodings, then apply them with guarded QAIRT.
+"""Apply explicit W4/W8/float policies with guarded QAIRT, or author W4 MSE ranges.
 
 Reuse the existing 16-sample activation calibration. Preserve norm internals
 and attention masks as float. This is one range-search algorithm, not a model
@@ -85,8 +85,12 @@ def main():
     ratios = np.linspace(1.0, 0.2, 17, dtype=np.float32)
     statistics = []
     started = time.monotonic()
-    result = {"format": "moshi-authored-w4-mse-v1", "status": "authoring_weight_encodings",
+    method = "offline numpy rowwise weight MSE, 17 bounded ranges"
+    if args.reuse_weight_policy:
+        method = "offline explicit mixed weight policy; preserve each projection bitwidth and encoding"
+    result = {"format": "moshi-authored-weight-policy-v2", "status": "authoring_weight_encodings",
               "source_onnx": str(args.source_onnx), "source_onnx_sha256": prior["source_onnx_sha256"],
+              "method": method,
               "script_sha256": sha256(__file__), "ratios": ratios.tolist(), "row_chunk": 64,
               "activation_calibration_reused_from": str(args.reference_directory),
               "device_verified": False, "default_bundle_replaced": False}
@@ -97,6 +101,7 @@ def main():
         if provenance["source_onnx_sha256"] != prior["source_onnx_sha256"]:
             raise ValueError("Reused weights refer to a different source")
         reused_policy = json.loads(args.reuse_weight_policy.read_text())["param_encodings"]
+        result["weight_policy_provenance"] = provenance
         prior_stats = {v["name"]: v for v in json.loads((args.reuse_weight_policy.parent / "weight_statistics.json").read_text())}
     for node in model.graph.node:
         if node.op_type != "MatMul" or node.input[1] not in initializers:
@@ -212,11 +217,12 @@ def main():
     q = dict(prior)
     q.update(status="quantized_not_verified", output_dlc=str(output), output_sha256=sha256(output),
              output_bytes=output.stat().st_size, source_onnx=str(args.source_onnx),
-             script_sha256=sha256(__file__), method="offline numpy rowwise MSE, 17 bounded ranges",
+             script_sha256=sha256(__file__), method=method,
              activation_calibration_reused_from=str(args.reference_directory), quantization_overrides=str(policy_path),
              quantization_overrides_sha256=sha256(policy_path), converter_receipt_sha256=sha256(receipt),
              command=command, elapsed_s=time.monotonic() - started)
     q["expected_projection_bits"] = expected_bits
+    q["source_dlc_role"] = "baseline reference; quantization starts from source ONNX"
     if args.activation_encodings:
         q["activation_calibration_manifest"] = str(args.activation_encodings.parent / "calibration.json")
         q["activation_encodings_sha256"] = sha256(args.activation_encodings)
