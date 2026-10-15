@@ -22,6 +22,7 @@ def main():
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--damping-fraction", type=float, default=32.0)
     p.add_argument("--selection-limit", type=float, default=0.095)
+    p.add_argument("--prefer-node",action="append",default=[],help="Prioritize a projection identified by prior whole-shard sensitivity")
     args = p.parse_args()
     import numpy as np
     import onnx
@@ -72,6 +73,7 @@ def main():
               "original_source_sha256":parent["original_source_sha256"], "independent_quality_test":False,
               "fit_sample_count":12, "range_and_rounding_selection_sample_count":16,
               "selection_relative_rms_limit":args.selection_limit, "final_cpu_relative_rms_limit":0.10,
+              "preferred_nodes":args.prefer_node,
               "projection_trials":[], "policy_trials":[], "device_verified":False,
               "algorithm":"Per-channel rounding selection from AWQ, weak covariance compensation, and strong covariance compensation; gated on shard outputs and recurrence"}
     started = time.monotonic()
@@ -169,7 +171,10 @@ def main():
         raise SystemExit(2)
     current = {row["name"]:8 for row in rows}
     selected_methods = {}
-    for row in sorted(rows,key=lambda v:-v["parameter_count"]):
+    if any(name not in {row["node"] for row in rows} for name in args.prefer_node):
+        raise ValueError("Preferred projection is absent from the source")
+    order=sorted(rows,key=lambda v:(args.prefer_node.index(v["node"]) if v["node"] in args.prefer_node else len(args.prefer_node),-v["parameter_count"]))
+    for row in order:
         name = row["name"]
         before = inputs[name]
         best, trials = None, []

@@ -53,10 +53,21 @@ def main():
     original_weights = {t.name:t for t in original_reference.graph.initializer}
     initializers = {t.name: i for i, t in enumerate(model.graph.initializer)}
     projection_nodes = {n.input[1]:n for n in model.graph.node if n.op_type=="MatMul" and n.input[1] in initializers}
+    source_biases = {}
+    for weight,node in projection_nodes.items():
+        additions = [n for n in model.graph.node if n.op_type=="Add" and node.output[0] in n.input
+                     and any(name.endswith("_bias_correction") and name in initializers for name in n.input)]
+        if additions:
+            if len(additions)!=1:
+                raise ValueError("Ambiguous projection bias addition")
+            add=additions[0]
+            source_biases[weight]=(add.output[0],next(name for name in add.input if name in initializers))
     reader = modeltools.IrDlcReader()
     reader.open(state["output_dlc"])
     graph = reader.get_ir_graph(next(iter(reader.get_ir_graph_names())))
+    actual_types = {t.name():t.data_type_string() for op in graph.get_ops() for t in (*op.inputs(),*op.outputs())}
     weights = []
+    biases = []
     aliases = {}
     for op in graph.get_ops():
         if op.type != "FullyConnected":
@@ -64,7 +75,36 @@ def main():
         t = op.inputs()[1]
         source_node = projection_nodes[t.name()]
         aliases[op.inputs()[0].name()] = source_node.input[0]
-        aliases[op.outputs()[0].name()] = source_node.output[0]
+        aliases[op.outputs()[0].name()] = source_biases[t.name()][0] if t.name() in source_biases and len(op.inputs())>2 else source_node.output[0]
+        if t.name() in source_biases:
+            bias_name=source_biases[t.name()][1]
+            if len(op.inputs())>2:
+                bias_tensor=op.inputs()[2]
+            else:
+                choices=[v for operation in graph.get_ops() for v in operation.inputs()
+                         if v.is_static() and v.name().startswith(bias_name)]
+                if not choices:
+                    raise ValueError("Corrected bias is absent from actual DLC")
+                bias_tensor=next((v for v in choices if "Fxp" in v.data_type_string()),choices[0])
+            bias_dtype=bias_tensor.data_type_string()
+            raw_bias=np.asarray(bias_tensor.get_data())
+            if bias_dtype.startswith("Float_"):
+                decoded_bias=raw_bias.astype(np.float32)
+            else:
+                e=bias_tensor.get_encoding()
+                info=e.axisEncInfo.encInfos if "AXIS" in str(e.type) else [e.encInfo]
+                bw=info[0].bw
+                values=raw_bias.astype(np.int64)
+                if bias_dtype.startswith("sFxp_"):
+                    values=np.where(values>2**(bw-1)-1,values-2**bw,values)
+                scales=np.asarray([v.scale for v in info],np.float64)
+                offsets=np.asarray([v.offset for v in info],np.float64)
+                decoded_bias=((values.reshape(-1)+offsets)*scales).astype(np.float32)
+            original_bias=numpy_helper.to_array(model.graph.initializer[initializers[bias_name]])
+            decoded_bias=decoded_bias.reshape(original_bias.shape)
+            biases.append({"name":bias_name,"actual_tensor":bias_tensor.name(),"dtype":bias_dtype,
+                           "max_abs_rounding_error":float(np.max(np.abs(decoded_bias-original_bias)))})
+            model.graph.initializer[initializers[bias_name]].CopyFrom(numpy_helper.from_array(decoded_bias,bias_name))
         bits = state.get("expected_projection_bits", {}).get(t.name(), 4)
         if bits == 32:
             if t.data_type_string() != "Float_32":
@@ -122,10 +162,25 @@ def main():
     missing = []
     preserved_float = []
     mapped_aliases = {}
+    encoding_metadata_conflicts = []
+    inactive_encodings = []
     for dlc_name, values in scalar_encoding_dictionary(encodings).items():
         name = aliases.get(dlc_name,dlc_name)
         if name != dlc_name:
             mapped_aliases[dlc_name] = name
+        dtype = actual_types.get(dlc_name)
+        if dtype is None:
+            inactive_encodings.append(dlc_name)
+            continue
+        if dtype.startswith("Float_"):
+            if values[0].get("dtype") != "float":
+                encoding_metadata_conflicts.append({"name":dlc_name,"actual_dtype":dtype,"serialized_encoding":values})
+            if name in available:
+                preserved_float.append(name)
+            continue
+        if not dtype.startswith(("uFxp_","sFxp_")):
+            inactive_encodings.append(dlc_name)
+            continue
         if name not in available:
             missing.append(name)
         elif len(values) == 1 and values[0].get("dtype") == "float":
@@ -184,9 +239,11 @@ def main():
             raise ValueError("Original reference weights changed")
     reference = ort.InferenceSession(str(reference_source), options, providers=["CPUExecutionProvider"])
     candidate = ort.InferenceSession(str(simulation), options, providers=["CPUExecutionProvider"])
-    report = {"format": "moshi-dlc-derived-onnx-cpu-check-v1", "weights": weights,
+    report = {"format": "moshi-dlc-derived-onnx-cpu-check-v1", "weights": weights, "biases":biases,
               "mapped_a16_encodings": sorted(mapped), "unmapped_encodings": missing,
               "projection_boundary_aliases": mapped_aliases,
+              "encoding_metadata_conflicts": encoding_metadata_conflicts,
+              "inactive_encodings": inactive_encodings,
               "preserved_float_tensors": preserved_float,
               "actual_dlc_execution": False, "device_verified": False,
               "source_onnx_sha256": sha256(source), "candidate_dlc_sha256": state["output_sha256"],

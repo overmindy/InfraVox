@@ -1,5 +1,8 @@
 # Moshi Temporal 按敏感性选择精度
 
+后续结果见 [激活感知量化与两个分片的交付记录](MOSHI_ACTIVATION_AWARE_QUANTIZATION.md)。
+该记录保留本页的单投影候选，并继续提高 W4 覆盖率和检查 HTP 编译限制。
+
 本实验只处理 `temporal_layers_2_3`。用户暂不连接手机。
 候选保存在独立目录，不替换默认模型包。
 

@@ -203,6 +203,10 @@ def main():
                               ("moshi_validate_temporal_calibration.py","calibration_validation",[])):
         with (root/(leaf+".log")).open("w") as log:
             run=subprocess.run([sys.executable,str(scripts/script),"--directory",str(candidate),*extra],env=env,stdout=log,stderr=subprocess.STDOUT)
+        if not (candidate/(leaf+".json")).is_file():
+            result.update(status=leaf+"_tool_failed",returncode=run.returncode,diagnostic_log=str(root/(leaf+".log")))
+            write(root/"RESULT.json",result)
+            raise SystemExit(run.returncode or 2)
         check=json.loads((candidate/(leaf+".json")).read_text())
         result[leaf+"_passed"]=check["passed"]
         if leaf=="cpu_simulation":result["cpu_screen_passed"]=check["passed"]
@@ -212,6 +216,8 @@ def main():
     with (root/"compile.log").open("w") as log:
         run=subprocess.run([sys.executable,str(scripts/"moshi_compile_temporal_candidate.py"),"--directory",str(root),"--sdk-root",str(args.sdk_root)],env=env,stdout=log,stderr=subprocess.STDOUT)
     print("LPBQ workflow finished",run.returncode,"seconds",time.monotonic()-started,flush=True)
+    if run.returncode:
+        raise SystemExit(run.returncode)
 
 
 if __name__=="__main__":
