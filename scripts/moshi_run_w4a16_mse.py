@@ -70,7 +70,9 @@ def main():
     result = {"format": "moshi-w4a16-mse-experiment-v1", "status": "converting_float_exclusions",
               "source_onnx": str(source), "source_onnx_sha256": sha256(source),
               "policy_sha256": sha256(policy_path), "weight_calibration": "mse",
-              "device_verified": False, "default_bundle_replaced": False}
+              "device_verified": False, "default_bundle_replaced": False,
+              "script_sha256": sha256(__file__),
+              "scope": "One candidate, 16 existing calibration samples, two teacher-forced CPU samples."}
     write(root / "RESULT.json", result)
 
     def run(command, log):
