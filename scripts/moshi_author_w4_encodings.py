@@ -21,6 +21,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("source-onnx", "reference-directory", "output-root", "sdk-root", "numpy-dir"):
         p.add_argument("--" + name, required=True, type=Path)
+    p.add_argument("--reuse-weight-policy", type=Path)
+    p.add_argument("--activation-encodings", type=Path)
     args = p.parse_args()
     root = args.output_root
     if root.exists() and any(root.iterdir()):
@@ -39,7 +41,7 @@ def main():
     prior = json.loads((args.reference_directory / "quantization.json").read_text())
     if sha256(args.source_onnx) != prior["source_onnx_sha256"]:
         raise ValueError("Activation calibration belongs to a different source")
-    model = onnx.load(str(args.source_onnx))
+    model = onnx.load(str(args.source_onnx), load_external_data=not bool(args.reuse_weight_policy))
     if any(n.op_type in ("QuantizeLinear", "DequantizeLinear") for n in model.graph.node):
         raise ValueError("Refusing repeated quantization of QDQ input")
     initializers = {t.name: t for t in model.graph.initializer}
@@ -49,6 +51,15 @@ def main():
         name: copy.deepcopy(value) for name, value in old["activation_encodings"].items() if name in available},
         "param_encodings": copy.deepcopy(old["param_encodings"])}
     float_value = [{"bitwidth": 32, "dtype": "float"}]
+    fresh_activations = None
+    if args.activation_encodings:
+        provenance = json.loads((args.activation_encodings.parent / "calibration.json").read_text())
+        if provenance["source_sha256"] != prior["source_onnx_sha256"]:
+            raise ValueError("Projection calibration has a different source")
+        fresh_activations = json.loads(args.activation_encodings.read_text())["activation_encodings"]
+        policy["activation_encodings"] = copy.deepcopy(fresh_activations)
+        policy["param_encodings"] = {name: float_value for name in old["param_encodings"]
+                                     if not name.startswith("onnx::MatMul_")}
     for node in model.graph.node:
         norm = node.name.startswith(("/norm1/", "/norm1_1/", "/norm2/", "/norm2_1/"))
         if (norm and not node.name.endswith("/Mul_1")) or node.name in ("/Add_1", "/Add_5", "/Where_3", "/Where_7"):
@@ -68,6 +79,9 @@ def main():
     for name in policy["param_encodings"]:
         if "norm" in name:
             policy["param_encodings"][name] = float_value
+    if fresh_activations:
+        # Cast/reshape aliases must not turn the projection boundary into float.
+        policy["activation_encodings"].update(copy.deepcopy(fresh_activations))
     ratios = np.linspace(1.0, 0.2, 17, dtype=np.float32)
     statistics = []
     started = time.monotonic()
@@ -77,10 +91,24 @@ def main():
               "activation_calibration_reused_from": str(args.reference_directory),
               "device_verified": False, "default_bundle_replaced": False}
     write(root / "RESULT.json", result)
+    reused_policy = None
+    if args.reuse_weight_policy:
+        provenance = json.loads((args.reuse_weight_policy.parent / "RESULT.json").read_text())
+        if provenance["source_onnx_sha256"] != prior["source_onnx_sha256"]:
+            raise ValueError("Reused weights refer to a different source")
+        reused_policy = json.loads(args.reuse_weight_policy.read_text())["param_encodings"]
+        prior_stats = {v["name"]: v for v in json.loads((args.reuse_weight_policy.parent / "weight_statistics.json").read_text())}
     for node in model.graph.node:
         if node.op_type != "MatMul" or node.input[1] not in initializers:
             continue
         name = node.input[1]
+        if reused_policy is not None:
+            encodings = reused_policy[name]
+            if len(encodings) != initializers[name].dims[1] or any(v["bitwidth"] != 4 for v in encodings):
+                raise ValueError("Reused W4 encoding has an unexpected shape or bitwidth")
+            policy["param_encodings"][name] = copy.deepcopy(encodings)
+            statistics.append(prior_stats[name])
+            continue
         original = numpy_helper.to_array(initializers[name])
         rows = np.ascontiguousarray(original.T)
         encodings = []
@@ -116,6 +144,11 @@ def main():
         del rows
     if len(statistics) != 8:
         raise ValueError("Expected eight projection weights")
+    write(root / "weight_statistics.json", statistics)
+    if args.reuse_weight_policy:
+        result["reused_weight_policy_sha256"] = sha256(args.reuse_weight_policy)
+    if args.activation_encodings:
+        result["activation_encodings_sha256"] = sha256(args.activation_encodings)
     result["weight_authoring_s"] = time.monotonic() - started
     policy_path = root / "quantization_overrides.json"
     write(policy_path, policy)
