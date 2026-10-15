@@ -104,9 +104,15 @@ def main():
         name = node.input[1]
         if reused_policy is not None:
             encodings = reused_policy[name]
-            if len(encodings) != initializers[name].dims[1] or any(v["bitwidth"] != 4 for v in encodings):
-                raise ValueError("Reused W4 encoding has an unexpected shape or bitwidth")
+            float_weight = len(encodings) == 1 and encodings[0].get("dtype") == "float"
+            if not float_weight and (len(encodings) != initializers[name].dims[1]
+                    or len({v["bitwidth"] for v in encodings}) != 1
+                    or encodings[0]["bitwidth"] not in (4, 8)):
+                raise ValueError("Reused weight encoding has an unexpected shape or bitwidth")
             policy["param_encodings"][name] = copy.deepcopy(encodings)
+            if float_weight:
+                policy["activation_encodings"][node.input[0]] = float_value
+                policy["activation_encodings"][node.output[0]] = float_value
             statistics.append(prior_stats[name])
             continue
         original = numpy_helper.to_array(initializers[name])
@@ -181,6 +187,21 @@ def main():
     from moshi_check_offline_dlc import audit
     actual = audit(output)
     write(candidate / "precision_audit.json", actual)
+    expected_bits = {name: values[0]["bitwidth"] for name, values in policy["param_encodings"].items()
+                     if name.startswith("onnx::MatMul_")}
+    actual_projections = [row for g in actual["graphs"] for row in g["projections"] if row["type"] == "FullyConnected"]
+    precision_passed = len(actual_projections) == 8 and all(
+        (expected_bits[row["inputs"][1]["name"]] == 32
+         and row["inputs"][1]["dtype"] == "Float_32") or (
+        row["inputs"][1]["bitwidths"] == [expected_bits[row["inputs"][1]["name"]]]
+        and row["inputs"][0]["dtype"] == "uFxp_16" and row["outputs"][0]["dtype"] == "uFxp_16")
+        for row in actual_projections)
+    result["expected_projection_bits"] = expected_bits
+    result["actual_precision_passed"] = precision_passed
+    if not precision_passed:
+        result["status"] = "precision_gate_failed"
+        write(root / "RESULT.json", result)
+        return
     reader = modeltools.IrDlcReader()
     reader.open(str(output))
     graph = reader.get_ir_graph(next(iter(reader.get_ir_graph_names())))
@@ -195,6 +216,10 @@ def main():
              activation_calibration_reused_from=str(args.reference_directory), quantization_overrides=str(policy_path),
              quantization_overrides_sha256=sha256(policy_path), converter_receipt_sha256=sha256(receipt),
              command=command, elapsed_s=time.monotonic() - started)
+    q["expected_projection_bits"] = expected_bits
+    if args.activation_encodings:
+        q["activation_calibration_manifest"] = str(args.activation_encodings.parent / "calibration.json")
+        q["activation_encodings_sha256"] = sha256(args.activation_encodings)
     write(candidate / "quantization.json", q)
     result.update(status="cpu_simulation", candidate=str(candidate), output_bytes=q["output_bytes"])
     write(root / "RESULT.json", result)

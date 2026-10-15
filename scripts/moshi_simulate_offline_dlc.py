@@ -42,24 +42,31 @@ def main():
         if op.type != "FullyConnected":
             continue
         t = op.inputs()[1]
+        bits = state.get("expected_projection_bits", {}).get(t.name(), 4)
+        if bits == 32:
+            if t.data_type_string() != "Float_32":
+                raise ValueError("Expected a retained float projection")
+            weights.append({"name": t.name(), "shape": list(t.dims()), "bitwidth": 32, "relative_rms": 0.0})
+            continue
         info = t.get_encoding().axisEncInfo
         values = list(info.encInfos)
-        if info.axis != 0 or any(v.bw != 4 for v in values):
+        if bits not in (4, 8) or info.axis != 0 or any(v.bw != bits for v in values):
             raise ValueError("Unexpected projection encoding")
         raw = np.asarray(t.get_data()).astype(np.int16)
-        signed = np.where(raw >= 8, raw - 16, raw).astype(np.float32)
+        lower, upper = -(2**(bits-1)), 2**(bits-1)-1
+        signed = np.where(raw > upper, raw - 2**bits, raw).astype(np.float32)
         scales = np.asarray([v.scale for v in values], np.float32)[:, None]
         if any(v.offset != 0 for v in values):
             raise ValueError("Unexpected signed weight offset")
         dequantized = np.ascontiguousarray((signed * scales).T)
         original = numpy_helper.to_array(model.graph.initializer[initializers[t.name()]])
-        expected_codes = np.clip(np.rint(original.T / scales), -8, 7)
+        expected_codes = np.clip(np.rint(original.T / scales), lower, upper)
         if not np.array_equal(expected_codes, signed):
             # QAIRT rounds half-way values away from zero on some paths.
             mismatches = expected_codes != signed
             if np.any(np.abs(original.T / scales - signed)[mismatches] > 0.5001):
                 raise ValueError("DLC nibble decoding does not match original weight rounding")
-        weights.append({"name": t.name(), "shape": list(dequantized.shape), "bitwidth": 4,
+        weights.append({"name": t.name(), "shape": list(dequantized.shape), "bitwidth": bits,
                         "relative_rms": float(np.linalg.norm(dequantized - original) /
                                               max(np.linalg.norm(original), 1e-12))})
         model.graph.initializer[initializers[t.name()]].CopyFrom(numpy_helper.from_array(dequantized, t.name()))

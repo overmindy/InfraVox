@@ -10,6 +10,7 @@ def main():
     p.add_argument("--source-onnx", type=Path, required=True)
     p.add_argument("--reference-directory", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--save-projections", action="store_true")
     args = p.parse_args()
     import numpy as np
     import onnx
@@ -53,7 +54,10 @@ def main():
     session = ort.InferenceSession(str(probe), opts, providers=["CPUExecutionProvider"])
     ranges = {name: [0.0, 0.0] for name in names}
     output_ranges = {name: [0.0, 0.0] for name in original_output_names}
-    for sample in prior["samples"]:
+    saved = []
+    if args.save_projections:
+        (root / "projection_samples").mkdir()
+    for index, sample in enumerate(prior["samples"]):
         path = Path(prior["calibration_manifest"]).parent / sample["file"]
         if sha256(path) != sample["sha256"]:
             raise ValueError("Calibration sample changed")
@@ -63,6 +67,11 @@ def main():
             if name.startswith("layer_"):
                 feed[name] = feed[name][:, :, :1000, :].copy()
         values = session.run(None, feed)
+        if args.save_projections:
+            target_path = root / "projection_samples" / f"{index:03d}.npz"
+            np.savez_compressed(target_path, **{v.name: a for v, a in zip(session.get_outputs(), values) if v.name in names})
+            saved.append({"file": str(target_path.relative_to(root)), "source_id": sample["source_id"],
+                          "frame": sample["frame"], "sha256": sha256(target_path)})
         for output, value in zip(session.get_outputs(), values):
             if not np.isfinite(value).all():
                 raise ValueError("Source calibration produced nonfinite values")
@@ -81,6 +90,7 @@ def main():
                                                "param_encodings": {}})
     write(root / "calibration.json", {"source_sha256": prior["source_onnx_sha256"], "samples": prior["samples"],
                                       "ranges": ranges, "source_output_ranges": output_ranges,
+                                      "projection_samples": saved,
                                       "script_sha256": sha256(__file__), "quality_test": False})
 
 
