@@ -69,9 +69,12 @@ def main():
     available = {v.name for v in model.graph.input} | {o for n in model.graph.node for o in n.output}
     mapped = {}
     missing = []
+    preserved_float = []
     for name, values in encodings["activation_encodings"].items():
         if name not in available:
             missing.append(name)
+        elif len(values) == 1 and values[0].get("dtype") == "float":
+            preserved_float.append(name)
         elif len(values) != 1 or values[0]["bitwidth"] != 16:
             raise ValueError("Expected scalar A16 encoding")
         else:
@@ -123,6 +126,7 @@ def main():
     candidate = ort.InferenceSession(str(simulation), options, providers=["CPUExecutionProvider"])
     report = {"format": "moshi-dlc-derived-onnx-cpu-check-v1", "weights": weights,
               "mapped_a16_encodings": sorted(mapped), "unmapped_encodings": missing,
+              "preserved_float_tensors": preserved_float,
               "actual_dlc_execution": False, "device_verified": False,
               "source_onnx_sha256": sha256(source), "candidate_dlc_sha256": state["output_sha256"],
               "relative_rms_limit": 0.10, "samples": [],
