@@ -1,7 +1,9 @@
 # Moshi 激活感知与 LPBQ 离线量化
 
-本轮处理 `temporal_layers_2_3` 和 `temporal_layers_30_31`。用户暂不连接手机。
+本轮处理 `temporal_layers_2_3` 和 `temporal_layers_30_31`。初期先进行离线实验。
 所有候选使用独立目录，不替换默认模型包。
+`2_3` LPBQ 后续手机结果见 [手机验证报告](MOSHI_LPBQ_PHONE_VALIDATION.md)：
+实际单片 DMA-BUF 减少 557 MiB；同为 16 片常驻、无重载的完整暖运行减少约 2.57%。
 
 2026-10-16 后续修复：`temporal_layers_2_3` 的 7 个 LPBQ W4、1 个 W8
 候选已通过完整 HTP v81 离线编译。修复将静态 MatMul 改写为等价 1×1 Conv，

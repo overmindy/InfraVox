@@ -1,7 +1,9 @@
 # Moshi LPBQ 算子表示修复与正确性审计
 
 日期：2026-10-16。目标：修复真实 Temporal 分片的 LPBQ 离线编译失败。
-手机未连接。默认模型包未替换。只处理 `temporal_layers_2_3`。
+本文记录离线阶段。默认模型包未替换。只处理 `temporal_layers_2_3`。
+后续已完成手机单片、4 帧及 38 帧检查，详见
+[手机验证报告](MOSHI_LPBQ_PHONE_VALIDATION.md)。
 
 ## 已完成结果
 
