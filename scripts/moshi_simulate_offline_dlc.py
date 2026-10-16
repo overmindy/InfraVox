@@ -52,7 +52,8 @@ def main():
     original_reference = onnx.load(str(reference_source), load_external_data=False)
     original_weights = {t.name:t for t in original_reference.graph.initializer}
     initializers = {t.name: i for i, t in enumerate(model.graph.initializer)}
-    projection_nodes = {n.input[1]:n for n in model.graph.node if n.op_type=="MatMul" and n.input[1] in initializers}
+    projection_nodes = {n.input[1]:n for n in model.graph.node
+                        if n.op_type in ("MatMul", "Conv") and n.input[1] in initializers}
     source_biases = {}
     for weight,node in projection_nodes.items():
         additions = [n for n in model.graph.node if n.op_type=="Add" and node.output[0] in n.input
@@ -70,10 +71,15 @@ def main():
     biases = []
     aliases = {}
     for op in graph.get_ops():
-        if op.type != "FullyConnected":
+        if op.type not in ("FullyConnected", "Conv2d"):
             continue
         t = op.inputs()[1]
         source_node = projection_nodes[t.name()]
+        is_conv = source_node.op_type == "Conv"
+        if is_conv and (op.type != "Conv2d" or t.dims()[:2] != [1, 1]):
+            raise ValueError("Only equivalent pointwise projection convolutions are supported")
+        if is_conv and len(op.inputs()) > 2 and np.any(op.inputs()[2].get_data()):
+            raise ValueError("Expected the converter's implicit zero convolution bias")
         aliases[op.inputs()[0].name()] = source_node.input[0]
         aliases[op.outputs()[0].name()] = source_biases[t.name()][0] if t.name() in source_biases and len(op.inputs())>2 else source_node.output[0]
         if t.name() in source_biases:
@@ -118,9 +124,12 @@ def main():
         info = t.get_encoding().lpbqEncInfo if blockwise else t.get_encoding().axisEncInfo
         values = list(info.encInfos)
         actual_bits = values[0].bw-info.blockScaleBitwidth if blockwise else values[0].bw
-        if bits not in (4, 8) or info.axis != 0 or actual_bits != bits:
+        if bits not in (4, 8) or info.axis != (3 if is_conv else 0) or actual_bits != bits:
             raise ValueError("Unexpected projection encoding")
         raw = np.asarray(t.get_data()).astype(np.int16)
+        if is_conv:
+            # QNN stores pointwise convolution weights as HWIO, ONNX as OIHW.
+            raw = raw[0, 0].T
         lower, upper = -(2**(bits-1)), 2**(bits-1)-1
         signed = np.where(raw > upper, raw - 2**bits, raw).astype(np.float32)
         scales = np.asarray([v.scale for v in values], np.float32)[:, None]
@@ -131,13 +140,16 @@ def main():
                 raise ValueError("LPBQ expansion shape does not match weights")
         if any(v.offset != 0 for v in values):
             raise ValueError("Unexpected signed weight offset")
-        dequantized = np.ascontiguousarray((signed * scales).T)
         original = numpy_helper.to_array(model.graph.initializer[initializers[t.name()]])
-        expected_codes = np.clip(np.rint(original.T / scales), lower, upper)
+        canonical_original = original[:, :, 0, 0] if is_conv else original.T
+        canonical_dequantized = signed * scales
+        dequantized = np.ascontiguousarray(canonical_dequantized[:, :, None, None] if is_conv
+                                         else canonical_dequantized.T)
+        expected_codes = np.clip(np.rint(canonical_original / scales), lower, upper)
         if not np.array_equal(expected_codes, signed):
             # QAIRT rounds half-way values away from zero on some paths.
             mismatches = expected_codes != signed
-            if np.any(np.abs(original.T / scales - signed)[mismatches] > 0.5001):
+            if np.any(np.abs(canonical_original / scales - signed)[mismatches] > 0.5001):
                 raise ValueError("DLC nibble decoding does not match original weight rounding")
         weights.append({"name": t.name(), "shape": list(dequantized.shape), "bitwidth": bits,
                         "relative_rms": float(np.linalg.norm(dequantized - original) /
@@ -148,9 +160,9 @@ def main():
             inverse_name = t.name()+"_awq_inverse"
             if inverse_name in initializers:
                 inverse = numpy_helper.to_array(model.graph.initializer[initializers[inverse_name]])
-                baseline_candidate = dequantized*inverse[:,None]
+                baseline_candidate = canonical_dequantized.T*inverse[:,None]
             else:
-                baseline_candidate = dequantized
+                baseline_candidate = canonical_dequantized.T
             weights[-1]["original_reference_relative_rms"] = float(
                 np.linalg.norm(baseline_candidate-baseline)/max(np.linalg.norm(baseline),1e-12))
         model.graph.initializer[initializers[t.name()]].CopyFrom(numpy_helper.from_array(dequantized, t.name()))

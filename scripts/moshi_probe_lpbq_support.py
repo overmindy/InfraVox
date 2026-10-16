@@ -1,4 +1,4 @@
-"""Check a small LPBQ W4/A16 FullyConnected conversion and HTP v81 compile."""
+"""Check LPBQ W4/A16 MatMul or pointwise Conv conversion and HTP compile."""
 import argparse
 import json
 import os
@@ -17,6 +17,7 @@ def main():
     p.add_argument("--output-width",type=int,default=256)
     p.add_argument("--input-rank",type=int,choices=(2,3),default=2)
     p.add_argument("--block-size",type=int,default=32)
+    p.add_argument("--operator", choices=("matmul", "conv"), default="matmul")
     args=p.parse_args()
     root=args.output_dir
     root.mkdir()
@@ -33,10 +34,18 @@ def main():
     scale=np.maximum(-blocks.min(axis=2)/8,blocks.max(axis=2)/7)
     per_channel=np.maximum(scale.max(axis=1)/16,1e-12)
     expansion=np.clip(np.rint(scale/per_channel[:,None]),1,16).astype(int)
-    model=helper.make_model(helper.make_graph([helper.make_node("MatMul",["x","weight"],["y"],name="projection")],
-                            "lpbq_probe",[helper.make_tensor_value_info("x",onnx.TensorProto.FLOAT,[1]*(args.input_rank-1)+[ni])],
-                            [helper.make_tensor_value_info("y",onnx.TensorProto.FLOAT,[1]*(args.input_rank-1)+[no])],
-                            [numpy_helper.from_array(weight.T.copy(),"weight")]),opset_imports=[helper.make_opsetid("",17)])
+    if args.operator == "conv":
+        node = helper.make_node("Conv", ["x", "weight"], ["y"], name="projection", kernel_shape=[1, 1])
+        input_shape, output_shape = [1, ni, 1, 1], [1, no, 1, 1]
+        stored_weight = weight[:, :, None, None].copy()
+    else:
+        node = helper.make_node("MatMul", ["x", "weight"], ["y"], name="projection")
+        input_shape, output_shape = [1]*(args.input_rank-1)+[ni], [1]*(args.input_rank-1)+[no]
+        stored_weight = weight.T.copy()
+    model=helper.make_model(helper.make_graph([node],
+                            "lpbq_probe",[helper.make_tensor_value_info("x",onnx.TensorProto.FLOAT,input_shape)],
+                            [helper.make_tensor_value_info("y",onnx.TensorProto.FLOAT,output_shape)],
+                            [numpy_helper.from_array(stored_weight,"weight")]),opset_imports=[helper.make_opsetid("",17)])
     model.ir_version=9
     onnx.save_model(model,str(root/"model.onnx"))
     overrides={"version":"1.0.0","activation_encodings":[{
@@ -54,7 +63,8 @@ def main():
     lib=args.sdk_root/"lib/x86_64-linux-clang"
     env=dict(os.environ,LD_LIBRARY_PATH=str(lib))
     result={"format":"moshi-lpbq-support-v1","device_verified":False,"conversion_command":converter,
-            "input_width":ni,"output_width":no,"input_rank":args.input_rank,"block_size":bs}
+            "input_width":ni,"output_width":no,"input_rank":len(input_shape),"block_size":bs,
+            "operator":args.operator}
     with (root/"conversion.log").open("w") as log:
         run=subprocess.run(converter,env=env,stdout=log,stderr=subprocess.STDOUT)
     result["conversion_returncode"]=run.returncode
@@ -65,9 +75,9 @@ def main():
     from qti.aisw.dlc_utils import modeltools
     reader=modeltools.IrDlcReader();reader.open(str(root/"model.dlc"))
     graph=reader.get_ir_graph(next(iter(reader.get_ir_graph_names())))
-    ops=[op for op in graph.get_ops() if op.type=="FullyConnected"]
+    ops=[op for op in graph.get_ops() if op.type in ("FullyConnected", "Conv2d")]
     if len(ops)!=1:
-        raise ValueError("Expected one FullyConnected")
+        raise ValueError("Expected one FullyConnected or Conv2d")
     op=ops[0]
     result["actual_precision"]={"input":op.inputs()[0].data_type_string(),"output":op.outputs()[0].data_type_string(),
                                 "weight_dtype":op.inputs()[1].data_type_string(),"weight_encoding":str(op.inputs()[1].get_encoding().type)}

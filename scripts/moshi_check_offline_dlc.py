@@ -46,7 +46,7 @@ def audit(path):
         rows = [{"name": op.name, "type": op.type,
                  "inputs": [tensor(t) for t in op.inputs()],
                  "outputs": [tensor(t) for t in op.outputs()]}
-                for op in graph.get_ops() if op.type in ("FullyConnected", "MatMul")]
+                for op in graph.get_ops() if op.type in ("FullyConnected", "MatMul", "Conv2d")]
         state_updates = [{"name": op.name, "type": op.type,
                           "inputs": [tensor(t) for t in op.inputs()],
                           "outputs": [tensor(t) for t in op.outputs()]}
