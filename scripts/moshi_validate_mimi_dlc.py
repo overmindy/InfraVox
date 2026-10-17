@@ -28,7 +28,7 @@ def main():
         assert state["cpu_screen"]["passed"] and state["conversion"]["returncode"] == 0
         dlc = root/"model.dlc"
         assert sha(dlc) == state["dlc"]["sha256"]
-        model = onnx.load(state["source_onnx"])
+        model = onnx.load(state.get("quantizer_source", state["source_onnx"]))
         weights = {t.name: numpy_helper.to_array(t) for t in model.graph.initializer}
         policy = json.loads((root/"quantization_overrides.json").read_text())
         expected = {t["name"]: t for t in policy["param_encodings"] if t["dtype"] == "INT"}
@@ -41,24 +41,39 @@ def main():
                 tensors[t.name()] = t.data_type_string()
                 if t.is_static():
                     static[t.name()] = (t.data_type_string(), np.asarray(t.get_data()).nbytes)
-            if op.type != "FullyConnected":
+            if op.type not in ("FullyConnected", "Conv2d") or op.inputs()[1].name() not in expected:
                 continue
             t = op.inputs()[1]
-            e = t.get_encoding().axisEncInfo
-            assert e.axis == 0 and t.name() in expected
+            blocked = "BLOCKWISE_EXPANSION" in str(t.get_encoding().type)
+            e = t.get_encoding().lpbqEncInfo if blocked else t.get_encoding().axisEncInfo
+            conv = op.type == "Conv2d"
+            assert e.axis == (3 if conv else 0)
+            bits = e.encInfos[0].bw - e.blockScaleBitwidth if blocked else e.encInfos[0].bw
             scales = np.array([x.scale for x in e.encInfos], np.float32)
             offsets = np.array([x.offset for x in e.encInfos], np.float32)
-            decoded = (np.asarray(t.get_data()).astype(np.float32)+offsets[:, None])*scales[:, None]
-            original = weights[t.name()].T
-            authored_scales = np.array(expected[t.name()]["scale"], np.float32)[:, None]
-            authored = np.clip(np.rint(original/authored_scales), -128, 127)*authored_scales
+            raw = np.asarray(t.get_data()).astype(np.float32)
+            raw = raw[0, 0].T if conv else raw
+            if blocked:
+                raw = np.where(raw > 2**(bits-1)-1, raw-2**bits, raw)
+                expansion = np.asarray(e.blocksScale8 or e.blocksScale16, np.float32).reshape(len(scales), e.numBlocksPerAxis)
+                grid = scales[:, None]*np.repeat(expansion, e.blockSize, axis=1)
+            else:
+                grid = scales[:, None]
+            decoded = (raw+offsets[:, None])*grid
+            original = weights[t.name()][:, :, 0, 0] if conv else weights[t.name()].T
+            if blocked:
+                authored = original
+            else:
+                authored_scales = np.array(expected[t.name()]["scale"], np.float32)[:, None]
+                authored = np.clip(np.rint(original/authored_scales), -128, 127)*authored_scales
             error = float(np.linalg.norm(decoded-authored)/max(np.linalg.norm(authored), 1e-12))
             row = {"name": op.name, "weight": t.name(), "input_dtype": op.inputs()[0].data_type_string(),
                    "weight_dtype": t.data_type_string(), "output_dtype": op.outputs()[0].data_type_string(),
-                   "authored_weight_relative_rms_difference": error, "shape": t.dims()}
+                   "authored_weight_relative_rms_difference": error, "shape": t.dims(), "bitwidth": bits}
             records.append(row)
         precision = len(records) == len(expected) == 32 and all(
             r["input_dtype"] == r["output_dtype"] == "uFxp_16" and r["weight_dtype"] == "sFxp_8"
+            and r["bitwidth"] == expected[r["weight"]].get("compressed_bw", expected[r["weight"]]["bw"])
             and r["authored_weight_relative_rms_difference"] < .002 for r in records)
         abi = {n: tensors[n] for n in ("kv_cache", "conv_state", "kv_cache_out", "conv_state_out", "audio", "codes")}
         assert all(dtype == "Float_32" for n, dtype in abi.items() if n != "codes")

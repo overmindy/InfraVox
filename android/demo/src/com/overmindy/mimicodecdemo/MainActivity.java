@@ -116,6 +116,12 @@ public final class MainActivity extends Activity {
         selectedEncoder = rememberedModel("encoder");
         selectedDecoder = rememberedModel("decoder");
         selectedLm = rememberedModel("lm");
+        File compact = new File(defaultModelsDirectory(), "lm-cache1000-v1");
+        if (new File(compact, "CONTEXT_ONLY").isFile()) {
+            selectedEncoder = new File(compact, "mimi_encoder.bin");
+            selectedDecoder = new File(compact, "mimi_decoder.bin");
+            selectedLm = compact;
+        }
 
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -147,6 +153,7 @@ public final class MainActivity extends Activity {
         moshiMode = new Switch(this);
         moshiMode.setText("启用 Moshi LM（预算内常驻＋context 缓存，非实时）");
         moshiMode.setTextColor(Color.WHITE);
+        moshiMode.setChecked(new File(compact, "CONTEXT_ONLY").isFile());
         steps.addView(moshiMode);
         moshiMode.setOnCheckedChangeListener((button, enabled) -> {
             long previous = sessionHandle;
@@ -156,8 +163,8 @@ public final class MainActivity extends Activity {
             outputFile().delete(); codesFile().delete();
             refresh();
         });
-        loadButton = button(steps, "加载两个 DLC 到 QNN", this::loadModels);
-        modelStatus = label(steps, "等待导入两个 DLC", 14,
+        loadButton = button(steps, "加载 Mimi 模型", this::loadModels);
+        modelStatus = label(steps, "等待选择 Mimi 模型", 14,
                             Color.rgb(176, 193, 210), false);
 
         LinearLayout input = card(column);
@@ -284,9 +291,12 @@ public final class MainActivity extends Activity {
         for (File folder : folders) {
             File encoder = new File(folder, "mimi_encoder.dlc");
             File decoder = new File(folder, "mimi_decoder.dlc");
+            if (!encoder.isFile()) encoder = new File(folder, "mimi_encoder.bin");
+            if (!decoder.isFile()) decoder = new File(folder, "mimi_decoder.bin");
             if (encoder.isFile() && encoder.length() > 0 && decoder.isFile() && decoder.length() > 0) {
+                final File chosenEncoder = encoder, chosenDecoder = decoder;
                 labels.add("Mimi：" + folder.getName());
-                choices.add(() -> selectMimi(encoder, decoder));
+                choices.add(() -> selectMimi(chosenEncoder, chosenDecoder));
             }
             if (new File(folder, "dlc_inventory.json").isFile() && new File(folder, "dlc").isDirectory()) {
                 labels.add("LM：" + folder.getName() + "（校验后直接使用）");
@@ -335,20 +345,27 @@ public final class MainActivity extends Activity {
                 }
                 JSONObject inventory = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
                 JSONObject graphs = inventory.getJSONObject("graphs");
+                boolean compact = "moshi-context-only-app-inventory-v1".equals(inventory.optString("format"));
+                if (compact && !new File(canonical, "CONTEXT_ONLY").isFile())
+                    throw new IOException("缺少设备模型包标记");
                 if (!inventory.getBoolean("all_graphs_verified") || graphs.length() != 26)
                     throw new IOException("需要完整的 26 图验证清单");
                 ArrayList<String> names = new ArrayList<>(); names.add("frontend"); names.add("head");
                 for (int i = 0; i < 32; i += 2) names.add("temporal_layers_" + i + "_" + (i+1));
                 for (int i = 0; i < 8; i++) names.add("depformer_codebook_" + i);
+                if (compact) { names.add("mimi_encoder"); names.add("mimi_decoder"); }
                 for (int i = 0; i < names.size(); i++) {
-                    String name = names.get(i); JSONObject graph = graphs.getJSONObject(name);
-                    String relative = "dlc/" + name + ".dlc";
+                    String name = names.get(i);
+                    boolean codec = name.startsWith("mimi_");
+                    JSONObject graph = (codec ? inventory.getJSONObject("mimi") : graphs).getJSONObject(name);
+                    String relative = (codec ? "" : "dlc/") + name + (compact ? ".bin" : ".dlc");
                     if (!relative.equals(graph.getString("file"))) throw new IOException("模型路径不匹配：" + name);
                     File model = new File(canonical, relative);
                     if (!model.getCanonicalPath().startsWith(canonical.getPath() + "/")
                             || !model.isFile() || model.length() == 0) throw new IOException("模型缺失：" + name);
                     final int index = i + 1;
-                    runOnUiThread(() -> status.setText("校验 " + index + "/26：" + name));
+                    final int total = names.size();
+                    runOnUiThread(() -> status.setText("校验 " + index + "/" + total + "：" + name));
                     MessageDigest digest = MessageDigest.getInstance("SHA-256");
                     try (InputStream input = new FileInputStream(model)) {
                         byte[] buffer = new byte[1024 * 1024]; int count;
@@ -358,10 +375,21 @@ public final class MainActivity extends Activity {
                     for (byte b : digest.digest()) hex.append(String.format(Locale.US, "%02x", b & 255));
                     if (!hex.toString().equals(graph.getString("sha256"))) throw new IOException("SHA256 不匹配：" + name);
                 }
+                if (compact && new File(canonical, "mimi_encoder.bin").equals(encoderFile())
+                        && new File(canonical, "mimi_decoder.bin").equals(decoderFile())) {
+                    // The verified compact bundle supersedes private codec imports.
+                    for (int kind : new int[]{PICK_ENCODER, PICK_DECODER}) {
+                        File obsolete = files[kind];
+                        long bytesRemoved = obsolete.length();
+                        if (obsolete.isFile() && obsolete.delete())
+                            android.util.Log.i("MoshiModelCleanup", "removed=" + obsolete.getAbsolutePath()
+                                    + " bytes=" + bytesRemoved);
+                    }
+                }
                 runOnUiThread(() -> {
                     selectedLm = canonical; localLmVerified = true;
                     getPreferences(MODE_PRIVATE).edit().putString("model_lm", canonical.getAbsolutePath()).apply();
-                    modelStatus.setText("LM 26 文件校验通过，直接使用：\n" + canonical.getAbsolutePath());
+                    modelStatus.setText("模型文件校验通过，直接使用：\n" + canonical.getAbsolutePath());
                     status.setText("模型已选择；无需重复导入。请点击加载。");
                 });
             } catch (Exception error) {
@@ -572,7 +600,8 @@ public final class MainActivity extends Activity {
                         readSmallFile(new File(selectedLm, "dlc_inventory.json")), StandardCharsets.UTF_8));
                     if (!"cache1000-shared-v1".equals(manifest.optString("runtime_preset")))
                         throw new IOException("所选 LM 不是 cache1000 加速包；请选择新包或关闭加速开关");
-                    cache = new File(contextCacheDirectory, "cache1000-v1");
+                    cache = "moshi-context-only-app-inventory-v1".equals(manifest.optString("format"))
+                        ? selectedLm : new File(contextCacheDirectory, "cache1000-v1");
                     if (!cache.isDirectory()) throw new IOException("缺少 cache1000-v1 本手机编译缓存；请部署缓存后再加载");
                 }
                 sessionHandle = nativePrepare(getApplicationInfo().nativeLibraryDir,
@@ -583,7 +612,7 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> modelStatus.setText(String.format(Locale.US,
                         requestFast ? "加速配置已就绪；首次运行加载 LM，重复运行复用。准备用时 %.1f 秒"
                               : useLm ? "Mimi 就绪；普通 LM 缓存对照模式。准备用时 %.1f 秒"
-                              : "两个 Mimi DLC 已就绪；本次加载用时 %.1f 秒", seconds)));
+                              : "Mimi 模型已就绪；本次加载用时 %.1f 秒", seconds)));
             } catch (Exception error) {
                 runOnUiThread(() -> modelStatus.setText("加载失败：" + error.getMessage()));
             } finally {
@@ -980,7 +1009,7 @@ public final class MainActivity extends Activity {
         scanModelsButton.setEnabled(!working && !recording);
         moshiMode.setEnabled(!working && !recording);
         lmFrameLimit.setEnabled(!working && !recording && moshiMode.isChecked());
-        loadButton.setText(moshiMode.isChecked() ? "准备 Mimi + Moshi LM" : "加载两个 Mimi DLC 到 QNN");
+        loadButton.setText(moshiMode.isChecked() ? "准备 Mimi + Moshi LM" : "加载 Mimi 模型");
         runButton.setText(moshiMode.isChecked() ? "运行 Encoder → Moshi LM → Decoder" : "运行 Encoder → Decoder 对照");
         loadButton.setEnabled(!working && !recording && modelFilesReady());
         recordButton.setEnabled(!working && (recording || sessionHandle != 0));

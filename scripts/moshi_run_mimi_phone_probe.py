@@ -21,6 +21,7 @@ def main():
     p.add_argument("--serial", default="ATWV026602002286")
     p.add_argument("--phone-root", default="/data/local/tmp/moshi-mimi-w8a16-20261018-v1")
     p.add_argument("--reuse-uploaded-contexts", action="store_true")
+    p.add_argument("--candidate-subdir", default="fc_only")
     args = p.parse_args()
     root, remote = args.directory, args.phone_root
     out = root/"phone"
@@ -45,7 +46,9 @@ def main():
     # The separate models/mimi copies have identical bytes but different mtimes.
     models = app+"/models/lm-cache1000-v1"
     cache = app+"/qnn-context-v1/cache1000-v1"
-    baseline_hashes = shell("sha256sum "+models+"/*.dlc")
+    compact = shell("if test -f "+models+"/CONTEXT_ONLY; then echo yes; else echo no; fi") == "yes"
+    suffix = ".bin" if compact else ".dlc"
+    baseline_hashes = shell("sha256sum "+models+"/mimi_*"+suffix)
     apk = shell("pm path com.overmindy.mimicodecdemo").split("package:", 1)[1]
     lib = str(Path(apk).parent/"lib/arm64")
     if not args.reuse_uploaded_contexts:
@@ -56,14 +59,17 @@ def main():
     shell("chmod 755 "+q(remote+"/runner"))
     run("push", str(root/"input.wav"), remote+"/input.wav")
     for comp in ("encoder", "decoder"):
-        state = json.loads((root/"fc_only"/comp/"RESULT.json").read_text())
+        state = json.loads((root/args.candidate_subdir/comp/"RESULT.json").read_text())
         assert state["actual_precision_passed"] and state["htp_compile"]["returncode"] == 0
-        binary = root/"fc_only"/comp/"htp"/("mimi_"+comp+".bin")
+        binary = Path(state["htp_compile"].get("local_binary",
+                      str(root/args.candidate_subdir/comp/"htp"/("mimi_"+comp+".bin"))))
         assert sha(binary) == state["htp_compile"]["sha256"]
         target = remote+"/mimi_"+comp+".bin"
         if not args.reuse_uploaded_contexts:
             run("push", str(binary), target)
         assert shell("sha256sum "+q(target)).split()[0] == sha(binary)
+        if compact:
+            continue
         paths = shell("ls "+cache+"/mimi_"+comp+"-*.bin").splitlines()
         assert len(paths) == 1
         base = paths[0]
@@ -81,8 +87,10 @@ def main():
         target = remote+"/results/"+variant+".wav"
         cmd = ["env", "LD_LIBRARY_PATH="+lib, "ADSP_LIBRARY_PATH="+lib,
                "MOSHI_QNN_PROFILE=1", "MOSHI_CODEC_CONTEXT_CACHE_DIR="+remote+"/cache_"+variant,
-               remote+"/runner", lib, models+"/mimi_encoder.dlc",
-               models+"/mimi_decoder.dlc", remote+"/input.wav", target, "4"]
+               remote+"/runner", lib,
+               remote+"/mimi_encoder.bin" if compact and variant == "candidate" else models+"/mimi_encoder"+suffix,
+               remote+"/mimi_decoder.bin" if compact and variant == "candidate" else models+"/mimi_decoder"+suffix,
+               remote+"/input.wav", target, "4"]
         start = time.monotonic()
         shell("test ! -e "+q(target)+" && "+shlex.join(cmd)+" > "+q(remote+"/results/"+variant+".log")+" 2>&1")
         elapsed = time.monotonic()-start
@@ -99,7 +107,7 @@ def main():
         results[variant] = {"elapsed_adb_s": elapsed, "profile": profiles,
                             "context_restores": len(restores), "dlc_fallback": False,
                             "runner_sha256": sha(runner)}
-    assert shell("sha256sum "+models+"/*.dlc") == baseline_hashes
+    assert shell("sha256sum "+models+"/mimi_*"+suffix) == baseline_hashes
 
     def audio(variant):
         with wave.open(str(out/variant/(variant+".wav")), "rb") as w:
@@ -121,6 +129,8 @@ def main():
                "short_numerical_gate_passed": bool(delta <= .1 and np.isfinite(a).all())}
     save(out/"PHONE_RESULT.json", summary)
     print(json.dumps({k: v for k, v in summary.items() if k != "results"}))
+    if not summary["short_numerical_gate_passed"]:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

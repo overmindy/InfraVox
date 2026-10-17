@@ -1,4 +1,4 @@
-"""Screen selective Mimi W8A16 PTQ from existing explicit-state exports.
+"""Screen selective Mimi W8/A16 or LPBQ W4/A16 from existing exports.
 
 This experiment does not change the deployed codec. It quantizes internal
 linear weights, while retaining codebooks, normalization and convolutions.
@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -38,6 +39,11 @@ def main():
     p.add_argument("--components", nargs="+", default=["encoder", "decoder"])
     p.add_argument("--frames", type=int, default=8)
     p.add_argument("--calibration-frames", type=int, default=4)
+    p.add_argument("--weight-bits", type=int, choices=(4, 8), default=8)
+    p.add_argument("--w4-scope", choices=("all", "mlp"), default="all")
+    p.add_argument("--block-size", type=int, default=32)
+    p.add_argument("--reuse-w8-directory", type=Path)
+    p.add_argument("--keep-w8-regex", default="", help="Retain matching sensitive projection nodes at W8")
     p.add_argument("--quantize-convolutions", action="store_true",
                    help="Diagnostic only; retain bias-free and boundary convolutions")
     args = p.parse_args()
@@ -85,6 +91,7 @@ def main():
                 "relative_rms": float(np.sqrt(np.mean((a-b)**2)) / max(np.sqrt(np.mean(b*b)), 1e-12)),
                 "normalized_max": float(np.max(np.abs(a-b)) / max(np.max(np.abs(b)), 1e-12))}
 
+    failures = []
     for comp in args.components:
         root = args.output_dir / comp
         root.mkdir(exist_ok=False)
@@ -124,6 +131,7 @@ def main():
         weight_records = []
         selected_weights = {n.input[1] for n in selected}
         selected_biases = {n.input[2] for n in selected if len(n.input) > 2}
+        precision = {}
         for t in model.graph.initializer:
             if t.data_type in (1, 10) and t.name not in selected_weights | selected_biases:
                 policy["param_encodings"].append({"name": t.name, "dtype": "FLOAT", "bw": 32})
@@ -131,16 +139,35 @@ def main():
             w = numpy_helper.to_array(weights[node.input[1]]).astype(np.float32)
             axis = 1 if node.op_type == "MatMul" else 0
             axes = tuple(i for i in range(w.ndim) if i != axis)
-            scale = np.maximum(np.max(np.abs(w), axis=axes), 1e-8) / 127
-            shape = [1] * w.ndim
-            shape[axis] = w.shape[axis]
-            grid = scale.reshape(shape)
-            decoded = np.clip(np.rint(w / grid), -128, 127) * grid
+            bits = args.weight_bits if args.w4_scope == "all" or "/linear" in node.name else 8
+            if args.keep_w8_regex and re.search(args.keep_w8_regex, node.name):
+                bits = 8
+            precision[node.input[1]] = bits
+            if bits == 4:
+                assert node.op_type == "MatMul" and w.shape[0] % args.block_size == 0
+                blocked = np.ascontiguousarray(w.T).reshape(w.shape[1], -1, args.block_size)
+                step = np.maximum(-blocked.min(axis=2)/8, blocked.max(axis=2)/7)
+                scale = np.maximum(step.max(axis=1)/16, 1e-12).astype(np.float32)
+                expansion = np.clip(np.rint(step/scale[:, None]), 1, 16).astype(np.uint8)
+                grid = (scale[:, None]*np.repeat(expansion, args.block_size, axis=1)).T
+                decoded = np.clip(np.rint(w/grid), -8, 7)*grid
+                encoding = {"name": node.input[1], "dtype": "INT", "bw": 8, "compressed_bw": 4,
+                            "enc_type": "LPBQ", "is_sym": True, "scale": scale.tolist(),
+                            "offset": [0]*len(scale), "block_size": args.block_size,
+                            "per_block_int_scale": expansion.flatten().tolist()}
+            else:
+                scale = np.maximum(np.max(np.abs(w), axis=axes), 1e-8) / 127
+                shape = [1] * w.ndim
+                shape[axis] = w.shape[axis]
+                grid = scale.reshape(shape)
+                decoded = np.clip(np.rint(w / grid), -128, 127) * grid
+                encoding = {"name": node.input[1], "dtype": "INT", "bw": 8,
+                            "enc_type": "PER_CHANNEL", "is_sym": True,
+                            "scale": scale.tolist(), "offset": [0]*len(scale)}
             cweights[node.input[1]].CopyFrom(numpy_helper.from_array(decoded, node.input[1]))
-            policy["param_encodings"].append({"name": node.input[1], "dtype": "INT", "bw": 8,
-                "enc_type": "PER_CHANNEL", "is_sym": True, "scale": scale.tolist(), "offset": [0]*len(scale)})
+            policy["param_encodings"].append(encoding)
             weight_records.append({"node": node.name, "name": node.input[1], "axis": axis,
-                                   "shape": list(w.shape), "parameters": int(w.size)})
+                                   "shape": list(w.shape), "parameters": int(w.size), "bitwidth": bits})
         ranges = {}
         for name, (lo, hi) in bounds.items():
             # A small fixed guard absorbs interpolation outside the four fitting frames.
@@ -150,6 +177,12 @@ def main():
             ranges[name] = (scale, offset)
             policy["activation_encodings"].append({"name": name, "dtype": "INT", "bw": 16,
                 "enc_type": "PER_TENSOR", "is_sym": False, "scale": [scale], "offset": [offset]})
+        if args.reuse_w8_directory:
+            prior = json.loads((args.reuse_w8_directory/comp/"RESULT.json").read_text())
+            assert prior["source_sha256"] == sha(source) and prior["audio_sha256"] == sha(args.audio_wav)
+            old = json.loads((args.reuse_w8_directory/comp/"quantization_overrides.json").read_text())
+            policy["activation_encodings"] = copy.deepcopy(old["activation_encodings"])
+            ranges = {e["name"]: (e["scale"][0], e["offset"][0]) for e in policy["activation_encodings"]}
         save(root / "quantization_overrides.json", policy)
         # ONNX arithmetic emulates the authored W8/A16 grids. This is not QNN CPU execution.
         for index, name in enumerate(boundaries):
@@ -184,10 +217,13 @@ def main():
         passed = all(x["position_exact"] and x["kv"]["finite"] and x["conv_state"]["finite"]
                      and x["kv"]["relative_rms"] <= .1 and x["conv_state"]["relative_rms"] <= .1
                      and (comp == "encoder" or x["audio"]["relative_rms"] <= .1) for x in scores)
-        state = {"format": "mimi-selective-w8a16-v1", "component": comp,
+        state = {"format": "mimi-selective-lowbit-a16-v2", "component": comp,
                  "source_onnx": str(source), "source_sha256": sha(source),
                  "audio_wav": str(args.audio_wav), "audio_sha256": sha(args.audio_wav),
                  "script_sha256": sha(__file__), "selected_weights": weight_records,
+                 "expected_projection_bits": precision, "w4_scope": args.w4_scope,
+                 "keep_w8_regex": args.keep_w8_regex,
+                 "block_size": args.block_size if args.weight_bits == 4 else None,
                  "retained": ["codebook embeddings/search", "normalization",
                               "all convolutions unless diagnostic flag is set", "public float32 state ABI"],
                  "quantize_convolutions": args.quantize_convolutions,
@@ -198,10 +234,38 @@ def main():
         save(root / "RESULT.json", state)
         print(comp, "CPU screen", passed, flush=True)
         if not passed:
+            failures.append(comp+":cpu_screen")
             continue
+        quantizer_source = source
+        if args.weight_bits == 4:
+            # HTP uses the validated pointwise layout. Mimi has two internal
+            # Transformer timesteps per 80 ms frame, represented as batch two.
+            from moshi_projection_layout import rewrite_pointwise_projections
+            authored = copy.deepcopy(model)
+            authored_weights = {t.name: t for t in authored.graph.initializer}
+            for name in precision:
+                authored_weights[name].CopyFrom(cweights[name])
+            before_rewrite = run_chain(authored, data[:2])
+            state["pointwise_rewrites"] = rewrite_pointwise_projections(authored, policy, precision, add_zero_bias=True)
+            after_rewrite = run_chain(authored, data[:2])
+            equivalence = []
+            for a, b in zip(after_rewrite, before_rewrite):
+                equivalence.extend(metrics(x, y) for x, y in zip(a, b))
+            assert all(x["finite"] and x["relative_rms"] < 1e-4 for x in equivalence)
+            state["pointwise_cpu_equivalence"] = equivalence
+            folder = root/"source"
+            folder.mkdir()
+            quantizer_source = folder/"model.onnx"
+            onnx.save_model(authored, str(quantizer_source), save_as_external_data=True,
+                            all_tensors_to_one_file=True, location="model.data", size_threshold=1024)
+            state["quantizer_source"] = str(quantizer_source)
+            state["quantizer_source_sha256"] = sha(quantizer_source)
+            state["quantizer_data_sha256"] = sha(folder/"model.data")
+            save(root/"quantization_overrides.json", policy)
+            save(root/"RESULT.json", state)
         command = [sys.executable, str(Path(__file__).with_name("moshi_guard_qairt_converter.py")),
             "--sdk-root", str(args.sdk_root), "--numpy-dir", str(args.numpy_dir),
-            "--receipt", str(root/"conversion.json"), "--", "--input_network", str(source),
+            "--receipt", str(root/"conversion.json"), "--", "--input_network", str(quantizer_source),
             "--output_path", str(root/"model.dlc"), "--quantization_overrides", str(root/"quantization_overrides.json"),
             "--preserve_onnx_output_order", "--onnx_skip_simplification",
             "--source_model_input_datatype", "position", "int32", "--preserve_io_datatype",
@@ -217,6 +281,11 @@ def main():
                             "sha256": sha(root/"model.dlc")}
         save(root/"RESULT.json", state)
         print(comp, "conversion returncode", run.returncode, flush=True)
+        if run.returncode:
+            failures.append(comp+":conversion")
+    if failures:
+        print("Rejected components:", ", ".join(failures), flush=True)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

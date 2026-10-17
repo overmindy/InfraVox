@@ -208,6 +208,10 @@ struct RuntimeSettings {
   }
 };
 
+bool serializedModel(const std::string& path) {
+  return path.size() >= 4 && path.compare(path.size() - 4, 4, ".bin") == 0;
+}
+
 class Runtime {
  public:
   explicit Runtime(const std::string& libraryDir, RuntimeSettings options = RuntimeSettings())
@@ -396,11 +400,20 @@ class Graph {
         GraphIoPool* ioPool = nullptr) : runtime_(runtime), ioPool_(ioPool) {
     try {
     label_ = dlcPath.substr(dlcPath.find_last_of('/') + 1);
+    const bool contextOnly = serializedModel(dlcPath);
+    if (contextOnly) {
+      // Keep logical graph labels stable for existing timing consumers.
+      label_.replace(label_.size() - 4, 4, ".dlc");
+      std::cerr << "serialized_model_source=" << dlcPath << '\n';
+    }
     const auto start = std::chrono::steady_clock::now();
-    if (!cachePath.empty() && loadBinary(cachePath)) {
+    const std::string binaryPath = contextOnly ? dlcPath : cachePath;
+    if (!binaryPath.empty() && loadBinary(binaryPath)) {
       runtime_.timing(label_, "restore_context", elapsedMs(start));
       return;
     }
+    if (contextOnly)
+      throw ContextConfigError("Serialized model is incompatible or unreadable; rebuild for this device/runtime: " + dlcPath);
     // SDK 1002 can hide an unreadable external-storage file. Fail clearly first.
     {
       std::ifstream readable(dlcPath, std::ios::binary);
@@ -510,7 +523,7 @@ class Graph {
     } catch (const ContextConfigError&) {
       release(); throw;
     } catch (const std::exception& error) {
-      std::cerr << "Context cache rejected; rebuilding DLC: " << error.what() << '\n';
+      std::cerr << "Context deserialization failed: " << error.what() << '\n';
       release(); inputs_.clear(); outputs_.clear(); inputTensors_.clear(); outputTensors_.clear();
       return false;
     }
@@ -884,6 +897,7 @@ class PagedMoshiLm {
  public:
   PagedMoshiLm(Runtime& runtime, std::string directory)
       : runtime_(runtime), directory_(std::move(directory)) {
+    contextOnly_ = access((directory_ + "/CONTEXT_ONLY").c_str(), R_OK) == 0;
     for (const auto& name : {"frontend", "head"}) requireFile(name);
     for (int i = 0; i < 32; i += 2) requireFile(shardName(i));
     for (int i = 0; i < 8; ++i) requireFile("depformer_codebook_" + std::to_string(i));
@@ -982,6 +996,7 @@ class PagedMoshiLm {
   std::string residencyJson() const {
     std::ostringstream out;
     out << "{\"available_at_planning_bytes\":" << availableAtPlanning_
+        << ",\"context_only_models\":" << (contextOnly_ ? "true" : "false")
         << ",\"residency_budget_bytes\":" << residencyBudget_
         << ",\"shared_spill_bytes\":" << runtime_.sharedSpillBytes
         << ",\"planned_temporal\":[";
@@ -1177,6 +1192,7 @@ class PagedMoshiLm {
     return *graph;
   }
   std::string cachePath(const std::string& name) const {
+    if (contextOnly_) return path(name);
     struct stat info{}, directoryInfo{};
     if (stat(path(name).c_str(), &info) || stat(cacheDirectory_.c_str(), &directoryInfo) ||
         access(cacheDirectory_.c_str(), W_OK)) return "";
@@ -1226,13 +1242,14 @@ class PagedMoshiLm {
   static std::string shardName(int layer) {
     return "temporal_layers_" + std::to_string(layer) + "_" + std::to_string(layer + 1);
   }
-  std::string path(const std::string& name) const { return directory_ + "/dlc/" + name + ".dlc"; }
+  std::string path(const std::string& name) const { return directory_ + "/dlc/" + name + (contextOnly_ ? ".bin" : ".dlc"); }
   void requireFile(const std::string& name) const {
     std::ifstream file(path(name), std::ios::binary | std::ios::ate);
     if (!file || file.tellg() <= 0) throw std::runtime_error("Missing LM DLC: " + path(name));
   }
   Runtime& runtime_;
   std::string directory_;
+  bool contextOnly_ = false;
   std::string cacheDirectory_;
   GraphIoPool temporalIoPool_;
   uint64_t residencyBudget_ = 0;
@@ -1320,6 +1337,7 @@ size_t runMoshiFrames(Graph& encoder, Graph& decoder, PagedMoshiLm& lm,
 
 std::string codecContextCachePath(Runtime& runtime, const std::string& dlc,
                                   const std::string& name) {
+  if (serializedModel(dlc)) return dlc;
   const char* directory = runtime.settings.codecDirectory.c_str();
   if (!*directory) return "";
   mkdir(directory, 0700);
