@@ -21,6 +21,7 @@ def main():
         p.add_argument("--" + name, required=True, type=Path)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--whole-shard-limit", type=float, default=0.10)
+    p.add_argument("--prepare-only", action="store_true", help="Prepare scales and A16 probe for a separate LPBQ policy search")
     args = p.parse_args()
     import numpy as np
     import onnx
@@ -274,15 +275,15 @@ def main():
 
     # Authored A16 boundaries guide selection. The real DLC still requires its own check.
     result["policy_search_activation_quantization"] = True
-    baseline = evaluate(current)
+    baseline = evaluate(current) if not args.prepare_only else {"passed": None, "skipped": "Separate LPBQ gate evaluates W8 and W4"}
     result["w8_control"] = baseline
-    if not baseline["passed"]:
+    if not args.prepare_only and not baseline["passed"]:
         result["status"] = "w8_control_rejected"
         write(root / "RESULT.json", result)
         raise SystemExit(2)
     result["policy_trials"] = []
     # Largest matrices first. Each accepted change must preserve the shard output gate.
-    for row in sorted(rows, key=lambda value: -value["parameter_count"]):
+    for row in ([] if args.prepare_only else sorted(rows, key=lambda value: -value["parameter_count"])):
         attempt = dict(current)
         attempt[row["name"]] = 4
         check = evaluate(attempt)
@@ -294,7 +295,7 @@ def main():
     for row in rows:
         row["bitwidth"] = current[row["name"]]
         policy["param_encodings"][row["name"]] = encodings(row["scale"+str(row["bitwidth"])], row["bitwidth"])
-    result.update(status="activation_aware_policy_selected", expected_projection_bits=current,
+    result.update(status="activation_aware_prepared_not_policy_verified" if args.prepare_only else "activation_aware_policy_selected", expected_projection_bits=current,
                   selected_precision={str(bits): sum(v == bits for v in current.values()) for bits in (4,8)},
                   w4_parameter_fraction=sum(v["parameter_count"] for v in rows if v["bitwidth"] == 4)/sum(v["parameter_count"] for v in rows),
                   elapsed_s=time.monotonic()-started)
@@ -317,7 +318,8 @@ def main():
     write(ref / "quantization.json", prior)
     # The authoring tool only needs this file for its nonprojection exclusions.
     write(ref / "model.w4a16_encoding.json", json.loads((args.reference_directory/"model.w4a16_encoding.json").read_text()))
-    print("Selected", result["selected_precision"], "W4 fraction", result["w4_parameter_fraction"], flush=True)
+    print("Prepared for a separate LPBQ gate" if args.prepare_only else "Selected",
+          result["selected_precision"], "W4 fraction", result["w4_parameter_fraction"], flush=True)
 
 
 if __name__ == "__main__":

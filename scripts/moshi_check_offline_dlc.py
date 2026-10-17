@@ -54,7 +54,7 @@ def audit(path):
         normalization_ops = [{"name": op.name, "type": op.type,
                               "input_dtypes": [t.data_type_string() for t in op.inputs()],
                               "output_dtypes": [t.data_type_string() for t in op.outputs()]}
-                             for op in graph.get_ops() if op.name.startswith("/norm")]
+                             for op in graph.get_ops() if op.name.startswith("/norm") or any(t.name().startswith("/norm") for t in op.outputs())]
         graphs.append({"name": name, "projections": rows, "state_updates": state_updates,
                        "normalization_ops": normalization_ops})
     return {"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size, "graphs": graphs}

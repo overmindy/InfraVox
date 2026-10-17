@@ -21,6 +21,11 @@ def main():
         p.add_argument("--"+name,type=Path,required=True)
     p.add_argument("--device",default="cuda:0")
     p.add_argument("--block-size",type=int,default=32)
+    p.add_argument("--pointwise",action=argparse.BooleanOptionalAction,default=True,
+                   help="Default to the HTP-validated Conv layout; --no-pointwise retains the diagnostic FC path")
+    p.add_argument("--rounding",choices=("compensated","nearest"),default="compensated")
+    p.add_argument("--selection-limit",type=float,default=0.095)
+    p.add_argument("--first-passing-rounding",action="store_true",help="Stop alternatives when the current W4 policy passes the full gate")
     args=p.parse_args()
     sys.path[:0]=[str(args.numpy_dir),str(args.sdk_root/"lib/python")]
     import numpy as np
@@ -57,11 +62,14 @@ def main():
     result={"format":"moshi-lpbq-mixed-candidate-v1","status":"searching_lpbq_weights",
             "script_sha256":sha256(__file__),"block_size":args.block_size,"damping_fraction":32.0,
             "original_source_onnx":parent["original_source_onnx"],"original_source_sha256":parent["original_source_sha256"],
-            "selection_relative_rms_limit":0.095,"final_cpu_relative_rms_limit":0.10,
+            "selection_relative_rms_limit":args.selection_limit,"final_cpu_relative_rms_limit":0.10,
+            "pointwise":args.pointwise,"rounding":args.rounding,
             "fit_samples":12,"selection_samples":16,"selection_recurrent_frames":6,
             "independent_quality_test":False,"device_verified":False,"default_bundle_replaced":False,
             "layers":rows,"policy_trials":[]}
-    reference_external={"model.data":sha256(Path(parent["original_source_onnx"]).parent/"model.data")}
+    reference_external=copy.deepcopy(parent.get("original_source_external_sha256", {}))
+    if not reference_external:
+        reference_external={"model.data":sha256(Path(parent["original_source_onnx"]).parent/"model.data")}
     result["reference_external_sha256"]=reference_external
     started=time.monotonic()
     alternatives,inputs,lpbq={}, {}, {}
@@ -81,7 +89,8 @@ def main():
         inverse=numpy_helper.to_array(tensors[name+"_awq_inverse"])
         x=np.concatenate([v[node.input[0]].reshape(-1,nin) for v in snapshots])*inverse
         y=np.concatenate([v[node.output[0]].reshape(-1,nout) for v in snapshots])
-        refined=compensated_rounding(weight,x[parent["weight_search_train_indices"]],scales,torch,args.device,32.0)
+        refined=(compensated_rounding(weight,x[parent["weight_search_train_indices"]],scales,torch,args.device,32.0)
+                 if args.rounding=="compensated" else nearest)
         norm=np.maximum(np.sqrt(np.mean(y.astype(np.float64)**2,axis=1))[:,None],1e-12)
         err0=np.mean(((x@nearest-y).astype(np.float64)/norm)**2,axis=0)
         err1=np.mean(((x@refined-y).astype(np.float64)/norm)**2,axis=0)
@@ -96,7 +105,7 @@ def main():
         row["lpbq_refined_channels"]=int(prefer.sum())
         print("LPBQ prepared",row["node"],"refined channels",int(prefer.sum()),flush=True)
         write(root/"RESULT.json",result)
-    gate=CalibrationGate(parent["original_source_onnx"],awq/"source/policy_probe.onnx",prior)
+    gate=CalibrationGate(parent["original_source_onnx"],awq/"source/policy_probe.onnx",prior,limit=args.selection_limit)
     result["w8_control"]=gate(inputs)
     if not result["w8_control"]["passed"]:
         result["status"]="w8_control_rejected"
@@ -115,7 +124,7 @@ def main():
             trials.append({"rounding_method":method,"max_relative_rms":maximum,**check})
             if check["passed"] and (best is None or maximum<best["error"]):
                 best={"method":method,"weight":weight,"error":maximum}
-            if best and best["error"]<=0.05:
+            if best and (best["error"]<=0.05 or args.first_passing_rounding):
                 break
         if best:
             current[name]=4
@@ -149,6 +158,9 @@ def main():
         else:
             overrides["param_encodings"].append({"name":name,"dtype":"INT","enc_type":"PER_CHANNEL","is_sym":True,
                                                 "bw":8,"scale":row["scale8"],"offset":[0]*row["shape"][1]})
+    if args.pointwise:
+        from moshi_projection_layout import rewrite_pointwise_projections
+        result["pointwise_rewrites"]=rewrite_pointwise_projections(model,overrides,current)
     source=root/"source/model.onnx"
     source.parent.mkdir()
     onnx.save_model(model,str(source),save_as_external_data=True,all_tensors_to_one_file=True,location="model.data",size_threshold=1024)
@@ -162,7 +174,8 @@ def main():
     scripts=root/"runtime_scripts";scripts.mkdir()
     for name in ("moshi_build_lpbq_candidate.py","moshi_calibration_gate.py","moshi_refine_weight_rounding.py",
                  "moshi_quantize_temporal_offline.py","moshi_guard_qairt_converter.py","moshi_check_offline_dlc.py",
-                 "moshi_simulate_offline_dlc.py","moshi_validate_temporal_calibration.py","moshi_compile_temporal_candidate.py"):
+                 "moshi_simulate_offline_dlc.py","moshi_validate_temporal_calibration.py","moshi_compile_temporal_candidate.py",
+                 "moshi_projection_layout.py"):
         shutil.copy2(Path(__file__).with_name(name),scripts/name)
     common=["--sdk-root",str(args.sdk_root),"--numpy-dir",str(args.numpy_dir)]
     command=[sys.executable,str(scripts/"moshi_guard_qairt_converter.py"),*common,"--receipt",str(candidate/"conversion.json"),"--",
@@ -182,10 +195,14 @@ def main():
     dlc=candidate/"model.w4a16.dlc"
     actual=audit(dlc)
     write(candidate/"precision_audit.json",actual)
-    ops=[v for g in actual["graphs"] for v in g["projections"] if v["type"]=="FullyConnected"]
+    ops=[v for g in actual["graphs"] for v in g["projections"] if v["type"]==("Conv2d" if args.pointwise else "FullyConnected")]
     result["actual_precision_passed"]=len(ops)==8 and all(
         op["inputs"][1].get("compressed_bitwidth",op["inputs"][1]["bitwidths"][0])==current[op["inputs"][1]["name"]]
         and op["inputs"][0]["dtype"]=="uFxp_16" and op["outputs"][0]["dtype"]=="uFxp_16" for op in ops)
+    norms=[op for g in actual["graphs"] for op in g["normalization_ops"]]
+    result["normalization_precision_passed"]=len(norms)>=24 and all(
+        dtype=="Float_32" for op in norms for dtype in (*op["input_dtypes"],*op["output_dtypes"]))
+    result["actual_precision_passed"] &= result["normalization_precision_passed"]
     if not result["actual_precision_passed"]:
         result["status"]="precision_gate_failed";write(root/"RESULT.json",result);raise SystemExit(2)
     reader=modeltools.IrDlcReader();reader.open(str(dlc));graph=reader.get_ir_graph(next(iter(reader.get_ir_graph_names())))
@@ -194,7 +211,7 @@ def main():
     target.write_text(serializer.get_graph_json())
     prior.update(status="quantized_not_verified",source_onnx=str(source),source_onnx_sha256=result["source_onnx_sha256"],
                  source_external_sha256=result["source_external_sha256"],output_dlc=str(dlc),output_sha256=sha256(dlc),output_bytes=dlc.stat().st_size,
-                 method="AWQ-style input scales plus sensitivity-selected LPBQ W4/A16 and W8/A16; block size 32",
+                 method=f"AWQ-style scales and sensitivity-selected LPBQ W4/W8 A16; block {args.block_size}; pointwise {args.pointwise}",
                  expected_projection_bits=current,script_sha256=sha256(__file__),quantization_overrides=str(root/"quantization_overrides.json"))
     prior["reference_external_sha256"]=reference_external
     write(candidate/"quantization.json",prior)

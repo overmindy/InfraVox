@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ def main():
     for name in ("candidate-directory", "output-dir", "sdk-root", "numpy-dir"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--frames", type=int, default=3)
+    parser.add_argument("--reuse-simulation-directory", type=Path)
     args = parser.parse_args()
     if args.frames < 2 or args.frames > 4:
         raise ValueError("Use two to four captured recurrent frames")
@@ -23,10 +25,24 @@ def main():
     root.mkdir()
     for name in ("quantization.json", "model.w4a16_encoding.json"):
         shutil.copy2(args.candidate_directory / name, root / name)
-    with (root / "simulation.log").open("w") as log:
-        subprocess.run([sys.executable, str(Path(__file__).with_name("moshi_simulate_offline_dlc.py")),
-                        "--directory", str(root), "--sdk-root", str(args.sdk_root),
-                        "--numpy-dir", str(args.numpy_dir)], stdout=log, stderr=subprocess.STDOUT, check=True)
+    if args.reuse_simulation_directory:
+        reuse = args.reuse_simulation_directory
+        receipt = json.loads((reuse/"cpu_simulation.json").read_text())
+        state = json.loads((root/"quantization.json").read_text())
+        if not receipt["passed"] or receipt["candidate_dlc_sha256"] != state["output_sha256"]:
+            raise ValueError("Reusable simulation has not passed for this DLC")
+        for name in ("cpu_simulation.onnx", "cpu_simulation.data"):
+            key = "simulation_onnx_sha256" if name.endswith("onnx") else "simulation_data_sha256"
+            validation = json.loads((reuse/"calibration_validation.json").read_text())
+            if not validation["passed"] or sha256(reuse/name) != validation[key]:
+                raise ValueError("Reusable simulation changed after calibration validation")
+            os.link(reuse/name,root/name)
+        shutil.copy2(reuse/"cpu_simulation.json",root/"cpu_simulation.json")
+    else:
+        with (root / "simulation.log").open("w") as log:
+            subprocess.run([sys.executable, str(Path(__file__).with_name("moshi_simulate_offline_dlc.py")),
+                            "--directory", str(root), "--sdk-root", str(args.sdk_root),
+                            "--numpy-dir", str(args.numpy_dir)], stdout=log, stderr=subprocess.STDOUT, check=True)
     import numpy as np
     import onnxruntime as ort
     state = json.loads((root / "quantization.json").read_text())

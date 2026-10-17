@@ -1,5 +1,6 @@
 """Calibrate only eight projection boundaries on the unchanged source graph."""
 import argparse
+import errno
 import json
 import os
 from pathlib import Path
@@ -44,7 +45,13 @@ def main():
             target = root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.exists():
-                os.link(args.source_onnx.parent / relative, target)
+                source_data = (args.source_onnx.parent / relative).resolve()
+                try:
+                    os.link(source_data, target)
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+                    target.symlink_to(source_data)
     probe = root / "projection_probe.onnx"
     # Metadata-only diagnostic view. Existing external weights are hard-linked.
     onnx.save_model(model, str(probe))
