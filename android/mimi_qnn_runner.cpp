@@ -90,6 +90,10 @@ void setMemHandle(Qnn_Tensor_t& t, Qnn_MemHandle_t handle) {
 size_t tensorBytes(const Qnn_Tensor_t& t) {
   size_t width;
   switch (tensorType(t)) {
+    case QNN_DATATYPE_UFIXED_POINT_8: case QNN_DATATYPE_SFIXED_POINT_8:
+    case QNN_DATATYPE_UINT_8: case QNN_DATATYPE_INT_8: case QNN_DATATYPE_BOOL_8: width = 1; break;
+    case QNN_DATATYPE_UFIXED_POINT_16: case QNN_DATATYPE_SFIXED_POINT_16:
+    case QNN_DATATYPE_UINT_16: case QNN_DATATYPE_INT_16: case QNN_DATATYPE_FLOAT_16: width = 2; break;
     case QNN_DATATYPE_FLOAT_32: case QNN_DATATYPE_INT_32: case QNN_DATATYPE_UINT_32: width = 4; break;
     case QNN_DATATYPE_INT_64: case QNN_DATATYPE_UINT_64: width = 8; break;
     default: throw std::runtime_error(std::string("Unsupported tensor datatype for ") + tensorName(t));
@@ -194,21 +198,37 @@ class SharedMemory {
   ToFd toFd_ = nullptr;
 };
 
-// Host-owned [heads, capacity, 128 floats] Temporal cache, laid out exactly like the graph input.
-class KvRing {
+// Zeroed host buffer in rpcmem when available, so HTP reads it without a per-execute copy.
+class SharedBuffer {
  public:
-  KvRing(SharedMemory& memory, size_t capacity) : memory_(memory), capacity_(capacity) {
-    bytes_ = kTemporalHeads * capacity * kHeadBytes;
+  SharedBuffer(SharedMemory& memory, size_t bytes) : memory_(memory), bytes_(bytes) {
     data_ = static_cast<uint8_t*>(memory_.allocate(bytes_, fd_));
     if (!data_) { fallback_.resize(bytes_); data_ = fallback_.data(); }
-    reset();
+    std::memset(data_, 0, bytes_);
   }
-  ~KvRing() { if (fd_ >= 0) memory_.release(data_); }
-  KvRing(const KvRing&) = delete;
-  KvRing& operator=(const KvRing&) = delete;
+  ~SharedBuffer() { if (fd_ >= 0) memory_.release(data_); }
+  SharedBuffer(const SharedBuffer&) = delete;
+  SharedBuffer& operator=(const SharedBuffer&) = delete;
+  uint8_t* data() const { return data_; }
+  size_t bytes() const { return bytes_; }
+  int fd() const { return fd_; }
+
+ private:
+  SharedMemory& memory_;
+  size_t bytes_;
+  int fd_ = -1;
+  uint8_t* data_ = nullptr;
+  std::vector<uint8_t> fallback_;
+};
+
+// Host-owned [heads, capacity, 128 floats] Temporal cache, laid out exactly like the graph input.
+class KvRing : public SharedBuffer {
+ public:
+  KvRing(SharedMemory& memory, size_t capacity)
+      : SharedBuffer(memory, kTemporalHeads * capacity * kHeadBytes), capacity_(capacity) {}
 
   // Masked slots must be finite zeros: softmax weights are zero but NaN * 0 is still NaN.
-  void reset() { std::memset(data_, 0, bytes_); }
+  void reset() { std::memset(data(), 0, bytes()); }
   void write(size_t position, const uint8_t* source, size_t sourceCapacity, size_t sourceSlot) {
     const size_t slot = position % capacity_;
     for (size_t head = 0; head < kTemporalHeads; ++head) {
@@ -216,20 +236,13 @@ class KvRing {
       const auto* values = reinterpret_cast<const float*>(from);
       for (size_t i = 0; i < kHeadBytes / sizeof(float); ++i)
         if (!std::isfinite(values[i])) throw std::runtime_error("Nonfinite new Temporal K/V");
-      std::memcpy(data_ + (head * capacity_ + slot) * kHeadBytes, from, kHeadBytes);
+      std::memcpy(data() + (head * capacity_ + slot) * kHeadBytes, from, kHeadBytes);
     }
   }
-  uint8_t* data() const { return data_; }
-  size_t bytes() const { return bytes_; }
   size_t capacity() const { return capacity_; }
-  int fd() const { return fd_; }
 
  private:
-  SharedMemory& memory_;
-  size_t capacity_, bytes_;
-  int fd_ = -1;
-  uint8_t* data_ = nullptr;
-  std::vector<uint8_t> fallback_;
+  size_t capacity_;
 };
 
 class Runtime {
@@ -451,13 +464,16 @@ class Graph {
     return find(outputs_, alias->second);
   }
 
+  const std::vector<Buffer>& inputs() const { return inputs_; }
+  const std::vector<Buffer>& outputs() const { return outputs_; }
+
   // Binds a large input to externally owned storage; registered shared memory when possible.
-  void bindInput(const std::string& name, const KvRing& ring) {
+  void bindInput(const std::string& name, const SharedBuffer& ring) {
     for (size_t i = 0; i < inputs_.size(); ++i) {
       auto& buffer = inputs_[i];
       if (buffer.name != name) continue;
-      if (tensorBytes(buffer.tensor) != ring.bytes() || tensorType(buffer.tensor) != QNN_DATATYPE_FLOAT_32)
-        throw std::runtime_error("KV storage does not match graph input " + name);
+      if (tensorBytes(buffer.tensor) != ring.bytes())
+        throw std::runtime_error("Shared storage size does not match graph input " + name);
       std::vector<uint8_t>().swap(buffer.bytes);
       Qnn_MemHandle_t handle = nullptr;
       if (ring.fd() >= 0 && runtime_.qnn.memRegister) {
