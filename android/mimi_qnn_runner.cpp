@@ -1037,10 +1037,9 @@ class Session {
 
 }  // namespace
 
-// cacheDirectory and fast are accepted for JNI compatibility; context binaries need neither.
-void* createConfiguredCodecSession(const std::string& libraryDir, const std::string& encoder,
-                                   const std::string& decoder, const std::string& lmDirectory,
-                                   const std::string& /*cacheDirectory*/, bool /*fast*/) {
+// An empty lmDirectory runs the Mimi encoder -> decoder loopback only.
+void* createSession(const std::string& libraryDir, const std::string& encoder,
+                    const std::string& decoder, const std::string& lmDirectory) {
   return new Session(libraryDir, encoder, decoder, lmDirectory);
 }
 

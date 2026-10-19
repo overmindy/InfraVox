@@ -11,8 +11,7 @@
 #include <string>
 #include <vector>
 
-void* createConfiguredCodecSession(const std::string&, const std::string&,
-    const std::string&, const std::string&, const std::string&, bool);
+void* createSession(const std::string&, const std::string&, const std::string&, const std::string&);
 size_t runMimiCodecSessionStreaming(void*, const std::string&, const std::string&, size_t,
     const std::function<void(size_t, size_t, double, const std::vector<int16_t>&)>&, bool);
 void destroyMimiCodecSession(void*);
@@ -24,17 +23,17 @@ static double elapsed(Clock::time_point start) {
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 9) throw std::runtime_error(
-        "Usage: probe LIB ENCODER DECODER LM CACHE INPUT OUTPUT_PREFIX FRAMES; use 0 for the full input");
-    const std::string prefix = argv[7];
-    const auto frameCount = std::stoul(argv[8]);
+    if (argc != 8) throw std::runtime_error(
+        "Usage: probe LIB ENCODER DECODER LM INPUT OUTPUT_PREFIX FRAMES; use 0 for the full input");
+    const std::string prefix = argv[6];
+    const auto frameCount = std::stoul(argv[7]);
     if (frameCount == 1 || frameCount > 3000) throw std::runtime_error("Use 0 or 2..3000 frames");
     setenv("ADSP_LIBRARY_PATH", argv[1], 1);
     std::ofstream report(prefix + ".latency.json");
     if (!report) throw std::runtime_error("Cannot create the latency report");
     const auto processStart = Clock::now();
     std::unique_ptr<void, decltype(&destroyMimiCodecSession)> session(
-        createConfiguredCodecSession(argv[1], argv[2], argv[3], argv[4], argv[5], true),
+        createSession(argv[1], argv[2], argv[3], argv[4]),
         &destroyMimiCodecSession);
     const double prepare = elapsed(processStart);
     report << std::fixed << std::setprecision(3)
@@ -50,7 +49,7 @@ int main(int argc, char** argv) {
       double firstPcm = -1, lastPcm = -1;
       size_t callbacks = 0, samples = 0;
       const auto runStart = Clock::now();
-      const size_t emitted = runMimiCodecSessionStreaming(session.get(), argv[6], output, frameCount,
+      const size_t emitted = runMimiCodecSessionStreaming(session.get(), argv[5], output, frameCount,
           [&](size_t consumed, size_t produced, double frameMs, const std::vector<int16_t>& pcm) {
             const double now = elapsed(runStart);
             ++callbacks; samples += pcm.size();

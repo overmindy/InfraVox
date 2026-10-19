@@ -12,8 +12,7 @@ size_t runMimiCodecSessionStreaming(void* session, const std::string& inputWav,
     const std::string& outputWav, size_t frames,
     const std::function<void(size_t, size_t, double, const std::vector<int16_t>&)>& callback, bool highPerformance);
 void destroyMimiCodecSession(void* session);
-void* createConfiguredCodecSession(const std::string&, const std::string&,
-    const std::string&, const std::string&, const std::string&, bool);
+void* createSession(const std::string&, const std::string&, const std::string&, const std::string&);
 
 namespace {
 
@@ -42,16 +41,13 @@ void throwJava(JNIEnv* env, const char* message) {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_overmindy_mimicodecdemo_MainActivity_nativePrepare(
-    JNIEnv* env, jclass, jstring libraryDir, jstring encoderDlc,
-    jstring decoderDlc, jstring lmDirectory, jstring cacheDirectory, jboolean fast) {
+    JNIEnv* env, jclass, jstring libraryDir, jstring encoderPath,
+    jstring decoderPath, jstring lmDirectory) {
   try {
     const std::string libraries = JavaString(env, libraryDir).str();
-    const std::string encoder = JavaString(env, encoderDlc).str();
-    const std::string decoder = JavaString(env, decoderDlc).str();
-    const std::string lm = JavaString(env, lmDirectory).str();
     setenv("ADSP_LIBRARY_PATH", libraries.c_str(), 1);
-    void* session = createConfiguredCodecSession(libraries, encoder, decoder, lm,
-        JavaString(env, cacheDirectory).str(), fast == JNI_TRUE);
+    void* session = createSession(libraries, JavaString(env, encoderPath).str(),
+        JavaString(env, decoderPath).str(), JavaString(env, lmDirectory).str());
     return reinterpret_cast<jlong>(session);
   } catch (const std::exception& error) {
     throwJava(env, error.what());

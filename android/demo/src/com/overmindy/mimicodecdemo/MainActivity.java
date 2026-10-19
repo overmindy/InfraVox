@@ -2,37 +2,32 @@ package com.overmindy.mimicodecdemo;
 
 import android.Manifest;
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.AudioTrack;
-import android.media.AudioAttributes;
 import android.media.MediaPlayer;
 import android.media.MediaRecorder;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
-import android.provider.DocumentsContract;
-import android.os.StatFs;
+import android.text.InputType;
 import android.view.Gravity;
-import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
-import android.widget.TextView;
 import android.widget.Switch;
-import android.widget.EditText;
-import android.text.InputType;
+import android.widget.TextView;
 
 import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -42,59 +37,47 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.LinkedHashMap;
 import java.util.Locale;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.security.MessageDigest;
-import org.json.JSONObject;
 
 public final class MainActivity extends Activity {
     private static final int PICK_AUDIO = 1;
-    private static final int PICK_ENCODER = 2;
-    private static final int PICK_DECODER = 3;
-    private static final int REQUEST_MICROPHONE = 4;
-    private static final int PICK_LM = 5;
+    private static final int REQUEST_MICROPHONE = 2;
     private static final int SAMPLE_RATE = 24_000;
     private static final int FRAME_SAMPLES = 1920;
     private static final int BACKGROUND = Color.rgb(10, 17, 29);
     private static final int CARD = Color.rgb(26, 39, 57);
     private static final int ACCENT = Color.rgb(68, 222, 194);
-    private final File[] files = new File[4];
-    private TextView status;
-    private TextView modelStatus;
-    private TextView audioStatus;
-    private TextView tokens;
-    private Button loadButton;
-    private Button recordButton;
-    private Button runButton;
-    private Button originalButton;
-    private Button outputButton;
-    private Button exportButton;
-    private Switch moshiMode;
-    private Switch streamPlayback;
-    private Switch htpPerformance;
-    private Switch fastRuntime;
+    private static final int MUTED = Color.rgb(176, 193, 210);
+    // Context-only bundle: Mimi + frontend/head/8 DepFormer + 4 Temporal parts, listed in SHA256SUMS.
+    private static final String BUNDLE = "lm-v2-w4w8vd";
+    private static final String[] BUNDLE_FILES = {
+        "mimi_encoder.bin", "mimi_decoder.bin", "dlc/frontend.bin", "dlc/head.bin",
+        "dlc/depformer_codebook_0.bin", "dlc/depformer_codebook_1.bin", "dlc/depformer_codebook_2.bin",
+        "dlc/depformer_codebook_3.bin", "dlc/depformer_codebook_4.bin", "dlc/depformer_codebook_5.bin",
+        "dlc/depformer_codebook_6.bin", "dlc/depformer_codebook_7.bin",
+        "dlc/temporal_part_0.bin", "dlc/temporal_part_1.bin", "dlc/temporal_part_2.bin", "dlc/temporal_part_3.bin",
+    };
+
+    private TextView status, modelStatus, audioStatus, tokens;
+    private Button verifyButton, loadButton, recordButton, runButton, originalButton, outputButton, exportButton;
+    private Switch moshiMode, streamPlayback, htpPerformance;
+    private EditText frameLimit;
     private AudioTrack streamTrack; // Worker thread owns creation/write/release.
-    private int streamedSamples;
-    private int streamThresholdBefore, streamThresholdAfter, streamCallbacks, streamChunks;
-    private EditText lmFrameLimit;
-    private File selectedEncoder, selectedDecoder, selectedLm;
-    private File contextCacheDirectory;
-    private boolean localLmVerified;
-    private Button scanModelsButton;
+    private int streamedSamples, streamCallbacks, streamChunks, streamThresholdBefore, streamThresholdAfter;
     private MediaPlayer player;
-    private boolean working;
+    private boolean working, bundleVerified;
     private volatile boolean recording;
     private volatile long sessionHandle;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
-    private static native long nativePrepare(String libraryDir, String encoderDlc,
-                                             String decoderDlc, String lmDirectory, String cacheDirectory, boolean fast);
-    private static native int nativeRunPrepared(long handle, String inputWav,
-                                                 String outputWav, int frames, MainActivity receiver, boolean highPerformance);
+    private static native long nativePrepare(String libraryDir, String encoder, String decoder, String lmDirectory);
+    private static native int nativeRunPrepared(long handle, String inputWav, String outputWav, int frames,
+                                                MainActivity receiver, boolean highPerformance);
     private static native void nativeRelease(long handle);
 
     static {
@@ -104,24 +87,8 @@ public final class MainActivity extends Activity {
     @Override
     public void onCreate(Bundle state) {
         super.onCreate(state);
-        contextCacheDirectory = getExternalFilesDir("qnn-context-v1");
-        if (contextCacheDirectory == null) contextCacheDirectory = new File(getFilesDir(), "qnn-context-v1");
-        contextCacheDirectory.mkdirs();
         getWindow().setStatusBarColor(BACKGROUND);
         getWindow().setNavigationBarColor(BACKGROUND);
-        files[PICK_AUDIO] = new File(getFilesDir(), "input.wav");
-        files[PICK_ENCODER] = new File(getFilesDir(), "mimi_encoder.dlc");
-        files[PICK_DECODER] = new File(getFilesDir(), "mimi_decoder.dlc");
-        defaultModelsDirectory();
-        selectedEncoder = rememberedModel("encoder");
-        selectedDecoder = rememberedModel("decoder");
-        selectedLm = rememberedModel("lm");
-        File compact = new File(defaultModelsDirectory(), "lm-cache1000-v1");
-        if (new File(compact, "CONTEXT_ONLY").isFile()) {
-            selectedEncoder = new File(compact, "mimi_encoder.bin");
-            selectedDecoder = new File(compact, "mimi_decoder.bin");
-            selectedLm = compact;
-        }
 
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -134,455 +101,153 @@ public final class MainActivity extends Activity {
 
         label(column, "MOSHI / MIMI  •  QNN", 13, ACCENT, true);
         label(column, "听见编码的过程", 28, Color.WHITE, true);
-        label(column, "WAV → Encoder → Moshi LM → Decoder → WAV（或 codec 对照）",
-              15, Color.rgb(176, 193, 210), false);
+        label(column, "WAV → Encoder → Moshi LM → Decoder → WAV（或 codec 对照）", 15, MUTED, false);
 
         LinearLayout steps = card(column);
-        label(steps, "① 导入并加载模型", 19, Color.WHITE, true);
-        label(steps, "两个 DLC 只需导入一次。点击加载，等 QNN 图就绪后再录音或推理。",
-              14, Color.rgb(176, 193, 210), false);
-        label(steps, "默认模型目录（ADB 直接放入，无需重复导入）：\n"
-              + defaultModelsDirectory().getAbsolutePath()
-              + "\nMimi：同一子目录放 mimi_encoder.dlc 与 mimi_decoder.dlc。"
-              + "\nLM：子目录内放 dlc_inventory.json 与 dlc/。", 13,
-              Color.rgb(176, 193, 210), false);
-        scanModelsButton = button(steps, "扫描默认目录并选择模型", this::chooseDefaultModels);
-        button(steps, "导入 Encoder DLC", () -> pick(PICK_ENCODER));
-        button(steps, "导入 Decoder DLC", () -> pick(PICK_DECODER));
-        button(steps, "导入完整 LM 模型目录（26 DLC + inventory）", this::pickLm);
+        label(steps, "① 校验并加载模型", 19, Color.WHITE, true);
+        label(steps, "模型包（ADB 放入，App 只读取并校验 SHA256SUMS）：\n" + bundleDirectory().getAbsolutePath(), 13, MUTED, false);
+        verifyButton = button(steps, "校验模型包", () -> verifyBundle(true));
         moshiMode = new Switch(this);
-        moshiMode.setText("启用 Moshi LM（预算内常驻＋context 缓存，非实时）");
+        moshiMode.setText("启用 Moshi LM（关闭则只跑 Mimi codec 对照）");
         moshiMode.setTextColor(Color.WHITE);
-        moshiMode.setChecked(new File(compact, "CONTEXT_ONLY").isFile());
+        moshiMode.setChecked(true);
         steps.addView(moshiMode);
         moshiMode.setOnCheckedChangeListener((button, enabled) -> {
-            long previous = sessionHandle;
-            sessionHandle = 0;
-            if (previous != 0) worker.execute(() -> nativeRelease(previous));
-            modelStatus.setText("模式已更换，请重新加载；LM 使用常驻小图与本机 context 缓存");
+            releaseSession();
+            modelStatus.setText("模式已更换，请重新加载");
             outputFile().delete(); codesFile().delete();
             refresh();
         });
-        loadButton = button(steps, "加载 Mimi 模型", this::loadModels);
-        modelStatus = label(steps, "等待选择 Mimi 模型", 14,
-                            Color.rgb(176, 193, 210), false);
+        loadButton = button(steps, "加载模型", this::loadModels);
+        modelStatus = label(steps, "正在检查模型包…", 14, MUTED, false);
 
         LinearLayout input = card(column);
         label(input, "② 准备音频", 19, Color.WHITE, true);
-        label(input, "录音直接保存为 24 kHz 单声道 PCM16 WAV；点击停止后再推理。也可选已有 WAV。",
-              14, Color.rgb(176, 193, 210), false);
+        label(input, "录音直接保存为 24 kHz 单声道 PCM16 WAV；点击停止后再推理。也可选已有 WAV。", 14, MUTED, false);
         recordButton = button(input, "● 开始录音", this::toggleRecording);
-        button(input, "选择 24 kHz 单声道 WAV", () -> pick(PICK_AUDIO));
+        button(input, "选择 24 kHz 单声道 WAV", this::pickAudio);
         button(input, "使用内置演示音频", this::useDemoAudio);
-        audioStatus = label(input, "等待模型就绪", 14,
-                            Color.rgb(176, 193, 210), false);
+        audioStatus = label(input, inputFile().isFile() ? "已有输入音频，可直接推理" : "等待模型就绪", 14, MUTED, false);
 
         LinearLayout result = card(column);
-        label(result, "③ 手机本地编码与重建", 19, Color.WHITE, true);
-        label(result, "先跑 2–4 帧检查。加速版需选择 lm-cache1000-v1，并使用本手机匹配的 context 缓存；首次运行仍要装载权重，重复运行复用。1000 帧窗口的长音频质量尚未验证。",
-              14, Color.rgb(176, 193, 210), false);
-        lmFrameLimit = new EditText(this);
-        lmFrameLimit.setInputType(InputType.TYPE_CLASS_NUMBER);
-        lmFrameLimit.setTextColor(Color.WHITE);
-        lmFrameLimit.setText("2");
-        result.addView(lmFrameLimit);
-        streamPlayback = new Switch(this);
-        streamPlayback.setText("每生成 80 ms 音频立即播放（仍可能有计算间隔）");
-        streamPlayback.setTextColor(Color.WHITE);
-        result.addView(streamPlayback);
-        htpPerformance = new Switch(this);
-        htpPerformance.setText("推理期间请求 HTP 性能档（更耗电，系统温控仍有效）");
-        htpPerformance.setTextColor(Color.WHITE);
-        htpPerformance.setChecked(true);
-        result.addView(htpPerformance);
-        fastRuntime = new Switch(this);
-        fastRuntime.setText("已验证加速：cache1000＋共享工作区＋8 GiB 常驻预算（需完整本机缓存）");
-        fastRuntime.setTextColor(Color.WHITE);
-        fastRuntime.setChecked(true);
-        result.addView(fastRuntime);
-        fastRuntime.setOnCheckedChangeListener((button, enabled) -> {
-            releaseSelectedSession();
-            modelStatus.setText("运行配置已改变，请重新加载；未关闭系统温控。");
-            refresh();
-        });
-        runButton = button(result, "运行 QNN Encoder → Decoder", this::runCodec);
-        status = label(result, "加载模型并准备音频后可推理", 14,
-                       Color.rgb(176, 193, 210), false);
-        originalButton = button(result, "▶ 播放原音", () -> play(files[PICK_AUDIO]));
-        outputButton = button(result, "▶ 播放重建音频", () -> play(outputFile()));
+        label(result, "③ 手机本地推理", 19, Color.WHITE, true);
+        label(result, "帧数填 0 跑整段；每帧 80 ms。Temporal 为 4 段 W4/W8 量化，KV 窗口 1000 帧（约 80 秒）。",
+              14, MUTED, false);
+        frameLimit = new EditText(this);
+        frameLimit.setInputType(InputType.TYPE_CLASS_NUMBER);
+        frameLimit.setTextColor(Color.WHITE);
+        frameLimit.setText("0");
+        result.addView(frameLimit);
+        streamPlayback = toggle(result, "每生成 80 ms 音频立即播放（仍可能有计算间隔）", false);
+        htpPerformance = toggle(result, "推理期间请求 HTP burst 性能档（更耗电，系统温控仍有效）", true);
+        runButton = button(result, "运行", this::runInference);
+        status = label(result, "加载模型并准备音频后可推理", 14, MUTED, false);
+        originalButton = button(result, "▶ 播放原音", () -> play(inputFile()));
+        outputButton = button(result, "▶ 播放输出音频", () -> play(outputFile()));
         exportButton = button(result, "保存音频、tokens 与性能计时到下载目录", this::exportResults);
 
         LinearLayout tokenCard = card(column);
         label(tokenCard, "④ 每帧的 codec tokens", 19, Color.WHITE, true);
         label(tokenCard, "codec 模式显示 Encoder tokens；Moshi 模式显示延迟对齐后的生成音频 tokens。LM 采用 greedy，预热一帧，不做末尾补帧。",
-              14, Color.rgb(176, 193, 210), false);
+              14, MUTED, false);
         tokens = label(tokenCard, "运行后显示编码结果", 13, ACCENT, false);
         tokens.setTypeface(Typeface.MONOSPACE);
-        if (encoderFile().isFile() && decoderFile().isFile()) {
-            modelStatus.setText("已有 Mimi：\n" + encoderFile().getAbsolutePath()
-                + "\n" + decoderFile().getAbsolutePath() + "\n点击加载即可");
-        }
-        if (files[PICK_AUDIO].isFile()) audioStatus.setText("已有输入音频，可直接推理");
+
         refresh();
         scroll.setFocusableInTouchMode(true);
         scroll.requestFocus();
         scroll.post(() -> scroll.scrollTo(0, 0));
-        if (selectedLm != null) verifyLocalLm(selectedLm);
+        verifyBundle(false);
     }
 
+    private File bundleDirectory() {
+        File root = getExternalFilesDir("models");
+        if (root == null) root = new File(getFilesDir(), "models");
+        return new File(root, BUNDLE);
+    }
+    private File inputFile() { return new File(getFilesDir(), "input.wav"); }
     private File outputFile() { return new File(getFilesDir(), "reconstructed.wav"); }
     private File codesFile() { return new File(getFilesDir(), "reconstructed.wav.codes.txt"); }
     private File textTokensFile() { return new File(getFilesDir(), "reconstructed.wav.text_tokens.txt"); }
-    private File lmDirectory() {
-        return selectedLm != null ? selectedLm : new File(getFilesDir(), "moshi-lm");
-    }
-    private File encoderFile() { return selectedEncoder != null ? selectedEncoder : files[PICK_ENCODER]; }
-    private File decoderFile() { return selectedDecoder != null ? selectedDecoder : files[PICK_DECODER]; }
 
-    private File defaultModelsDirectory() {
-        File root = getExternalFilesDir("models");
-        if (root == null) root = new File(getFilesDir(), "models");
-        root.mkdirs();
-        return root;
-    }
-
-    private File rememberedModel(String key) {
-        String value = getPreferences(MODE_PRIVATE).getString("model_" + key, "");
-        if (value.isEmpty()) return null;
-        File path = new File(value);
-        try {
-            String candidate = path.getCanonicalPath();
-            String root = defaultModelsDirectory().getCanonicalPath();
-            if ((candidate.startsWith(root + "/") || (key.equals("lm") && candidate.equals(root)))
-                    && path.exists()) return path;
-        } catch (IOException ignored) { }
-        return null;
-    }
-
-    private void releaseSelectedSession() {
-        long previous = sessionHandle; sessionHandle = 0;
+    private void releaseSession() {
+        long previous = sessionHandle;
+        sessionHandle = 0;
         if (previous != 0) worker.execute(() -> nativeRelease(previous));
     }
 
-    private void chooseDefaultModels() {
+    // Hashes every bundle file against SHA256SUMS. A full pass is remembered by file size and
+    // modification time, so unchanged bundles skip re-hashing 6 GB unless `force` is set.
+    private void verifyBundle(boolean force) {
         if (working || recording) return;
-        File root = defaultModelsDirectory();
-        ArrayList<File> folders = new ArrayList<>(); folders.add(root);
-        File[] children = root.listFiles(File::isDirectory);
-        if (children != null) {
-            Arrays.sort(children, Comparator.comparing(File::getName));
-            folders.addAll(Arrays.asList(children));
-        }
-        ArrayList<String> labels = new ArrayList<>();
-        ArrayList<Runnable> choices = new ArrayList<>();
-        if (files[PICK_ENCODER].isFile() && files[PICK_DECODER].isFile()) {
-            labels.add("Mimi：之前导入的私有模型");
-            choices.add(() -> selectMimi(null, null));
-        }
-        File privateLm = new File(getFilesDir(), "moshi-lm");
-        if (new File(privateLm, "READY").isFile()) {
-            labels.add("LM：之前导入的私有模型");
-            choices.add(() -> {
-                releaseSelectedSession(); selectedLm = null; localLmVerified = false;
-                getPreferences(MODE_PRIVATE).edit().remove("model_lm").apply();
-                modelStatus.setText("已选择私有 LM，请重新加载"); refresh();
-            });
-        }
-        for (File folder : folders) {
-            File encoder = new File(folder, "mimi_encoder.dlc");
-            File decoder = new File(folder, "mimi_decoder.dlc");
-            if (!encoder.isFile()) encoder = new File(folder, "mimi_encoder.bin");
-            if (!decoder.isFile()) decoder = new File(folder, "mimi_decoder.bin");
-            if (encoder.isFile() && encoder.length() > 0 && decoder.isFile() && decoder.length() > 0) {
-                final File chosenEncoder = encoder, chosenDecoder = decoder;
-                labels.add("Mimi：" + folder.getName());
-                choices.add(() -> selectMimi(chosenEncoder, chosenDecoder));
-            }
-            if (new File(folder, "dlc_inventory.json").isFile() && new File(folder, "dlc").isDirectory()) {
-                labels.add("LM：" + folder.getName() + "（校验后直接使用）");
-                choices.add(() -> verifyLocalLm(folder));
-            }
-        }
-        if (labels.isEmpty()) {
-            status.setText("没有发现模型。请放入：\n" + root.getAbsolutePath()); return;
-        }
-        new AlertDialog.Builder(this).setTitle("选择 Mimi 或 LM；可分别选择")
-            .setItems(labels.toArray(new String[0]), (dialog, which) -> choices.get(which).run())
-            .setNegativeButton("取消", null).show();
-    }
-
-    private void selectMimi(File encoder, File decoder) {
-        releaseSelectedSession(); selectedEncoder = encoder; selectedDecoder = decoder;
-        getPreferences(MODE_PRIVATE).edit()
-            .putString("model_encoder", encoder == null ? "" : encoder.getAbsolutePath())
-            .putString("model_decoder", decoder == null ? "" : decoder.getAbsolutePath()).apply();
-        modelStatus.setText("已选择 Mimi：\n" + encoderFile().getAbsolutePath()
-            + "\n" + decoderFile().getAbsolutePath() + "\n请点击加载");
-        refresh();
-    }
-
-    private void verifyLocalLm(File folder) {
-        if (working || recording) return;
-        releaseSelectedSession(); working = true; localLmVerified = false; refresh();
-        status.setText("正在校验默认目录中的 26 个 LM DLC（不复制文件）…");
+        releaseSession();
+        working = true; bundleVerified = false; refresh();
         worker.execute(() -> {
             try {
-                File root = defaultModelsDirectory().getCanonicalFile();
-                File canonical = folder.getCanonicalFile();
-                if (!canonical.equals(root) && !canonical.getPath().startsWith(root.getPath() + "/"))
-                    throw new IOException("LM 目录必须位于默认模型目录内");
-                File inventoryFile = new File(canonical, "dlc_inventory.json");
-                if (inventoryFile.length() > 1024 * 1024) throw new IOException("模型清单过大");
-                byte[] bytes;
-                try (InputStream input = new FileInputStream(inventoryFile);
-                     ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-                    byte[] buffer = new byte[8192]; int count;
-                    while ((count = input.read(buffer)) != -1) {
-                        output.write(buffer, 0, count);
-                        if (output.size() > 1024 * 1024) throw new IOException("模型清单过大");
-                    }
-                    bytes = output.toByteArray();
+                File bundle = bundleDirectory();
+                Map<String, String> expected = readChecksums(new File(bundle, "SHA256SUMS"));
+                StringBuilder fingerprint = new StringBuilder();
+                for (String name : BUNDLE_FILES) {
+                    File file = new File(bundle, name);
+                    if (!file.isFile() || file.length() == 0) throw new IOException("缺少模型文件：" + name);
+                    if (!expected.containsKey(name)) throw new IOException("SHA256SUMS 未列出：" + name);
+                    fingerprint.append(name).append(':').append(file.length()).append(':').append(file.lastModified()).append(';');
                 }
-                JSONObject inventory = new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-                JSONObject graphs = inventory.getJSONObject("graphs");
-                boolean compact = "moshi-context-only-app-inventory-v1".equals(inventory.optString("format"));
-                if (compact && !new File(canonical, "CONTEXT_ONLY").isFile())
-                    throw new IOException("缺少设备模型包标记");
-                if (!inventory.getBoolean("all_graphs_verified") || graphs.length() != 26)
-                    throw new IOException("需要完整的 26 图验证清单");
-                ArrayList<String> names = new ArrayList<>(); names.add("frontend"); names.add("head");
-                for (int i = 0; i < 32; i += 2) names.add("temporal_layers_" + i + "_" + (i+1));
-                for (int i = 0; i < 8; i++) names.add("depformer_codebook_" + i);
-                if (compact) { names.add("mimi_encoder"); names.add("mimi_decoder"); }
-                for (int i = 0; i < names.size(); i++) {
-                    String name = names.get(i);
-                    boolean codec = name.startsWith("mimi_");
-                    JSONObject graph = (codec ? inventory.getJSONObject("mimi") : graphs).getJSONObject(name);
-                    String relative = (codec ? "" : "dlc/") + name + (compact ? ".bin" : ".dlc");
-                    if (!relative.equals(graph.getString("file"))) throw new IOException("模型路径不匹配：" + name);
-                    File model = new File(canonical, relative);
-                    if (!model.getCanonicalPath().startsWith(canonical.getPath() + "/")
-                            || !model.isFile() || model.length() == 0) throw new IOException("模型缺失：" + name);
-                    final int index = i + 1;
-                    final int total = names.size();
-                    runOnUiThread(() -> status.setText("校验 " + index + "/" + total + "：" + name));
-                    MessageDigest digest = MessageDigest.getInstance("SHA-256");
-                    try (InputStream input = new FileInputStream(model)) {
-                        byte[] buffer = new byte[1024 * 1024]; int count;
-                        while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+                SharedPreferences preferences = getPreferences(MODE_PRIVATE);
+                boolean cached = !force && fingerprint.toString().equals(preferences.getString("verified_bundle", ""));
+                if (!cached) {
+                    for (int i = 0; i < BUNDLE_FILES.length; i++) {
+                        String name = BUNDLE_FILES[i];
+                        final String progress = "校验 " + (i + 1) + "/" + BUNDLE_FILES.length + "：" + name;
+                        runOnUiThread(() -> modelStatus.setText(progress));
+                        if (!sha256(new File(bundle, name)).equals(expected.get(name)))
+                            throw new IOException("SHA256 不匹配：" + name);
                     }
-                    StringBuilder hex = new StringBuilder();
-                    for (byte b : digest.digest()) hex.append(String.format(Locale.US, "%02x", b & 255));
-                    if (!hex.toString().equals(graph.getString("sha256"))) throw new IOException("SHA256 不匹配：" + name);
-                }
-                if (compact && new File(canonical, "mimi_encoder.bin").equals(encoderFile())
-                        && new File(canonical, "mimi_decoder.bin").equals(decoderFile())) {
-                    // The verified compact bundle supersedes private codec imports.
-                    for (int kind : new int[]{PICK_ENCODER, PICK_DECODER}) {
-                        File obsolete = files[kind];
-                        long bytesRemoved = obsolete.length();
-                        if (obsolete.isFile() && obsolete.delete())
-                            android.util.Log.i("MoshiModelCleanup", "removed=" + obsolete.getAbsolutePath()
-                                    + " bytes=" + bytesRemoved);
-                    }
+                    preferences.edit().putString("verified_bundle", fingerprint.toString()).apply();
                 }
                 runOnUiThread(() -> {
-                    selectedLm = canonical; localLmVerified = true;
-                    getPreferences(MODE_PRIVATE).edit().putString("model_lm", canonical.getAbsolutePath()).apply();
-                    modelStatus.setText("模型文件校验通过，直接使用：\n" + canonical.getAbsolutePath());
-                    status.setText("模型已选择；无需重复导入。请点击加载。");
+                    bundleVerified = true;
+                    modelStatus.setText((cached ? "模型包未变化，沿用上次校验：\n" : "16 个模型文件 SHA256 校验通过：\n")
+                        + bundle.getAbsolutePath() + "\n点击加载");
                 });
             } catch (Exception error) {
-                runOnUiThread(() -> status.setText("LM 校验失败：" + error.getMessage()));
-            } finally { runOnUiThread(() -> { working = false; refresh(); }); }
-        });
-    }
-
-    private void pickLm() {
-        if (working || recording) return;
-        startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), PICK_LM);
-    }
-
-    private void pick(int kind) {
-        if (working || recording) return;
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
-        startActivityForResult(intent, kind);
-    }
-
-    @Override
-    protected void onActivityResult(int request, int result, Intent data) {
-        super.onActivityResult(request, result, data);
-        if (request == PICK_LM && result == RESULT_OK && data != null && data.getData() != null) {
-            importLm(data.getData());
-            return;
-        }
-        if (result != RESULT_OK || data == null || data.getData() == null ||
-            request < PICK_AUDIO || request > PICK_DECODER) return;
-        Uri uri = data.getData();
-        if (request == PICK_ENCODER) {
-            selectedEncoder = null;
-            getPreferences(MODE_PRIVATE).edit().remove("model_encoder").apply();
-        } else if (request == PICK_DECODER) {
-            selectedDecoder = null;
-            getPreferences(MODE_PRIVATE).edit().remove("model_decoder").apply();
-        }
-        doCopy(() -> getContentResolver().openInputStream(uri), files[request],
-               request == PICK_AUDIO ? "音频已导入" : "DLC 已导入");
-    }
-
-    private interface Source { InputStream open() throws IOException; }
-
-    private Uri child(Uri tree, String parentId, String name) throws IOException {
-        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId);
-        try (Cursor cursor = getContentResolver().query(children,
-                new String[]{DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                             DocumentsContract.Document.COLUMN_DISPLAY_NAME}, null, null, null)) {
-            if (cursor != null) while (cursor.moveToNext()) {
-                if (name.equals(cursor.getString(1)))
-                    return DocumentsContract.buildDocumentUriUsingTree(tree, cursor.getString(0));
-            }
-        }
-        throw new IOException("模型目录缺少 " + name);
-    }
-
-    private byte[] smallDocument(Uri uri) throws IOException {
-        try (InputStream input = getContentResolver().openInputStream(uri);
-             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            if (input == null) throw new IOException("无法读取模型清单");
-            byte[] buffer = new byte[8192]; int count;
-            while ((count = input.read(buffer)) != -1) {
-                output.write(buffer, 0, count);
-                if (output.size() > 1024 * 1024) throw new IOException("模型清单过大");
-            }
-            return output.toByteArray();
-        }
-    }
-
-    private void importLm(Uri tree) {
-        if (working || recording) return;
-        if (new StatFs(getFilesDir().getAbsolutePath()).getAvailableBytes() < 13L * 1024 * 1024 * 1024) {
-            status.setText("导入 LM 至少需要 13 GiB 可用空间（约 12 GB 模型，不包含原目录）");
-            return;
-        }
-        working = true;
-        long previous = sessionHandle; sessionHandle = 0;
-        refresh(); status.setText("正在读取 LM 清单并校验 26 个模型…");
-        worker.execute(() -> {
-            File incoming = new File(getFilesDir(), "lm-import-" + System.currentTimeMillis());
-            try {
-                if (previous != 0) nativeRelease(previous);
-                String rootId = DocumentsContract.getTreeDocumentId(tree);
-                byte[] inventoryBytes = smallDocument(child(tree, rootId, "dlc_inventory.json"));
-                JSONObject inventory = new JSONObject(new String(inventoryBytes, StandardCharsets.UTF_8));
-                JSONObject graphs = inventory.getJSONObject("graphs");
-                if (!inventory.getBoolean("all_graphs_verified") || graphs.length() != 26)
-                    throw new IOException("需要全部验证通过的 26 个 LM 模块");
-                File dlcDir = new File(incoming, "dlc");
-                if (!dlcDir.mkdirs()) throw new IOException("无法创建模型目录");
-                Uri sourceDir = child(tree, rootId, "dlc");
-                String parentId = DocumentsContract.getDocumentId(sourceDir);
-                String[] names = new String[26];
-                names[0] = "frontend"; names[1] = "head";
-                for (int i = 0; i < 16; i++) names[2+i] = "temporal_layers_" + (2*i) + "_" + (2*i+1);
-                for (int i = 0; i < 8; i++) names[18+i] = "depformer_codebook_" + i;
-                for (int i = 0; i < names.length; i++) {
-                    String name = names[i];
-                    JSONObject graph = graphs.getJSONObject(name);
-                    if (!graph.getString("file").equals("dlc/" + name + ".dlc"))
-                        throw new IOException("模型路径不匹配：" + name);
-                    final int index = i + 1;
-                    runOnUiThread(() -> status.setText("导入并校验 " + index + "/26：" + name));
-                    MessageDigest digest = MessageDigest.getInstance("SHA-256");
-                    File target = new File(dlcDir, name + ".dlc");
-                    try (InputStream input = getContentResolver().openInputStream(child(tree, parentId, name + ".dlc"));
-                         OutputStream output = new FileOutputStream(target)) {
-                        if (input == null) throw new IOException("无法读取 " + name);
-                        byte[] buffer = new byte[1024 * 1024]; int count;
-                        while ((count = input.read(buffer)) != -1) {
-                            digest.update(buffer, 0, count); output.write(buffer, 0, count);
-                        }
-                    }
-                    StringBuilder hex = new StringBuilder();
-                    for (byte b : digest.digest()) hex.append(String.format(Locale.US, "%02x", b & 255));
-                    if (!target.isFile() || target.length() == 0 || !hex.toString().equals(graph.getString("sha256")))
-                        throw new IOException("SHA256 不匹配：" + name);
-                }
-                try (OutputStream out = new FileOutputStream(new File(incoming, "dlc_inventory.json"))) { out.write(inventoryBytes); }
-                try (OutputStream out = new FileOutputStream(new File(incoming, "READY"))) {
-                    out.write("26 DLC SHA256 verified\n".getBytes(StandardCharsets.UTF_8));
-                }
-                File old = new File(getFilesDir(), "lm-previous-" + System.currentTimeMillis());
-                File privateTarget = new File(getFilesDir(), "moshi-lm");
-                boolean hadOld = privateTarget.exists();
-                if (hadOld && !privateTarget.renameTo(old)) throw new IOException("无法保留原模型目录");
-                if (!incoming.renameTo(privateTarget)) {
-                    if (hadOld && !old.renameTo(privateTarget)) throw new IOException("切换失败；原模型保留在 " + old);
-                    throw new IOException("无法切换模型目录");
-                }
-                runOnUiThread(() -> {
-                    selectedLm = null; localLmVerified = false;
-                    getPreferences(MODE_PRIVATE).edit().remove("model_lm").apply();
-                    moshiMode.setChecked(true);
-                    modelStatus.setText("26 个 LM DLC 校验完成；原模型（如有）已保留。请加载模型后运行短音频");
-                });
-            } catch (Exception error) {
-                runOnUiThread(() -> status.setText("LM 导入失败：" + error.getMessage()
-                        + "；未完成文件保留在 " + incoming.getName()));
-            } finally { runOnUiThread(() -> { working = false; refresh(); }); }
-        });
-    }
-
-    private void useDemoAudio() {
-        doCopy(() -> getAssets().open("demo.wav"), files[PICK_AUDIO],
-               "演示音频已导入");
-    }
-
-    private void doCopy(Source source, File target, String success) {
-        if (working || recording) return;
-        stopPlayer();
-        outputFile().delete();
-        codesFile().delete();
-        tokens.setText("输入或模型已更换；请重新运行编码");
-        boolean modelChanged = target == files[PICK_ENCODER] ||
-                               target == files[PICK_DECODER];
-        long oldHandle = modelChanged ? sessionHandle : 0;
-        if (modelChanged) {
-            sessionHandle = 0;
-            modelStatus.setText("模型文件已更换，请重新加载 DLC");
-        }
-        working = true;
-        refresh();
-        status.setText("正在导入 " + target.getName() + "…");
-        worker.execute(() -> {
-            if (oldHandle != 0) nativeRelease(oldHandle);
-            try (InputStream input = source.open();
-                 OutputStream output = new FileOutputStream(target)) {
-                byte[] buffer = new byte[1024 * 1024];
-                int count;
-                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
-                if (target.length() == 0) throw new IOException("文件为空");
-                runOnUiThread(() -> {
-                    if (modelChanged) modelStatus.setText("DLC 已导入；点击加载两个 DLC 到 QNN");
-                    else audioStatus.setText(success + "：" + target.getName());
-                    status.setText(success + "：" + target.getName());
-                });
-            } catch (Exception error) {
-                target.delete();
-                runOnUiThread(() -> status.setText("导入失败：" + error.getMessage()));
+                runOnUiThread(() -> modelStatus.setText("模型包不可用：" + error.getMessage()
+                    + "\n请把 " + BUNDLE + " 放到 " + bundleDirectory().getParent()));
             } finally {
                 runOnUiThread(() -> { working = false; refresh(); });
             }
         });
     }
 
+    private static Map<String, String> readChecksums(File file) throws IOException {
+        Map<String, String> sums = new LinkedHashMap<>();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] fields = line.trim().split("\\s+", 2);
+                if (fields.length == 2) sums.put(fields[1].replaceFirst("^\\*", ""), fields[0].toLowerCase(Locale.US));
+            }
+        }
+        return sums;
+    }
+
+    private static String sha256(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream input = new FileInputStream(file)) {
+            byte[] buffer = new byte[1024 * 1024];
+            int count;
+            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+        }
+        StringBuilder hex = new StringBuilder();
+        for (byte b : digest.digest()) hex.append(String.format(Locale.US, "%02x", b & 255));
+        return hex.toString();
+    }
+
     private void loadModels() {
-        if (working || recording || !modelFilesReady()) return;
+        if (working || recording || !bundleVerified) return;
         working = true;
         final boolean useLm = moshiMode.isChecked();
-        final boolean requestFast = useLm && fastRuntime.isChecked();
-        modelStatus.setText("正在加载 Mimi 图；LM 使用本机 context 缓存、预算内常驻和共享缓冲…");
+        modelStatus.setText(useLm ? "正在加载 Mimi + Moshi LM（全部 context 常驻）…" : "正在加载 Mimi…");
         refresh();
         worker.execute(() -> {
             long start = System.nanoTime();
@@ -590,31 +255,64 @@ public final class MainActivity extends Activity {
                 long previous = sessionHandle;
                 sessionHandle = 0;
                 if (previous != 0) nativeRelease(previous);
-                File cache = contextCacheDirectory;
-                if (requestFast) {
-                    // Only the separately hash-verified, short-chain-tested bundle
-                    // opts into the fast profile. Original/SAF imports keep the control path.
-                    if (selectedLm == null || !localLmVerified)
-                        throw new IOException("请先从默认目录校验 lm-cache1000-v1；或关闭加速开关运行普通对照");
-                    JSONObject manifest = new JSONObject(new String(
-                        readSmallFile(new File(selectedLm, "dlc_inventory.json")), StandardCharsets.UTF_8));
-                    if (!"cache1000-shared-v1".equals(manifest.optString("runtime_preset")))
-                        throw new IOException("所选 LM 不是 cache1000 加速包；请选择新包或关闭加速开关");
-                    cache = "moshi-context-only-app-inventory-v1".equals(manifest.optString("format"))
-                        ? selectedLm : new File(contextCacheDirectory, "cache1000-v1");
-                    if (!cache.isDirectory()) throw new IOException("缺少 cache1000-v1 本手机编译缓存；请部署缓存后再加载");
-                }
+                File bundle = bundleDirectory();
                 sessionHandle = nativePrepare(getApplicationInfo().nativeLibraryDir,
-                        encoderFile().getAbsolutePath(),
-                        decoderFile().getAbsolutePath(),
-                        useLm ? lmDirectory().getAbsolutePath() : "", cache.getAbsolutePath(), requestFast);
+                        new File(bundle, "mimi_encoder.bin").getAbsolutePath(),
+                        new File(bundle, "mimi_decoder.bin").getAbsolutePath(),
+                        useLm ? bundle.getAbsolutePath() : "");
                 double seconds = (System.nanoTime() - start) / 1e9;
                 runOnUiThread(() -> modelStatus.setText(String.format(Locale.US,
-                        requestFast ? "加速配置已就绪；首次运行加载 LM，重复运行复用。准备用时 %.1f 秒"
-                              : useLm ? "Mimi 就绪；普通 LM 缓存对照模式。准备用时 %.1f 秒"
-                              : "Mimi 模型已就绪；本次加载用时 %.1f 秒", seconds)));
+                        "%s已就绪；加载用时 %.1f 秒", useLm ? "Mimi + Moshi LM " : "Mimi ", seconds)));
             } catch (Exception error) {
                 runOnUiThread(() -> modelStatus.setText("加载失败：" + error.getMessage()));
+            } finally {
+                runOnUiThread(() -> { working = false; refresh(); });
+            }
+        });
+    }
+
+    private void pickAudio() {
+        if (working || recording) return;
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("audio/*");
+        startActivityForResult(intent, PICK_AUDIO);
+    }
+
+    @Override
+    protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != PICK_AUDIO || result != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+        copyAudio(() -> getContentResolver().openInputStream(uri), "音频已导入");
+    }
+
+    private interface Source { InputStream open() throws IOException; }
+
+    private void useDemoAudio() {
+        copyAudio(() -> getAssets().open("demo.wav"), "演示音频已导入");
+    }
+
+    private void copyAudio(Source source, String success) {
+        if (working || recording) return;
+        stopPlayer();
+        outputFile().delete();
+        codesFile().delete();
+        tokens.setText("输入已更换；请重新运行");
+        working = true;
+        refresh();
+        worker.execute(() -> {
+            File target = inputFile();
+            try (InputStream input = source.open(); OutputStream output = new FileOutputStream(target)) {
+                if (input == null) throw new IOException("无法读取音频");
+                byte[] buffer = new byte[1024 * 1024];
+                int count;
+                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                if (target.length() == 0) throw new IOException("文件为空");
+                runOnUiThread(() -> { audioStatus.setText(success); status.setText(success); });
+            } catch (Exception error) {
+                target.delete();
+                runOnUiThread(() -> status.setText("导入失败：" + error.getMessage()));
             } finally {
                 runOnUiThread(() -> { working = false; refresh(); });
             }
@@ -629,25 +327,19 @@ public final class MainActivity extends Activity {
             return;
         }
         if (working || sessionHandle == 0) return;
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
-                PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},
-                               REQUEST_MICROPHONE);
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_MICROPHONE);
             return;
         }
         beginRecording();
     }
 
     @Override
-    public void onRequestPermissionsResult(int request, String[] permissions,
-                                            int[] results) {
+    public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
         if (request != REQUEST_MICROPHONE) return;
-        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
-            beginRecording();
-        } else {
-            audioStatus.setText("需要麦克风权限才能录音；也可选择现有 WAV");
-        }
+        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) beginRecording();
+        else audioStatus.setText("需要麦克风权限才能录音；也可选择现有 WAV");
     }
 
     private void beginRecording() {
@@ -655,7 +347,7 @@ public final class MainActivity extends Activity {
         stopPlayer();
         outputFile().delete();
         codesFile().delete();
-        tokens.setText("录音后点击推理查看 codec tokens");
+        tokens.setText("录音后点击运行查看 tokens");
         recording = true;
         audioStatus.setText("正在录音；点击停止后生成 24 kHz PCM16 WAV");
         refresh();
@@ -666,13 +358,10 @@ public final class MainActivity extends Activity {
                 int minimumBytes = AudioRecord.getMinBufferSize(SAMPLE_RATE,
                         AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
                 if (minimumBytes <= 0) throw new IOException("本机不支持 24 kHz 单声道录音");
-                microphone = new AudioRecord(MediaRecorder.AudioSource.MIC,
-                        SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT,
+                microphone = new AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
+                        AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
                         Math.max(minimumBytes, FRAME_SAMPLES * 4));
-                if (microphone.getState() != AudioRecord.STATE_INITIALIZED) {
-                    throw new IOException("麦克风初始化失败");
-                }
+                if (microphone.getState() != AudioRecord.STATE_INITIALIZED) throw new IOException("麦克风初始化失败");
                 short[] pcm = new short[FRAME_SAMPLES];
                 byte[] packed = new byte[FRAME_SAMPLES * 2];
                 long sampleCount = 0;
@@ -681,8 +370,7 @@ public final class MainActivity extends Activity {
                     wav.write(new byte[44]);
                     microphone.startRecording();
                     while (recording) {
-                        int count = microphone.read(pcm, 0, pcm.length,
-                                AudioRecord.READ_BLOCKING);
+                        int count = microphone.read(pcm, 0, pcm.length, AudioRecord.READ_BLOCKING);
                         if (count < 0) throw new IOException("录音读取失败：" + count);
                         for (int i = 0; i < count; i++) {
                             packed[2 * i] = (byte) pcm[i];
@@ -690,9 +378,7 @@ public final class MainActivity extends Activity {
                         }
                         wav.write(packed, 0, count * 2);
                         sampleCount += count;
-                        if (sampleCount > (0xffffffffL - 36) / 2) {
-                            throw new IOException("录音超过 WAV 格式容量");
-                        }
+                        if (sampleCount > (0xffffffffL - 36) / 2) throw new IOException("录音超过 WAV 格式容量");
                     }
                     long completeSamples = sampleCount - sampleCount % FRAME_SAMPLES;
                     if (completeSamples == 0) throw new IOException("请至少录制 80 ms");
@@ -701,15 +387,11 @@ public final class MainActivity extends Activity {
                     writeWavHeader(wav, completeSamples);
                     sampleCount = completeSamples;
                 }
-                files[PICK_AUDIO].delete();
-                if (!temporary.renameTo(files[PICK_AUDIO])) {
-                    throw new IOException("录音文件保存失败");
-                }
+                inputFile().delete();
+                if (!temporary.renameTo(inputFile())) throw new IOException("录音文件保存失败");
                 final long savedSamples = sampleCount;
-                runOnUiThread(() -> audioStatus.setText(String.format(Locale.US,
-                        "录音完成：%.2f 秒 / %d 帧；点击推理",
-                        savedSamples / (double) SAMPLE_RATE,
-                        savedSamples / FRAME_SAMPLES)));
+                runOnUiThread(() -> audioStatus.setText(String.format(Locale.US, "录音完成：%.2f 秒 / %d 帧；点击运行",
+                        savedSamples / (double) SAMPLE_RATE, savedSamples / FRAME_SAMPLES)));
             } catch (Exception error) {
                 temporary.delete();
                 runOnUiThread(() -> audioStatus.setText("录音失败：" + error.getMessage()));
@@ -734,8 +416,7 @@ public final class MainActivity extends Activity {
         writeLittle16(wav, (int) (value >>> 16));
     }
 
-    private static void writeWavHeader(RandomAccessFile wav, long samples)
-            throws IOException {
+    private static void writeWavHeader(RandomAccessFile wav, long samples) throws IOException {
         long bytes = samples * 2;
         wav.write("RIFF".getBytes(StandardCharsets.US_ASCII));
         writeLittle32(wav, 36 + bytes);
@@ -751,15 +432,15 @@ public final class MainActivity extends Activity {
         writeLittle32(wav, bytes);
     }
 
-    private void runCodec() {
-        if (working || recording || sessionHandle == 0 || !files[PICK_AUDIO].isFile()) return;
+    private void runInference() {
+        if (working || recording || sessionHandle == 0 || !inputFile().isFile()) return;
         final int requestedFrames;
         try {
-            requestedFrames = moshiMode.isChecked() ? Integer.parseInt(lmFrameLimit.getText().toString().trim()) : 0;
-            if (requestedFrames < 0 || requestedFrames == 1 || requestedFrames > 3000)
+            requestedFrames = Integer.parseInt(frameLimit.getText().toString().trim());
+            if (requestedFrames < 0 || (moshiMode.isChecked() && requestedFrames == 1) || requestedFrames > 3000)
                 throw new NumberFormatException();
         } catch (NumberFormatException error) {
-            status.setText("LM 帧数请填 2–3000，或 0 跑整段");
+            status.setText("帧数请填 0（整段）或 2–3000");
             return;
         }
         stopPlayer();
@@ -768,8 +449,7 @@ public final class MainActivity extends Activity {
         textTokensFile().delete();
         new File(outputFile().getAbsolutePath() + ".playback.csv").delete();
         tokens.setText("正在执行 QNN 图…");
-        status.setText(moshiMode.isChecked() ? "正在流式递进 Encoder → LM → Decoder；首次建立 context 缓存，之后复用…"
-                                            : "正在逐帧执行 Encoder → Decoder…");
+        status.setText(moshiMode.isChecked() ? "正在逐帧执行 Encoder → LM → Decoder…" : "正在逐帧执行 Encoder → Decoder…");
         working = true;
         refresh();
         final boolean enableStreamPlayback = moshiMode.isChecked() && streamPlayback.isChecked();
@@ -779,40 +459,18 @@ public final class MainActivity extends Activity {
             try {
                 stopStream();
                 streamedSamples = 0;
-                streamCallbacks = 0; streamChunks = 0;
-                if (enableStreamPlayback) {
-                    int minimum = AudioTrack.getMinBufferSize(SAMPLE_RATE,
-                            AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-                    streamTrack = new AudioTrack.Builder()
-                            .setAudioAttributes(new AudioAttributes.Builder()
-                                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-                            .setAudioFormat(new AudioFormat.Builder().setSampleRate(SAMPLE_RATE)
-                                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                            .setBufferSizeInBytes(Math.max(minimum, FRAME_SAMPLES * 2 * 4))
-                            .setTransferMode(AudioTrack.MODE_STREAM).build();
-                    if (android.os.Build.VERSION.SDK_INT >= 31) {
-                        streamThresholdBefore = streamTrack.getStartThresholdInFrames();
-                        streamThresholdAfter = streamTrack.setStartThresholdInFrames(FRAME_SAMPLES);
-                    } else {
-                        streamThresholdBefore = streamTrack.getBufferSizeInFrames();
-                        streamTrack.setBufferSizeInFrames(FRAME_SAMPLES);
-                        streamThresholdAfter = streamTrack.getBufferSizeInFrames();
-                    }
-                    streamTrack.play();
-                }
-                int frames = nativeRunPrepared(sessionHandle,
-                                       files[PICK_AUDIO].getAbsolutePath(),
-                                       outputFile().getAbsolutePath(), requestedFrames, this, enableHtpPerformance);
+                streamCallbacks = 0;
+                streamChunks = 0;
+                if (enableStreamPlayback) startStream();
+                int frames = nativeRunPrepared(sessionHandle, inputFile().getAbsolutePath(),
+                        outputFile().getAbsolutePath(), requestedFrames, this, enableHtpPerformance);
                 final String playbackResult = finishStreamPlayback();
                 String codeText = readCodes();
                 double seconds = (System.nanoTime() - start) / 1e9;
                 runOnUiThread(() -> {
                     status.setText(String.format(Locale.US,
-                            "推理完成：%d 帧 / %.2f 秒输出音频；本次运行 %.2f 秒，输出 RTF %.2f（小于 1 才达到实时）。详细计时可导出。",
-                            frames, frames * 0.08, seconds,
-                            seconds / Math.max(frames * 0.08, 1e-9)) + playbackResult);
+                            "推理完成：%d 帧 / %.2f 秒输出音频；本次运行 %.2f 秒，RTF %.2f（小于 1 才达到实时）。详细计时可导出。",
+                            frames, frames * 0.08, seconds, seconds / Math.max(frames * 0.08, 1e-9)) + playbackResult);
                     tokens.setText(codeText);
                 });
             } catch (Exception error) {
@@ -827,8 +485,30 @@ public final class MainActivity extends Activity {
         });
     }
 
-    // Called on the existing inference worker once per input frame, not UI thread.
-    // A bounded AudioTrack buffer provides backpressure; no unbounded audio queue.
+    private void startStream() {
+        int minimum = AudioTrack.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        streamTrack = new AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                .setAudioFormat(new AudioFormat.Builder().setSampleRate(SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                .setBufferSizeInBytes(Math.max(minimum, FRAME_SAMPLES * 2 * 4))
+                .setTransferMode(AudioTrack.MODE_STREAM).build();
+        // The default start threshold is the whole buffer; start after one 80 ms frame instead.
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            streamThresholdBefore = streamTrack.getStartThresholdInFrames();
+            streamThresholdAfter = streamTrack.setStartThresholdInFrames(FRAME_SAMPLES);
+        } else {
+            streamThresholdBefore = streamTrack.getBufferSizeInFrames();
+            streamTrack.setBufferSizeInFrames(FRAME_SAMPLES);
+            streamThresholdAfter = streamTrack.getBufferSizeInFrames();
+        }
+        streamTrack.play();
+    }
+
+    // Called on the inference worker once per input frame, not the UI thread.
     private void onNativeFrame(int consumed, int emitted, double milliseconds, short[] pcm) {
         ++streamCallbacks;
         if (streamTrack != null && pcm.length > 0) {
@@ -842,8 +522,7 @@ public final class MainActivity extends Activity {
             ++streamChunks;
         }
         runOnUiThread(() -> status.setText(String.format(Locale.US,
-                "已处理输入 %d 帧，输出 %d 帧；刚完成一帧 %.1f ms。模型与状态继续复用。",
-                consumed, emitted, milliseconds)));
+                "已处理输入 %d 帧，输出 %d 帧；刚完成一帧 %.1f ms", consumed, emitted, milliseconds)));
     }
 
     private void stopStream() {
@@ -852,7 +531,6 @@ public final class MainActivity extends Activity {
 
     private String finishStreamPlayback() throws IOException, InterruptedException {
         if (streamTrack == null) return "";
-        // A bounded final queue; do not call consumption a proof of audible quality.
         long deadline = android.os.SystemClock.uptimeMillis() + 2000;
         while (streamTrack.getPlaybackHeadPosition() < streamedSamples
                 && android.os.SystemClock.uptimeMillis() < deadline) Thread.sleep(10);
@@ -872,13 +550,11 @@ public final class MainActivity extends Activity {
 
     private String readCodes() throws IOException {
         StringBuilder text = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                new FileInputStream(codesFile()), StandardCharsets.UTF_8))) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(codesFile()), StandardCharsets.UTF_8))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 String[] values = line.split(",");
-                text.append(String.format(java.util.Locale.US, "%02d  ",
-                                          Integer.parseInt(values[0])));
+                text.append(String.format(Locale.US, "%02d  ", Integer.parseInt(values[0])));
                 for (int i = 1; i < values.length; i++) {
                     if (i > 1) text.append(' ');
                     text.append(values[i]);
@@ -887,9 +563,8 @@ public final class MainActivity extends Activity {
             }
         }
         if (moshiMode.isChecked() && textTokensFile().isFile()) {
-            text.append("\n文本 token ID（尚未接 SentencePiece 解码，不是文字转录）：\n");
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
-                    new FileInputStream(textTokensFile()), StandardCharsets.UTF_8))) {
+            text.append("\n文本 token ID（未接 SentencePiece 解码）：\n");
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(textTokensFile()), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) text.append(line).append('\n');
             }
@@ -939,23 +614,21 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             try {
                 String suffix = Long.toString(System.currentTimeMillis());
-                saveDownload(outputFile(), "mimi-" + suffix + ".wav", "audio/wav");
-                saveDownload(codesFile(), "mimi-" + suffix + "-tokens.csv", "text/csv");
-                if (moshiMode.isChecked() && textTokensFile().isFile())
-                    saveDownload(textTokensFile(), "moshi-" + suffix + "-text-token-ids.csv", "text/csv");
-                File performance = new File(outputFile().getAbsolutePath() + ".performance.csv");
-                if (performance.isFile())
-                    saveDownload(performance, "moshi-" + suffix + "-performance.csv", "text/csv");
-                File qnnProfile = new File(outputFile().getAbsolutePath() + ".performance.csv.qnn.csv");
-                if (qnnProfile.isFile())
-                    saveDownload(qnnProfile, "moshi-" + suffix + "-qnn-profile.csv", "text/csv");
-                File configuration = new File(outputFile().getAbsolutePath() + ".runtime.json");
-                if (configuration.isFile())
-                    saveDownload(configuration, "moshi-" + suffix + "-runtime.json", "application/json");
-                File playback = new File(outputFile().getAbsolutePath() + ".playback.csv");
-                if (playback.isFile())
-                    saveDownload(playback, "moshi-" + suffix + "-playback.csv", "text/csv");
-                runOnUiThread(() -> status.setText("已保存到 Downloads/MimiDemo"));
+                String base = outputFile().getAbsolutePath();
+                saveDownload(outputFile(), "moshi-" + suffix + ".wav", "audio/wav");
+                saveDownload(codesFile(), "moshi-" + suffix + "-audio-tokens.csv", "text/csv");
+                String[][] extras = {
+                    {textTokensFile().getAbsolutePath(), "-text-token-ids.csv", "text/csv"},
+                    {base + ".performance.csv", "-performance.csv", "text/csv"},
+                    {base + ".performance.csv.qnn.csv", "-qnn-profile.csv", "text/csv"},
+                    {base + ".runtime.json", "-runtime.json", "application/json"},
+                    {base + ".playback.csv", "-playback.csv", "text/csv"},
+                };
+                for (String[] extra : extras) {
+                    File file = new File(extra[0]);
+                    if (file.isFile()) saveDownload(file, "moshi-" + suffix + extra[1], extra[2]);
+                }
+                runOnUiThread(() -> status.setText("已保存到 Downloads/MimiDemo（前缀 moshi-" + suffix + "）"));
             } catch (Exception error) {
                 runOnUiThread(() -> status.setText("保存失败：" + error.getMessage()));
             } finally {
@@ -968,10 +641,8 @@ public final class MainActivity extends Activity {
         ContentValues values = new ContentValues();
         values.put(MediaStore.Downloads.DISPLAY_NAME, name);
         values.put(MediaStore.Downloads.MIME_TYPE, mime);
-        values.put(MediaStore.Downloads.RELATIVE_PATH,
-                   Environment.DIRECTORY_DOWNLOADS + "/MimiDemo");
-        Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                                              values);
+        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/MimiDemo");
+        Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
         if (uri == null) throw new IOException("无法创建下载文件");
         try (InputStream input = new FileInputStream(source);
              OutputStream output = getContentResolver().openOutputStream(uri)) {
@@ -982,52 +653,31 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private boolean modelFilesReady() {
-        return encoderFile().isFile() && decoderFile().isFile()
-                && (!moshiMode.isChecked() || (selectedLm != null ? localLmVerified
-                    : new File(lmDirectory(), "READY").isFile()));
-    }
-
-    private static byte[] readSmallFile(File file) throws IOException {
-        try (InputStream input = new FileInputStream(file);
-             ByteArrayOutputStream bytes = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[8192]; int count;
-            while ((count = input.read(buffer)) != -1) {
-                if (bytes.size() + count > 1024 * 1024) throw new IOException("清单超过 1 MiB");
-                bytes.write(buffer, 0, count);
-            }
-            return bytes.toByteArray();
-        }
-    }
-
     private void refresh() {
-        if (working || recording) getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        else getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        if (streamPlayback != null) streamPlayback.setEnabled(!working && !recording);
-        if (htpPerformance != null) htpPerformance.setEnabled(!working && !recording);
-        if (fastRuntime != null) fastRuntime.setEnabled(!working && !recording);
-        scanModelsButton.setEnabled(!working && !recording);
-        moshiMode.setEnabled(!working && !recording);
-        lmFrameLimit.setEnabled(!working && !recording && moshiMode.isChecked());
-        loadButton.setText(moshiMode.isChecked() ? "准备 Mimi + Moshi LM" : "加载 Mimi 模型");
+        boolean idle = !working && !recording;
+        if (idle) getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        streamPlayback.setEnabled(idle && moshiMode.isChecked());
+        htpPerformance.setEnabled(idle);
+        verifyButton.setEnabled(idle);
+        moshiMode.setEnabled(idle);
+        frameLimit.setEnabled(idle);
+        loadButton.setText(moshiMode.isChecked() ? "加载 Mimi + Moshi LM" : "加载 Mimi");
         runButton.setText(moshiMode.isChecked() ? "运行 Encoder → Moshi LM → Decoder" : "运行 Encoder → Decoder 对照");
-        loadButton.setEnabled(!working && !recording && modelFilesReady());
+        loadButton.setEnabled(idle && bundleVerified);
         recordButton.setEnabled(!working && (recording || sessionHandle != 0));
         recordButton.setText(recording ? "■ 停止录音" : "● 开始录音");
-        runButton.setEnabled(!working && !recording && sessionHandle != 0 &&
-                             files[PICK_AUDIO].isFile());
-        originalButton.setEnabled(!working && !recording && files[PICK_AUDIO].isFile());
-        outputButton.setEnabled(!working && !recording && outputFile().isFile());
-        exportButton.setEnabled(!working && !recording && outputFile().isFile() &&
-                                codesFile().isFile());
+        runButton.setEnabled(idle && sessionHandle != 0 && inputFile().isFile());
+        originalButton.setEnabled(idle && inputFile().isFile());
+        outputButton.setEnabled(idle && outputFile().isFile());
+        exportButton.setEnabled(idle && outputFile().isFile() && codesFile().isFile());
     }
 
     private LinearLayout card(LinearLayout parent) {
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(16), dp(16), dp(16), dp(16));
-        android.graphics.drawable.GradientDrawable background =
-                new android.graphics.drawable.GradientDrawable();
+        android.graphics.drawable.GradientDrawable background = new android.graphics.drawable.GradientDrawable();
         background.setColor(CARD);
         background.setCornerRadius(dp(18));
         panel.setBackground(background);
@@ -1037,14 +687,22 @@ public final class MainActivity extends Activity {
         return panel;
     }
 
-    private TextView label(LinearLayout parent, String value, int size,
-                           int color, boolean bold) {
+    private TextView label(LinearLayout parent, String value, int size, int color, boolean bold) {
         TextView view = new TextView(this);
         view.setText(value);
         view.setTextColor(color);
         view.setTextSize(size);
         view.setPadding(0, dp(4), 0, dp(8));
         if (bold) view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        parent.addView(view);
+        return view;
+    }
+
+    private Switch toggle(LinearLayout parent, String title, boolean checked) {
+        Switch view = new Switch(this);
+        view.setText(title);
+        view.setTextColor(Color.WHITE);
+        view.setChecked(checked);
         parent.addView(view);
         return view;
     }
