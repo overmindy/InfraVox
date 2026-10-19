@@ -28,6 +28,7 @@ import android.widget.Switch;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -38,6 +39,7 @@ import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
@@ -63,7 +65,8 @@ public final class MainActivity extends Activity {
         "dlc/temporal_part_0.bin", "dlc/temporal_part_1.bin", "dlc/temporal_part_2.bin", "dlc/temporal_part_3.bin",
     };
 
-    private TextView status, modelStatus, audioStatus, tokens;
+    private TextView status, modelStatus, audioStatus, tokens, replyText;
+    private String[] textVocabulary; // SentencePiece pieces by id; loaded on the worker thread.
     private Button verifyButton, loadButton, recordButton, runButton, originalButton, outputButton, exportButton;
     private Switch moshiMode, streamPlayback, htpPerformance;
     private EditText frameLimit;
@@ -142,6 +145,8 @@ public final class MainActivity extends Activity {
         htpPerformance = toggle(result, "推理期间请求 HTP burst 性能档（更耗电，系统温控仍有效）", true);
         runButton = button(result, "运行", this::runInference);
         status = label(result, "加载模型并准备音频后可推理", 14, MUTED, false);
+        label(result, "回复文本", 15, Color.WHITE, true);
+        replyText = label(result, "运行后显示 Moshi 生成的文本", 18, ACCENT, false);
         originalButton = button(result, "▶ 播放原音", () -> play(inputFile()));
         outputButton = button(result, "▶ 播放输出音频", () -> play(outputFile()));
         exportButton = button(result, "保存音频、tokens 与性能计时到下载目录", this::exportResults);
@@ -449,6 +454,7 @@ public final class MainActivity extends Activity {
         textTokensFile().delete();
         new File(outputFile().getAbsolutePath() + ".playback.csv").delete();
         tokens.setText("正在执行 QNN 图…");
+        replyText.setText(moshiMode.isChecked() ? "生成中…" : "codec 对照模式没有文本输出");
         status.setText(moshiMode.isChecked() ? "正在逐帧执行 Encoder → LM → Decoder…" : "正在逐帧执行 Encoder → Decoder…");
         working = true;
         refresh();
@@ -466,8 +472,10 @@ public final class MainActivity extends Activity {
                         outputFile().getAbsolutePath(), requestedFrames, this, enableHtpPerformance);
                 final String playbackResult = finishStreamPlayback();
                 String codeText = readCodes();
+                final String reply = moshiMode.isChecked() && textTokensFile().isFile() ? decodeReply() : null;
                 double seconds = (System.nanoTime() - start) / 1e9;
                 runOnUiThread(() -> {
+                    if (reply != null) replyText.setText(reply.isEmpty() ? "（本段没有生成文字，只有停顿）" : reply);
                     status.setText(String.format(Locale.US,
                             "推理完成：%d 帧 / %.2f 秒输出音频；本次运行 %.2f 秒，RTF %.2f（小于 1 才达到实时）。详细计时可导出。",
                             frames, frames * 0.08, seconds, seconds / Math.max(frames * 0.08, 1e-9)) + playbackResult);
@@ -563,13 +571,57 @@ public final class MainActivity extends Activity {
             }
         }
         if (moshiMode.isChecked() && textTokensFile().isFile()) {
-            text.append("\n文本 token ID（未接 SentencePiece 解码）：\n");
+            text.append("\n文本 token ID（解码结果见“回复文本”）：\n");
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(textTokensFile()), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) text.append(line).append('\n');
             }
         }
         return text.toString();
+    }
+
+    // Decodes the runner's "frame,token" text stream with the SentencePiece vocabulary:
+    // ids 0-3 are <unk>/<s>/</s>/<pad>, "<0xHH>" pieces are raw bytes, and "▁" marks a space.
+    private String decodeReply() throws IOException {
+        if (textVocabulary == null) {
+            ArrayList<String> pieces = new ArrayList<>();
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(getAssets().open("text_vocab.txt"), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) pieces.add(unescapePiece(line));
+            }
+            textVocabulary = pieces.toArray(new String[0]);
+        }
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(textTokensFile()), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String[] fields = line.split(",");
+                int id = Integer.parseInt(fields[fields.length - 1].trim());
+                if (id <= 3 || id >= textVocabulary.length) continue;
+                String piece = textVocabulary[id];
+                if (piece.length() == 6 && piece.startsWith("<0x") && piece.endsWith(">")) {
+                    bytes.write(Integer.parseInt(piece.substring(3, 5), 16));
+                } else {
+                    byte[] encoded = piece.replace('▁', ' ').getBytes(StandardCharsets.UTF_8);
+                    bytes.write(encoded, 0, encoded.length);
+                }
+            }
+        }
+        return new String(bytes.toByteArray(), StandardCharsets.UTF_8).trim();
+    }
+
+    private static String unescapePiece(String line) {
+        StringBuilder out = new StringBuilder(line.length());
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (c == '\\' && i + 1 < line.length()) {
+                char next = line.charAt(++i);
+                out.append(next == 'n' ? '\n' : next == 'r' ? '\r' : next);
+            } else {
+                out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     private void play(File file) {

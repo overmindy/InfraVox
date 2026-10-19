@@ -42,6 +42,7 @@ for library in libQnnHtp.so libQnnSystem.so libQnnHtpV81.so \
   cp "$QNN_LIBS/$library" "$OUT/stage/lib/arm64-v8a/$library"
 done
 cp "$SAMPLE" "$OUT/stage/assets/demo.wav"
+cp "$SCRIPT_DIR"/assets/* "$OUT/stage/assets/"
 
 "$JAVA_HOME/bin/javac" -source 8 -target 8 -Xlint:-options \
   -classpath "$PLATFORM" -d "$OUT/classes" \
