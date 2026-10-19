@@ -37,7 +37,6 @@ namespace {
 
 constexpr size_t kFrameSamples = 1920;
 constexpr uint32_t kSampleRate = 24000;
-constexpr size_t kTemporalHeads = 32, kHeadBytes = 128 * sizeof(float);
 
 using Clock = std::chrono::steady_clock;
 double elapsedMs(Clock::time_point start) {
@@ -220,30 +219,6 @@ class SharedBuffer {
   int fd_ = -1;
   uint8_t* data_ = nullptr;
   std::vector<uint8_t> fallback_;
-};
-
-// Host-owned [heads, capacity, 128 floats] Temporal cache, laid out exactly like the graph input.
-class KvRing : public SharedBuffer {
- public:
-  KvRing(SharedMemory& memory, size_t capacity)
-      : SharedBuffer(memory, kTemporalHeads * capacity * kHeadBytes), capacity_(capacity) {}
-
-  // Masked slots must be finite zeros: softmax weights are zero but NaN * 0 is still NaN.
-  void reset() { std::memset(data(), 0, bytes()); }
-  void write(size_t position, const uint8_t* source, size_t sourceCapacity, size_t sourceSlot) {
-    const size_t slot = position % capacity_;
-    for (size_t head = 0; head < kTemporalHeads; ++head) {
-      const auto* from = source + (head * sourceCapacity + sourceSlot) * kHeadBytes;
-      const auto* values = reinterpret_cast<const float*>(from);
-      for (size_t i = 0; i < kHeadBytes / sizeof(float); ++i)
-        if (!std::isfinite(values[i])) throw std::runtime_error("Nonfinite new Temporal K/V");
-      std::memcpy(data() + (head * capacity_ + slot) * kHeadBytes, from, kHeadBytes);
-    }
-  }
-  size_t capacity() const { return capacity_; }
-
- private:
-  size_t capacity_;
 };
 
 class Runtime {
@@ -680,12 +655,14 @@ void dequantizeFrom(const Affine& a, const uint8_t* src, size_t count, float* ds
 // One Qualcomm-LLM-layout Temporal part (moshi_temporal_part.py): host attention mask and
 // RoPE cos/sin, fixed-point KV rings (key [H,1,D,P], value [H,1,P,D]), new K/V outputs only.
 class TemporalPartV2 {
+  struct Ring { Affine in, out; std::unique_ptr<SharedBuffer> storage; };
+
  public:
   static constexpr size_t kHeads = 32, kHeadDim = 128, kDim = 4096;
   static constexpr float kMaskMin = -50.0f;
 
   TemporalPartV2(Runtime& runtime, const std::string& path, bool grouped = false)
-      : runtime_(runtime), graph_(runtime, path, grouped) {
+      : runtime_(runtime), rings_(), graph_(runtime, path, grouped) {
     for (const auto& input : graph_.inputs()) {
       int layer = -1;
       if (std::sscanf(input.name.c_str(), "past_key_%d_in", &layer) == 1) layers_.push_back(layer);
@@ -752,8 +729,6 @@ class TemporalPartV2 {
   }
 
  private:
-  struct Ring { Affine in, out; std::unique_ptr<SharedBuffer> storage; };
-
   static std::string cacheName(int layer, bool key, bool input) {
     return std::string(key ? "past_key_" : "past_value_") + std::to_string(layer) + (input ? "_in" : "_out");
   }
@@ -778,9 +753,9 @@ class TemporalPartV2 {
   }
 
   Runtime& runtime_;
+  std::vector<Ring> rings_;  // Declared before graph_: deregister memory before freeing it.
   Graph graph_;
   std::vector<int> layers_;
-  std::vector<Ring> rings_;
   size_t past_ = 0;
   Affine hidden_, hiddenOut_, mask_, cos_, sin_;
 };
@@ -831,33 +806,32 @@ class Codec {
   size_t encoded_ = 0, decoded_ = 0;
 };
 
-// Moshiko LM: frontend -> 16 Temporal shards (2 layers each) -> head -> 8 sequential DepFormer codebooks.
+// Moshiko LM: frontend -> 4 Temporal parts (8 layers each, moshi_temporal_part.py layout)
+// -> head -> 8 sequential DepFormer codebooks.
 class MoshiLm {
  public:
+  static constexpr int kParts = 4;
+
   MoshiLm(Runtime& runtime, const std::string& directory) : runtime_(runtime) {
-    std::vector<std::string> names = {"frontend"};
-    for (int layer = 0; layer < 32; layer += 2) names.push_back(shardName(layer));
-    names.push_back("head");
+    std::vector<std::string> names = {"frontend", "head"};
     for (int book = 0; book < 8; ++book) names.push_back("depformer_codebook_" + std::to_string(book));
+    std::vector<std::string> parts;
+    for (int p = 0; p < kParts; ++p) parts.push_back(directory + "/dlc/temporal_part_" + std::to_string(p) + ".bin");
 
     uint64_t spill = 0;
     for (const auto& name : names) spill = std::max(spill, spillFillBytes(directory + "/dlc/" + name + ".bin"));
+    for (const auto& path : parts) spill = std::max(spill, spillFillBytes(path));
     runtime_.groupSpillBytes = spill;
     for (const auto& name : names) graphs_[name] = std::make_unique<Graph>(runtime_, directory + "/dlc/" + name + ".bin", true);
-
-    for (int layer = 0; layer < 32; layer += 2) {
-      Graph& graph = *graphs_.at(shardName(layer));
-      for (int j = 0; j < 4; ++j) {
-        const std::string name = cacheName(layer + j / 2, j % 2);
-        rings_[2 * layer + j] = std::make_unique<KvRing>(runtime_.sharedMemory, cacheCapacity(graph.input(name)));
-        graph.bindInput(name, *rings_[2 * layer + j]);
-      }
-      shared_ += graph.sharedInputs();
+    for (const auto& path : parts) {
+      temporal_.push_back(std::make_unique<TemporalPartV2>(runtime_, path, true));
+      shared_ += temporal_.back()->sharedInputs();
     }
   }
 
   ~MoshiLm() {
-    // Contexts first (they reference KV storage), and the group leader last.
+    // Every grouped context goes before the group leader (frontend).
+    temporal_.clear();
     auto leader = std::move(graphs_.at("frontend"));
     graphs_.clear();
     leader.reset();
@@ -868,7 +842,7 @@ class MoshiLm {
 
   void reset() {
     delay_.reset();
-    for (auto& ring : rings_) ring->reset();
+    for (auto& part : temporal_) part->reset();
     position_ = 0;
   }
 
@@ -877,27 +851,19 @@ class MoshiLm {
     Graph& frontend = *graphs_.at("frontend");
     set(frontend.input("sequence"), sequence.data(), sizeof(sequence), QNN_DATATYPE_INT_32);
     frontend.execute();
-    const Buffer* hidden = &frontend.output("hidden");
-    requireFinite(*hidden);
+    auto& embedded = frontend.output("hidden");
+    expect(embedded, QNN_DATATYPE_FLOAT_32, TemporalPartV2::kDim * sizeof(float));
+    requireFinite(embedded);
 
-    const int32_t position = position_;
-    for (int layer = 0; layer < 32; layer += 2) {
-      Graph& graph = *graphs_.at(shardName(layer));
-      set(graph.input("hidden"), hidden->bytes.data(), hidden->bytes.size(), QNN_DATATYPE_FLOAT_32);
-      set(graph.input("position"), &position, sizeof(position), QNN_DATATYPE_INT_32);
-      graph.execute();
-      hidden = &graph.output(graph.hasOutput("output_hidden") ? "output_hidden" : "output_0");
-      expect(*hidden, QNN_DATATYPE_FLOAT_32, 4096 * sizeof(float));
-      requireFinite(*hidden);
-      for (int j = 0; j < 4; ++j) {
-        auto& output = temporalOutput(graph, layer, j);
-        const size_t capacity = cacheCapacity(output);
-        rings_[2 * layer + j]->write(position, output.data(), capacity, position % capacity);
-      }
+    std::vector<float> hidden(TemporalPartV2::kDim), next(TemporalPartV2::kDim);
+    std::memcpy(hidden.data(), embedded.data(), embedded.bytes.size());
+    for (auto& part : temporal_) {
+      part->step(position_, hidden.data(), next.data());
+      hidden.swap(next);
     }
 
     Graph& head = *graphs_.at("head");
-    set(head.input("hidden"), hidden->bytes.data(), hidden->bytes.size(), QNN_DATATYPE_FLOAT_32);
+    set(head.input("hidden"), hidden.data(), hidden.size() * sizeof(float), QNN_DATATYPE_FLOAT_32);
     head.execute();
     const auto& temporal = head.output("temporal");
     requireFinite(temporal);
@@ -945,30 +911,14 @@ class MoshiLm {
     check(status, "context metadata " + path);
     return bytes;
   }
-  static std::string shardName(int layer) {
-    return "temporal_layers_" + std::to_string(layer) + "_" + std::to_string(layer + 1);
-  }
+  // DepFormer depth-cache tensor names.
   static std::string cacheName(int layer, int value) {
     return "layer_" + std::to_string(layer) + (value ? "_value" : "_key");
   }
-  static size_t cacheCapacity(const Buffer& buffer) {
-    const auto* shape = tensorDimensions(buffer.tensor);
-    if (tensorRank(buffer.tensor) != 4 || shape[0] != 1 || shape[1] != kTemporalHeads || !shape[2] ||
-        shape[3] != 128 || tensorType(buffer.tensor) != QNN_DATATYPE_FLOAT_32)
-      throw std::runtime_error("Unsupported Temporal cache layout: " + buffer.name);
-    return shape[2];
-  }
-  // Only the delivered 0_1 shard numbers its outputs: hidden, then key/value per layer.
-  static Buffer& temporalOutput(Graph& graph, int layer, int index) {
-    const std::string name = "output_" + cacheName(layer + index / 2, index % 2);
-    if (graph.hasOutput(name)) return graph.output(name);
-    if (layer == 0) return graph.output("output_" + std::to_string(index + 1));
-    throw std::runtime_error("Missing Temporal cache output: " + name);
-  }
 
   Runtime& runtime_;
-  std::array<std::unique_ptr<KvRing>, 64> rings_;
   std::map<std::string, std::unique_ptr<Graph>> graphs_;
+  std::vector<std::unique_ptr<TemporalPartV2>> temporal_;
   MoshiDelayRing delay_;
   int32_t position_ = 0;
   size_t shared_ = 0;
