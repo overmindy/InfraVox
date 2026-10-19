@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -631,6 +632,158 @@ void writeWav(const std::string& path, const std::vector<int16_t>& samples) {
   output.write(reinterpret_cast<const char*>(samples.data()), dataBytes);
   if (!output) throw std::runtime_error("Failed writing output WAV: " + path);
 }
+
+// Fixed-point I/O of a QNN tensor: real = scale * (q + offset). FLOAT_32 tensors pass through.
+struct Affine {
+  Qnn_DataType_t type = QNN_DATATYPE_FLOAT_32;
+  float scale = 1.0f;
+  int32_t offset = 0;
+  bool operator==(const Affine& o) const { return type == o.type && scale == o.scale && offset == o.offset; }
+};
+
+Affine affineOf(const Qnn_Tensor_t& tensor) {
+  Affine a;
+  a.type = tensorType(tensor);
+  if (a.type == QNN_DATATYPE_FLOAT_32) return a;
+  if (a.type != QNN_DATATYPE_UFIXED_POINT_8 && a.type != QNN_DATATYPE_UFIXED_POINT_16)
+    throw std::runtime_error(std::string("Unsupported fixed-point I/O type for ") + tensorName(tensor));
+  const auto& q = TENSOR_FIELD(tensor, quantizeParams);
+  if (q.encodingDefinition != QNN_DEFINITION_DEFINED || q.quantizationEncoding != QNN_QUANTIZATION_ENCODING_SCALE_OFFSET)
+    throw std::runtime_error(std::string("Expected per-tensor scale/offset for ") + tensorName(tensor));
+  a.scale = q.scaleOffsetEncoding.scale;
+  a.offset = q.scaleOffsetEncoding.offset;
+  return a;
+}
+
+size_t affineWidth(const Affine& a) {
+  return a.type == QNN_DATATYPE_UFIXED_POINT_8 ? 1 : a.type == QNN_DATATYPE_UFIXED_POINT_16 ? 2 : 4;
+}
+
+void quantizeTo(const Affine& a, const float* src, size_t count, uint8_t* dst) {
+  if (a.type == QNN_DATATYPE_FLOAT_32) { std::memcpy(dst, src, count * sizeof(float)); return; }
+  const float top = a.type == QNN_DATATYPE_UFIXED_POINT_8 ? 255.0f : 65535.0f;
+  for (size_t i = 0; i < count; ++i) {
+    const float q = std::clamp(std::nearbyint(src[i] / a.scale) - static_cast<float>(a.offset), 0.0f, top);
+    if (a.type == QNN_DATATYPE_UFIXED_POINT_8) dst[i] = static_cast<uint8_t>(q);
+    else reinterpret_cast<uint16_t*>(dst)[i] = static_cast<uint16_t>(q);
+  }
+}
+
+void dequantizeFrom(const Affine& a, const uint8_t* src, size_t count, float* dst) {
+  if (a.type == QNN_DATATYPE_FLOAT_32) { std::memcpy(dst, src, count * sizeof(float)); return; }
+  for (size_t i = 0; i < count; ++i) {
+    const float q = a.type == QNN_DATATYPE_UFIXED_POINT_8 ? src[i] : reinterpret_cast<const uint16_t*>(src)[i];
+    dst[i] = a.scale * (q + static_cast<float>(a.offset));
+  }
+}
+
+// One Qualcomm-LLM-layout Temporal part (moshi_temporal_part.py): host attention mask and
+// RoPE cos/sin, fixed-point KV rings (key [H,1,D,P], value [H,1,P,D]), new K/V outputs only.
+class TemporalPartV2 {
+ public:
+  static constexpr size_t kHeads = 32, kHeadDim = 128, kDim = 4096;
+  static constexpr float kMaskMin = -50.0f;
+
+  TemporalPartV2(Runtime& runtime, const std::string& path, bool grouped = false)
+      : runtime_(runtime), graph_(runtime, path, grouped) {
+    for (const auto& input : graph_.inputs()) {
+      int layer = -1;
+      if (std::sscanf(input.name.c_str(), "past_key_%d_in", &layer) == 1) layers_.push_back(layer);
+    }
+    std::sort(layers_.begin(), layers_.end());
+    if (layers_.empty()) throw std::runtime_error("No past_key inputs in " + path);
+    const auto& firstKey = graph_.input(cacheName(layers_[0], true, true));
+    past_ = tensorDimensions(firstKey.tensor)[3];
+    hidden_ = affineOf(graph_.input("hidden").tensor);
+    hiddenOut_ = affineOf(graph_.output("hidden_out").tensor);
+    mask_ = affineOf(graph_.input("attention_mask").tensor);
+    cos_ = affineOf(graph_.input("position_cos").tensor);
+    sin_ = affineOf(graph_.input("position_sin").tensor);
+    for (int layer : layers_) {
+      for (bool key : {true, false}) {
+        const auto& in = graph_.input(cacheName(layer, key, true));
+        Ring ring{affineOf(in.tensor), affineOf(graph_.output(cacheName(layer, key, false)).tensor), nullptr};
+        if (affineWidth(ring.in) != 1 && affineWidth(ring.in) != 2) throw std::runtime_error("KV must be fixed point");
+        ring.storage = std::make_unique<SharedBuffer>(runtime_.sharedMemory, in.bytes.size());
+        graph_.bindInput(in.name, *ring.storage);
+        rings_.push_back(std::move(ring));
+      }
+    }
+    reset();
+  }
+
+  const std::string& label() const { return graph_.label(); }
+  size_t sharedInputs() const { return graph_.sharedInputs(); }
+
+  // Empty slots hold the quantized value of 0.0, as in the float graph; masked or not,
+  // byte 0 would be -128*scale for a symmetric 8-bit encoding.
+  void reset() {
+    for (auto& ring : rings_) {
+      const float zero = 0.0f;
+      std::vector<uint8_t> code(affineWidth(ring.in));
+      quantizeTo(ring.in, &zero, 1, code.data());
+      for (size_t i = 0; i < ring.storage->bytes(); i += code.size())
+        std::memcpy(ring.storage->data() + i, code.data(), code.size());
+    }
+  }
+
+  void step(int32_t position, const float* hidden, float* out) {
+    quantizeTo(hidden_, hidden, kDim, graph_.input("hidden").data());
+    std::vector<float> mask(past_ + 1, kMaskMin);
+    mask[past_] = 0.0f;
+    for (int32_t back = 1; back <= std::min<int32_t>(position, static_cast<int32_t>(past_)); ++back)
+      mask[(position - back) % past_] = 0.0f;
+    quantizeTo(mask_, mask.data(), mask.size(), graph_.input("attention_mask").data());
+    float cos[kHeadDim / 2], sin[kHeadDim / 2];
+    for (size_t i = 0; i < kHeadDim / 2; ++i) {
+      const double angle = position * std::exp(-std::log(10000.0) * 2.0 * i / kHeadDim);
+      cos[i] = static_cast<float>(std::cos(angle));
+      sin[i] = static_cast<float>(std::sin(angle));
+    }
+    quantizeTo(cos_, cos, kHeadDim / 2, graph_.input("position_cos").data());
+    quantizeTo(sin_, sin, kHeadDim / 2, graph_.input("position_sin").data());
+    graph_.execute();
+    dequantizeFrom(hiddenOut_, graph_.output("hidden_out").data(), kDim, out);
+    const size_t slot = position % past_;
+    for (size_t r = 0; r < rings_.size(); ++r) {
+      const bool key = r % 2 == 0;
+      writeSlot(rings_[r], graph_.output(cacheName(layers_[r / 2], key, false)).data(), slot, key);
+    }
+  }
+
+ private:
+  struct Ring { Affine in, out; std::unique_ptr<SharedBuffer> storage; };
+
+  static std::string cacheName(int layer, bool key, bool input) {
+    return std::string(key ? "past_key_" : "past_value_") + std::to_string(layer) + (input ? "_in" : "_out");
+  }
+
+  // Key out [H,1,D,1] -> ring [H,1,D,P] column `slot`; value out [H,1,1,D] -> ring [H,1,P,D] row `slot`.
+  void writeSlot(Ring& ring, const uint8_t* source, size_t slot, bool key) {
+    const size_t width = affineWidth(ring.in), count = kHeads * kHeadDim;
+    std::vector<uint8_t> converted;
+    if (!(ring.in == ring.out)) {
+      std::vector<float> values(count);
+      dequantizeFrom(ring.out, source, count, values.data());
+      converted.resize(count * width);
+      quantizeTo(ring.in, values.data(), count, converted.data());
+      source = converted.data();
+    }
+    uint8_t* base = ring.storage->data();
+    for (size_t h = 0; h < kHeads; ++h)
+      for (size_t d = 0; d < kHeadDim; ++d) {
+        const size_t element = key ? (h * kHeadDim + d) * past_ + slot : (h * past_ + slot) * kHeadDim + d;
+        std::memcpy(base + element * width, source + (h * kHeadDim + d) * width, width);
+      }
+  }
+
+  Runtime& runtime_;
+  Graph graph_;
+  std::vector<int> layers_;
+  std::vector<Ring> rings_;
+  size_t past_ = 0;
+  Affine hidden_, hiddenOut_, mask_, cos_, sin_;
+};
 
 // Mimi encoder/decoder pair; each graph carries its own streaming state (position advances by 2 per frame).
 class Codec {
