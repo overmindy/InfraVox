@@ -212,6 +212,19 @@ def relative_rms(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).float().pow(2).mean().sqrt() / b.float().pow(2).mean().sqrt())
 
 
+def export_onnx(part: TemporalPart, onnx_path: Path) -> int:
+    """Export the AR1 graph (CPU copy of the part) with external weight data; returns bytes written."""
+    cpu_part = part.cpu()
+    mask, past = HostRing(len(cpu_part.layers), torch.device("cpu")).inputs(0, torch.device("cpu"))
+    cos, sin = rope_tables(torch.zeros(1))
+    example = (torch.zeros(1, 1, DIM), mask, cos[0], sin[0], *past)
+    input_names, output_names = cpu_part.names()
+    onnx_path.parent.mkdir(parents=True)
+    torch.onnx.export(cpu_part, example, str(onnx_path), input_names=input_names, output_names=output_names,
+                      opset_version=17, do_constant_folding=True, dynamo=False)
+    return sum(p.stat().st_size for p in onnx_path.parent.iterdir())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
@@ -251,18 +264,9 @@ def main() -> None:
             # Unfilled KV slots are zeros, so compression keeps early-step samples small.
             np.savez_compressed(args.output_dir / f"calibration_{index:03d}.npz", **dict(zip(input_names, sample)))
 
-    part = part.cpu()
-    mask, past = HostRing(args.layers, torch.device("cpu")).inputs(0, torch.device("cpu"))
-    cos, sin = rope_tables(torch.zeros(1))
-    example = (torch.zeros(1, 1, DIM), mask, cos[0], sin[0], *past)
-    input_names, output_names = part.names()
-    onnx_path = args.output_dir / "onnx" / "model.onnx"
-    onnx_path.parent.mkdir()
     start = time.monotonic()
-    torch.onnx.export(part, example, str(onnx_path), input_names=input_names, output_names=output_names,
-                      opset_version=17, do_constant_folding=True, dynamo=False)
+    report["onnx_bytes"] = export_onnx(part, args.output_dir / "onnx" / "model.onnx")
     report["onnx_export_s"] = time.monotonic() - start
-    report["onnx_bytes"] = sum(p.stat().st_size for p in onnx_path.parent.iterdir())
     (args.output_dir / "export.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report), flush=True)
 
