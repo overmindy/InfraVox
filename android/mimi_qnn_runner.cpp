@@ -111,7 +111,7 @@ struct MappedFile {
     struct stat info{};
     if (fd < 0 || fstat(fd, &info) || info.st_size <= 0) {
       if (fd >= 0) close(fd);
-      throw std::runtime_error("Missing or unreadable context binary (check 644 permissions): " + path);
+      throw std::runtime_error("Missing or unreadable model file (check 644 permissions): " + path);
     }
     size = static_cast<size_t>(info.st_size);
     data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -652,6 +652,19 @@ void dequantizeFrom(const Affine& a, const uint8_t* src, size_t count, float* ds
   }
 }
 
+// Real values into / out of a FP32 or fixed-point graph tensor.
+void setReal(Buffer& buffer, const float* src, size_t count) {
+  const auto a = affineOf(buffer.tensor);
+  if (buffer.bytes.size() != count * affineWidth(a)) throw std::runtime_error("Unexpected tensor size: " + buffer.name);
+  quantizeTo(a, src, count, buffer.data());
+}
+
+void getReal(const Buffer& buffer, float* dst, size_t count) {
+  const auto a = affineOf(buffer.tensor);
+  if (buffer.bytes.size() != count * affineWidth(a)) throw std::runtime_error("Unexpected tensor size: " + buffer.name);
+  dequantizeFrom(a, buffer.bytes.data(), count, dst);
+}
+
 // One Qualcomm-LLM-layout Temporal part (moshi_temporal_part.py): host attention mask and
 // RoPE cos/sin, fixed-point KV rings (key [H,1,D,P], value [H,1,P,D]), new K/V outputs only.
 class TemporalPartV2 {
@@ -811,14 +824,59 @@ class Codec {
   size_t encoded_ = 0, decoded_ = 0;
 };
 
-// Moshiko LM: frontend -> 4 Temporal parts (8 layers each, moshi_temporal_part.py layout)
+// moshi_export_frontend_table.py: the text table and 16 audio tables in BF16, one row per token.
+// The Temporal input is the sum of one row per sequence slot, done on the CPU.
+class EmbeddingTable {
+ public:
+  explicit EmbeddingTable(const std::string& path) : file_(path) {
+    const auto* bytes = static_cast<const uint8_t*>(file_.data);
+    if (file_.size < 20 || std::memcmp(bytes, "MOSHIEMB", 8) || read32(bytes + 8) != 1)
+      throw std::runtime_error("Not a Moshi embedding table: " + path);
+    dim_ = read32(bytes + 12);
+    const uint32_t count = read32(bytes + 16);
+    size_t offset = 20 + 4 * size_t(count);
+    for (uint32_t t = 0; t < count && offset <= file_.size; ++t) {
+      const uint32_t rows = read32(bytes + 20 + 4 * t);
+      tables_.push_back({reinterpret_cast<const uint16_t*>(bytes + offset), rows});
+      offset += size_t(rows) * dim_ * sizeof(uint16_t);
+    }
+    if (offset != file_.size) throw std::runtime_error("Truncated Moshi embedding table: " + path);
+  }
+
+  size_t dim() const { return dim_; }
+
+  void sum(const int32_t* tokens, size_t count, float* out) const {
+    if (count != tables_.size()) throw std::runtime_error("Sequence does not match the embedding tables");
+    std::fill(out, out + dim_, 0.0f);
+    for (size_t t = 0; t < count; ++t) {
+      if (tokens[t] < 0 || uint32_t(tokens[t]) >= tables_[t].rows) throw std::runtime_error("Embedding token out of range");
+      const uint16_t* row = tables_[t].data + size_t(tokens[t]) * dim_;
+      for (size_t i = 0; i < dim_; ++i) {
+        const uint32_t bits = uint32_t(row[i]) << 16;
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        out[i] += value;
+      }
+    }
+  }
+
+ private:
+  struct Table { const uint16_t* data; uint32_t rows; };
+  MappedFile file_;
+  uint32_t dim_ = 0;
+  std::vector<Table> tables_;
+};
+
+// Moshiko LM: CPU embedding sum -> 4 Temporal parts (8 layers each, moshi_temporal_part.py layout)
 // -> head -> 8 sequential DepFormer codebooks.
 class MoshiLm {
  public:
   static constexpr int kParts = 4;
 
-  MoshiLm(Runtime& runtime, const std::string& directory) : runtime_(runtime) {
-    std::vector<std::string> names = {"frontend", "head"};
+  MoshiLm(Runtime& runtime, const std::string& directory)
+      : runtime_(runtime), embeddings_(directory + "/frontend_embeddings.bin") {
+    if (embeddings_.dim() != TemporalPartV2::kDim) throw std::runtime_error("Embedding width does not match Temporal");
+    std::vector<std::string> names = {"head"};
     for (int book = 0; book < 8; ++book) names.push_back("depformer_codebook_" + std::to_string(book));
     std::vector<std::string> parts;
     for (int p = 0; p < kParts; ++p) parts.push_back(directory + "/dlc/temporal_part_" + std::to_string(p) + ".bin");
@@ -835,9 +893,9 @@ class MoshiLm {
   }
 
   ~MoshiLm() {
-    // Every grouped context goes before the group leader (frontend).
+    // Every grouped context goes before the group leader (head, created first).
     temporal_.clear();
-    auto leader = std::move(graphs_.at("frontend"));
+    auto leader = std::move(graphs_.at("head"));
     graphs_.clear();
     leader.reset();
     runtime_.groupLeader = nullptr;
@@ -853,15 +911,10 @@ class MoshiLm {
 
   std::optional<std::array<int32_t, 9>> step(const std::array<int32_t, 8>& user) {
     const auto sequence = delay_.begin(user);
-    Graph& frontend = *graphs_.at("frontend");
-    set(frontend.input("sequence"), sequence.data(), sizeof(sequence), QNN_DATATYPE_INT_32);
-    frontend.execute();
-    auto& embedded = frontend.output("hidden");
-    expect(embedded, QNN_DATATYPE_FLOAT_32, TemporalPartV2::kDim * sizeof(float));
-    requireFinite(embedded);
-
     std::vector<float> hidden(TemporalPartV2::kDim), next(TemporalPartV2::kDim);
-    std::memcpy(hidden.data(), embedded.data(), embedded.bytes.size());
+    const auto start = Clock::now();
+    embeddings_.sum(sequence.data(), sequence.size(), hidden.data());
+    runtime_.timing("frontend_cpu", "execute", elapsedMs(start));
     for (auto& part : temporal_) {
       part->step(position_, hidden.data(), next.data());
       hidden.swap(next);
@@ -878,19 +931,32 @@ class MoshiLm {
     const auto* scores = reinterpret_cast<const float*>(logits.data());
     const int32_t text = static_cast<int32_t>(std::max_element(scores, scores + 32000) - scores);
 
-    // The depth cache restarts every frame and is shared across the 8 codebooks.
+    // The depth cache restarts every frame and is shared across the 8 codebooks. I/O is FP32
+    // (legacy graphs) or 16-bit fixed point (moshi_depformer_quantize.py), each with its own encoding.
+    constexpr size_t kCache = 16 * 8 * 64;
     std::array<int32_t, 8> audio{};
     int32_t previous = text;
     Graph* last = nullptr;
+    std::vector<float> values(kCache);
+    const auto* temporalValues = reinterpret_cast<const float*>(temporal.bytes.data());
     for (int book = 0; book < 8; ++book) {
       Graph& graph = *graphs_.at("depformer_codebook_" + std::to_string(book));
       set(graph.input("previous_token"), &previous, sizeof(previous), QNN_DATATYPE_INT_32);
-      set(graph.input("temporal"), temporal.bytes.data(), temporal.bytes.size(), QNN_DATATYPE_FLOAT_32);
+      setReal(graph.input("temporal"), temporalValues, TemporalPartV2::kDim);
       for (int j = 0; j < 12; ++j) {
         auto& input = graph.input(cacheName(j / 2, j % 2));
-        expect(input, QNN_DATATYPE_FLOAT_32, 16 * 8 * 64 * sizeof(float));
-        if (last) std::memcpy(input.data(), last->output("output_" + input.name).data(), input.bytes.size());
-        else std::fill(input.bytes.begin(), input.bytes.end(), 0);
+        if (!last) {
+          std::fill(values.begin(), values.end(), 0.0f);
+          setReal(input, values.data(), kCache);
+          continue;
+        }
+        const auto& source = last->output("output_" + input.name);
+        if (affineOf(source.tensor) == affineOf(input.tensor) && source.bytes.size() == input.bytes.size()) {
+          std::memcpy(input.data(), source.bytes.data(), input.bytes.size());
+        } else {
+          getReal(source, values.data(), kCache);
+          setReal(input, values.data(), kCache);
+        }
       }
       graph.execute();
       auto& token = graph.output("audio_token");
@@ -922,6 +988,7 @@ class MoshiLm {
   }
 
   Runtime& runtime_;
+  EmbeddingTable embeddings_;
   std::map<std::string, std::unique_ptr<Graph>> graphs_;
   std::vector<std::unique_ptr<TemporalPartV2>> temporal_;
   MoshiDelayRing delay_;

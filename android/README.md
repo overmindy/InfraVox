@@ -7,11 +7,12 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| App | `com.overmindy.mimicodecdemo` 2.9.0-o3（versionCode 15）；内置演示 36 帧 7.03 s，RTF 2.44 |
-| 模型包 | `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v2-o3`，16 个 context，约 6.7 GB（legacy 图为 O3 编译；旧包 `lm-v2-w4w8vd` 仍在手机上） |
-| 38 帧输入（3.04 s） | 暖运行 6.9–7.3 s，首段 PCM 约 0.38 s，输出 2.96 s，RTF 约 2.4 |
-| 每帧耗时 | 约 180–195 ms：Temporal 110–135、DepFormer 33–38、Mimi 16–19、frontend 9–11、head 4 |
+| App | `com.overmindy.mimicodecdemo` 3.0.0-dep8（versionCode 16）；内置演示 36 帧 6.12 s，RTF 2.13，加载 3.4 s |
+| 模型包 | `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v3-dep8`，15 个 context + CPU embedding 表，约 6.0 GB（上一版 `lm-v2-o3` 仍在手机上） |
+| 38 帧输入（3.04 s） | 暖运行 5.6–6.5 s，首段 PCM 约 0.33 s，输出 2.96 s，RTF 约 2.0 |
+| 每帧耗时 | 约 145–160 ms：Temporal 105–125、DepFormer 15–20、Mimi 13–14、head 3、frontend（CPU）0.03 |
 | Temporal 质量（8 段 held-out，1558 帧，手机实测） | 文本 top-1 98.7%，音频 cb0 95.3%，8 路全对 90.6% |
+| DepFormer W8 质量（同一批 1558 帧，QuantSim，对 BF16） | 串联 8 路全对 92.4%（旧 FP16 权重的 legacy 图 85.3%，FP32 上限 94.0%） |
 
 质量指标是 teacher-forced 的：每帧给相同的 BF16 历史，比较该帧的文本 argmax 和 DepFormer 贪心音频 token。
 它不是听感或 ASR 评测；free-running 贪心解码即使全 W8 也会在十几帧内出现 token 分叉。
@@ -24,7 +25,7 @@
                              ▼
           17 路延迟环 (moshi_lm_scheduler.h)
                              ▼
-  frontend → Temporal part 0..3（各 8 层）→ head ──text──┐
+  CPU embedding 求和 → Temporal part 0..3（各 8 层）→ head ──text──┐
                                                ▼          │
                               DepFormer codebook 0..7（顺序执行）
                                                ▼
@@ -118,10 +119,10 @@ export SAMPLE_WAV=/path/to/24k_mono_pcm16.wav                          # 打进 
    python moshi_temporal_part.py --model-dir $BF16 --output-dir $W/build/part$P \
      --first-layer $((8*P)) --layers 8 --parity-steps 4 --calibration-steps 0
    cp $W/w4w8vd/temporal_part_$P.encodings $W/build/part$P/
-   bash moshi_temporal_build.sh $W/build/part$P temporal_part_$P      # 默认 O3 + vtcm 8 MB
+   bash moshi_quantized_build.sh $W/build/part$P temporal_part_$P      # 默认 O3 + vtcm 8 MB
    ```
 
-   `moshi_temporal_build.sh` 把 DLC 的图命名为 `NAME`，这样 `backend.json` 里的 O3 和 VTCM 设置才会生效
+   `moshi_quantized_build.sh` 把 DLC 的图命名为 `NAME`，这样 `backend.json` 里的 O3 和 VTCM 设置才会生效
    （默认选项下 8 层 part 要 92–101 ms，O3 下只要 28 ms）。转换器经过 `moshi_guard_qairt_converter.py`，
    用来阻止 QAIRT 2.45 错误地融合 RMSNorm。LPBQ 只能用 Conv：LPBQ 的 FullyConnected 会让 context 生成器段错误。
 
@@ -132,47 +133,74 @@ export SAMPLE_WAV=/path/to/24k_mono_pcm16.wav                          # 打进 
 快速筛选工具：`moshi_temporal_token_eval.py` 在 PyTorch 里伪量化权重，每个变体约 1.5 分钟。
 `moshi_temporal_sweep.py` 在 2 层子图上一次跑多个 QuantSim 变体，并拆分权重误差和激活误差。
 
+## DepFormer W8
+
+旧流程把 DepFormer 权重留成了 FP16（每个 codebook 约 85M 参数、171 MB）。现在用 AIMET 重新量化：
+int8 per-channel 权重、int16 激活，每个 codebook 约 89 MB（codebook 0 含文本 embedding，150 MB）。
+手机上每个 codebook 从 4–5 ms 降到约 1.7–2.9 ms。
+
+```sh
+source /data2/yejialei/envs/aimet228/env.sh
+TMPDIR=$W/tmp python moshi_depformer_quantize.py --model-dir $BF16 --capture-dir $W/capture \
+  --work-dir $W/depformer_w8          # 约 25 分钟；--no-legacy 跳过 CPU 上很慢的旧图对照
+bash moshi_depformer_build.sh $W/depformer_w8   # 8 个 context 并行构建，约 5 分钟，输出到 bundle/
+```
+
+- 输入取自 capture 的第 31 层输出，经 BF16 head 得到 DepFormer 的 `temporal` 和文本 token。
+  校准用 8 段校准音频、每段均匀取 32 帧；门限用全部 8 段 held-out（1558 帧），参照是 BF16 贪心 token。
+- 门限结果（8 路全对 / 各 codebook）：串联 92.4% / 95.1–99.6%，teacher-forced 93.6% / 98.5–99.6%；
+  旧 legacy 图分别为 85.3% 和 87.9%，FP32 上限 94.0%。
+- **attention 不能用 −inf mask。** 每个 codebook 的步号是常量，`DepFormerStepBlock` 直接切掉后面的槽位，
+  数学上等价。用 −inf mask 时 16-bit 激活的范围被撑爆，只有不需要 mask 的 codebook 0 和 7 正常，其余掉到 55–80%。
+- 转换器没有保留 FP32 I/O，图的 I/O 是 uint16 定点。运行器按每个张量自己的 scale/offset 写入和读出，
+  FP32 的旧图也能用同一段代码。
+
+## CPU frontend
+
+frontend 只是 1 行文本 embedding 加 16 行音频 embedding。`moshi_export_frontend_table.py` 把 17 张 BF16 表
+原样导出成 `frontend_embeddings.bin`（531 MB，`MOSHIEMB` 头 + 行数 + BF16 数据），运行器 mmap 后用 FP32 求和，
+每帧约 0.03 ms（HTP 上的旧图要 9 ms）。它比旧的 16-bit 图更接近 BF16，所以贪心解码的 token 会有差异：
+38 帧验证输入说出的是同一句 "Hello, what's up?"，只是提前一帧开始。
+
 ## 其他图（legacy，沿用 Codex 产物）
 
-frontend、head、8 个 DepFormer 和 Mimi 的量化沿用旧流程的 DLC。`moshi_legacy_o3.sh OUT_DIR` 把这 12 个 DLC
+head 和 Mimi 的量化沿用旧流程的 DLC。`moshi_legacy_o3.sh OUT_DIR` 把这些 DLC
 用 O3 + vtcm8 重新编译（经 `moshi_compile_context.sh`，图名从 DLC 读取，旧 DLC 的图都叫 `model`），
 token 与默认选项编译的版本完全一致。实测（2026-10-22）：
 
-- 只有 Mimi 变快：encoder 8.9 → 6.1 ms，decoder 6.7 → 5.4 ms（单图连跑）。frontend、head、DepFormer 已接近带宽上限，O3 没有收益。
+- 只有 Mimi 变快：encoder 8.9 → 6.1 ms，decoder 6.7 → 5.4 ms（单图连跑）。head 已接近带宽上限，O3 没有收益。
   Mimi 在 vtcm8 下仍有约 8 MB spill；vtcm12 可消除 spill，但手机上加载失败（QNN 5005）。
-- DepFormer 每个 codebook 约读 171 MB 权重。单图重复执行 2.55 ms，在链路里 4–5 ms，因为前一个图把缓存里的权重换掉了。
-  把 8 个合进一个 context 或拼成一个图（输出完全一致）都只快 0–2 ms，在噪声范围内，因此没有采用。
+- 每个图单独重复执行时比在链路里快（DepFormer 2.55 vs 4–5 ms），因为前一个图把缓存里的权重换掉了。
+  把 8 个 DepFormer 合进一个 context 或拼成一个图（输出完全一致）都只快 0–2 ms，在噪声范围内，因此没有采用。
 
 | 图 | 来源链路 | 远端产物 |
 | --- | --- | --- |
-| frontend、head、DepFormer | `moshi_export_lm_onnx.py` → `moshi_prepare_calibration_audio.py` → `moshi_quantize_lm_graph_set.py`（AI Hub 量化）→ `moshi_rebuild_guarded_dlc_set.py` | `/data3/yejialei/moshi-lm-guarded-dlc-set-v2/dlc`；context 当初由旧运行器在手机上编译 |
+| head | `moshi_export_lm_onnx.py` → `moshi_prepare_calibration_audio.py` → `moshi_quantize_lm_graph_set.py`（AI Hub 量化）→ `moshi_rebuild_guarded_dlc_set.py` | `/data3/yejialei/moshi-lm-guarded-dlc-set-v2/dlc`；QDQ 源 ONNX 在 `/data2/yejialei/tmp/moshi-lm-guarded-dlc-set-v1/graphs`，DepFormer 门限的 legacy 对照也用它 |
 | Mimi encoder（W8）、decoder（LPBQ W4） | `moshi_export_mimi_streaming_onnx.py` → `moshi_quantize_mimi_offline.py` → `moshi_validate_mimi_dlc.py` | `/data2/yejialei/moshi-mimi-lpbq-20261018-v2/selected/{encoder,decoder}` |
-
-现在的运行器只加载 `.bin` context。要重建这些图，用 `qnn-context-binary-generator` 从上面的 DLC 离线编译，
-参照 `moshi_temporal_build.sh` 的编译段，图名要与 DLC 一致。
 
 ## 模型包与 App
 
 模型包目录结构（App 只读，用 ADB 放入）：
 
 ```text
-lm-v2-o3/
+lm-v3-dep8/
   CONTEXT_ONLY
   SHA256SUMS                 # sha256sum 格式，相对路径，16 行
-  mimi_encoder.bin  mimi_decoder.bin
-  dlc/frontend.bin  dlc/head.bin  dlc/depformer_codebook_{0..7}.bin  dlc/temporal_part_{0..3}.bin
+  frontend_embeddings.bin  mimi_encoder.bin  mimi_decoder.bin
+  dlc/head.bin  dlc/depformer_codebook_{0..7}.bin  dlc/temporal_part_{0..3}.bin
 ```
 
 ```sh
-M=/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v2-o3
+M=/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v3-dep8
 adb shell mkdir -p $M/dlc
 adb push ... $M/                                   # 放入上面的文件
 adb shell chmod 755 $M $M/dlc                      # 目录必须可进入，否则 App 读取失败
 adb shell "chmod 644 $M/*.bin $M/dlc/*.bin"
-adb shell "cd $M && sha256sum mimi_encoder.bin mimi_decoder.bin dlc/*.bin > SHA256SUMS"
+adb shell "cd $M && sha256sum frontend_embeddings.bin mimi_encoder.bin mimi_decoder.bin dlc/*.bin > SHA256SUMS"
 ```
 
-当前包的清单另存在 Mac：`/Users/e1ainay/d_personal/moshi-models/temporal-v2/BUNDLE_SHA256SUMS`，4 个 Temporal context 也在同一目录。
+Mac 上的副本：Temporal context 在 `/Users/e1ainay/d_personal/moshi-models/temporal-v2/`，
+W8 DepFormer 在 `.../depformer_w8/`，embedding 表在 `.../frontend_table/`，O3 编译的 head 和 Mimi 在 `.../legacy-o3/`。
 
 构建并安装 App：
 
@@ -198,8 +226,9 @@ adb shell "LD_LIBRARY_PATH=$LIB ADSP_LIBRARY_PATH=$LIB ./moshi_graph_bench $LIB 
 
 ## 已知限制与下一步
 
-- 实时率约 2.5，还没到实时。每帧约 180–195 ms，几乎都花在 HTP 执行上（宿主端约 5 ms），整体受权重读取带宽限制。
-  要继续提速只能减少每帧读取的权重字节数，例如 DepFormer 降到 W8/W4，或 Temporal 的 value/down 也降到 W4。
+- 实时率约 2，还没到实时。每帧约 145–160 ms，其中 Temporal 占 105–125 ms，整体受权重读取带宽限制。
+  4 个 Temporal part 大小相同，但在链路里各需 23–36 ms，原因还没查清（需要逐算子 profile）。
+  要进一步减少读取字节，可以把 Temporal 的 value/down 也降到 W4（每帧约少读 1 GB，会损失一些质量）。
 - part 3（第 24–31 层）是最主要的误差来源。单独量化 part 3 时 cb0 为 96.3%，其他 part 都在 99% 以上。
   可以考虑 part 3 全部用 W8，代价是每步约多 20 ms。
 - 没有做听感、ASR 和长音频评测。超过 1000 帧窗口后的环绕没有在真实模型上验证。

@@ -55,10 +55,10 @@ public final class MainActivity extends Activity {
     private static final int CARD = Color.rgb(26, 39, 57);
     private static final int ACCENT = Color.rgb(68, 222, 194);
     private static final int MUTED = Color.rgb(176, 193, 210);
-    // Context-only bundle: Mimi + frontend/head/8 DepFormer + 4 Temporal parts, listed in SHA256SUMS.
-    private static final String BUNDLE = "lm-v2-o3";
+    // Mimi + head/8 DepFormer + 4 Temporal contexts and the CPU embedding table, listed in SHA256SUMS.
+    private static final String BUNDLE = "lm-v3-dep8";
     private static final String[] BUNDLE_FILES = {
-        "mimi_encoder.bin", "mimi_decoder.bin", "dlc/frontend.bin", "dlc/head.bin",
+        "mimi_encoder.bin", "mimi_decoder.bin", "frontend_embeddings.bin", "dlc/head.bin",
         "dlc/depformer_codebook_0.bin", "dlc/depformer_codebook_1.bin", "dlc/depformer_codebook_2.bin",
         "dlc/depformer_codebook_3.bin", "dlc/depformer_codebook_4.bin", "dlc/depformer_codebook_5.bin",
         "dlc/depformer_codebook_6.bin", "dlc/depformer_codebook_7.bin",

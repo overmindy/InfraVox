@@ -396,15 +396,20 @@ class DepFormerStepBlock(nn.Module):
             attention_values = attention_values.repeat_interleave(
                 self.kv_repeat, dim=1
             )
-        valid = (slots <= self.step).reshape(1, 1, 1, self.context)
         if self.single_value_attention:
             # Codebook 0 has exactly one valid attention slot. Its softmax
             # weight is 1 regardless of query/key, so return that value while
             # keeping the same cache writes and output projection.
             update = attention_values[:, :, :1, :]
         else:
+            # Slots after this constant step are always masked; slicing them away
+            # avoids a -inf mask, which ruins fixed-point activation ranges.
+            visible = self.step + 1
             update = functional.scaled_dot_product_attention(
-                query, attention_keys, attention_values, valid, dropout_p=0.0
+                query,
+                attention_keys[:, :, :visible],
+                attention_values[:, :, :visible],
+                dropout_p=0.0,
             )
         update = update.transpose(1, 2).reshape(
             hidden.shape[0], 1, query_width
