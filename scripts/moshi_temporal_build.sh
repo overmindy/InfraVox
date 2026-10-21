@@ -12,8 +12,7 @@ NUMPY=${QAIRT_NUMPY_DIR:-/data2/yejialei/tmp/moshi-qdq-0-1-cpu-check-v1/dlc_fusi
 PY=${QAIRT_PYTHON:-/home/user/workdir-wenhao/my_conda_pkgs/qairt/bin/python}
 SCRIPTS=$(cd "$(dirname "$0")" && pwd)
 BIN=$SDK/bin/x86_64-linux-clang
-LIB=$SDK/lib/x86_64-linux-clang
-export LD_LIBRARY_PATH=$LIB
+export LD_LIBRARY_PATH=$SDK/lib/x86_64-linux-clang
 FLOAT_IO="hidden attention_mask position_cos position_sin hidden_out"
 
 if [ ! -f "$PART/$NAME.dlc" ]; then
@@ -29,23 +28,4 @@ if [ ! -f "$PART/$NAME.dlc" ]; then
   rm -f "$PART/float/$NAME.dlc"
 fi
 
-case "$COMPILE" in
-  default) GRAPHS="" ;;
-  o3) GRAPHS="\"graphs\": [{\"graph_names\": [\"$NAME\"], \"O\": 3}]," ;;
-  o3-vtcm*) GRAPHS="\"graphs\": [{\"graph_names\": [\"$NAME\"], \"O\": 3, \"vtcm_mb\": ${COMPILE#o3-vtcm}}]," ;;
-  *) echo "Unknown compile mode $COMPILE" >&2; exit 2 ;;
-esac
-OUT=$PART/htp_${NAME}_$COMPILE
-mkdir -p "$OUT"
-echo "{$GRAPHS \"devices\": [{\"soc_model\": 87, \"dsp_arch\": \"v81\"}]}" > "$OUT/backend.json"
-cat > "$OUT/config.json" <<EOF
-{"backend_extensions": {"shared_library_path": "$LIB/libQnnHtpNetRunExtensions.so",
-                        "config_file_path": "$OUT/backend.json"}}
-EOF
-time "$BIN/qnn-context-binary-generator" --backend "$LIB/libQnnHtp.so" --model "$LIB/libQnnModelDlc.so" \
-  --dlc_path "$PART/$NAME.dlc" --config_file "$OUT/config.json" \
-  --binary_file "$NAME" --output_dir "$OUT" --log_level warn 2>&1 | grep -E "spill_bytes|fill_bytes|read_total" || true
-"$BIN/qnn-context-binary-utility" --context_binary "$OUT/$NAME.bin" --json_file "$OUT/context.json" >/dev/null
-grep -o '"graphName"[^,]*\|"optimizationLevel"[^,]*\|"vtcmSize[^,]*' "$OUT/context.json" | tr '\n' ' '; echo
-ls -la "$OUT/$NAME.bin"
-sha256sum "$OUT/$NAME.bin"
+"$SCRIPTS/moshi_compile_context.sh" "$PART/$NAME.dlc" "$NAME" "$PART/htp_${NAME}_$COMPILE" "$COMPILE"

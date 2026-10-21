@@ -9,8 +9,8 @@
 | --- | --- |
 | App | `com.overmindy.mimicodecdemo` 2.8.0-temporal-v2（versionCode 13） |
 | 模型包 | `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v2-w4w8vd`，16 个 context，约 6.7 GB |
-| 38 帧输入（3.04 s） | 暖运行 8.5–9.0 s，输出 2.96 s，RTF 约 3 |
-| 每帧耗时 | 约 200–210 ms：Temporal 135、DepFormer 29–36、Mimi 19、frontend 11、head 3.5 |
+| 38 帧输入（3.04 s） | 暖运行 6.9–7.3 s，首段 PCM 约 0.38 s，输出 2.96 s，RTF 约 2.4 |
+| 每帧耗时 | 约 180–195 ms：Temporal 110–135、DepFormer 33–38、Mimi 16–19、frontend 9–11、head 4 |
 | Temporal 质量（8 段 held-out，1558 帧，手机实测） | 文本 top-1 98.7%，音频 cb0 95.3%，8 路全对 90.6% |
 
 质量指标是 teacher-forced 的：每帧给相同的 BF16 历史，比较该帧的文本 argmax 和 DepFormer 贪心音频 token。
@@ -134,7 +134,14 @@ export SAMPLE_WAV=/path/to/24k_mono_pcm16.wav                          # 打进 
 
 ## 其他图（legacy，沿用 Codex 产物）
 
-frontend、head、8 个 DepFormer 和 Mimi 仍沿用旧流程的产物，原样复制到新包。它们的 context 不是用 O3 编译的。
+frontend、head、8 个 DepFormer 和 Mimi 的量化沿用旧流程的 DLC。`moshi_legacy_o3.sh OUT_DIR` 把这 12 个 DLC
+用 O3 + vtcm8 重新编译（经 `moshi_compile_context.sh`，图名从 DLC 读取，旧 DLC 的图都叫 `model`），
+token 与默认选项编译的版本完全一致。实测（2026-10-22）：
+
+- 只有 Mimi 变快：encoder 8.9 → 6.1 ms，decoder 6.7 → 5.4 ms（单图连跑）。frontend、head、DepFormer 已接近带宽上限，O3 没有收益。
+  Mimi 在 vtcm8 下仍有约 8 MB spill；vtcm12 可消除 spill，但手机上加载失败（QNN 5005）。
+- DepFormer 每个 codebook 约读 171 MB 权重。单图重复执行 2.55 ms，在链路里 4–5 ms，因为前一个图把缓存里的权重换掉了。
+  把 8 个合进一个 context 或拼成一个图（输出完全一致）都只快 0–2 ms，在噪声范围内，因此没有采用。
 
 | 图 | 来源链路 | 远端产物 |
 | --- | --- | --- |
@@ -191,8 +198,8 @@ adb shell "LD_LIBRARY_PATH=$LIB ADSP_LIBRARY_PATH=$LIB ./moshi_graph_bench $LIB 
 
 ## 已知限制与下一步
 
-- 实时率约 3，还没到实时。下一步：用 O3 + vtcm8 重新编译 legacy 图；评估把 8 个 DepFormer 合并成一个图；
-  按 Temporal 的方式重新导出和量化 frontend、head、DepFormer。
+- 实时率约 2.5，还没到实时。每帧约 180–195 ms，几乎都花在 HTP 执行上（宿主端约 5 ms），整体受权重读取带宽限制。
+  要继续提速只能减少每帧读取的权重字节数，例如 DepFormer 降到 W8/W4，或 Temporal 的 value/down 也降到 W4。
 - part 3（第 24–31 层）是最主要的误差来源。单独量化 part 3 时 cb0 为 96.3%，其他 part 都在 99% 以上。
   可以考虑 part 3 全部用 W8，代价是每步约多 20 ms。
 - 没有做听感、ASR 和长音频评测。超过 1000 帧窗口后的环绕没有在真实模型上验证。

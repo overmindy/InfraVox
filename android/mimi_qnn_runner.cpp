@@ -697,10 +697,15 @@ class TemporalPartV2 {
   void reset() {
     for (auto& ring : rings_) {
       const float zero = 0.0f;
-      std::vector<uint8_t> code(affineWidth(ring.in));
-      quantizeTo(ring.in, &zero, 1, code.data());
-      for (size_t i = 0; i < ring.storage->bytes(); i += code.size())
-        std::memcpy(ring.storage->data() + i, code.data(), code.size());
+      uint8_t code[2];
+      quantizeTo(ring.in, &zero, 1, code);
+      if (affineWidth(ring.in) == 1) {
+        std::memset(ring.storage->data(), code[0], ring.storage->bytes());
+      } else {
+        uint16_t value;
+        std::memcpy(&value, code, sizeof(value));
+        std::fill_n(reinterpret_cast<uint16_t*>(ring.storage->data()), ring.storage->bytes() / 2, value);
+      }
     }
   }
 
