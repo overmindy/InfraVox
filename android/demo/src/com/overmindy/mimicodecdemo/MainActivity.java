@@ -56,7 +56,7 @@ public final class MainActivity extends Activity {
     private static final int ACCENT = Color.rgb(68, 222, 194);
     private static final int MUTED = Color.rgb(176, 193, 210);
     // Context-only bundle: Mimi + frontend/head/8 DepFormer + 4 Temporal parts, listed in SHA256SUMS.
-    private static final String BUNDLE = "lm-v2-w4w8vd";
+    private static final String BUNDLE = "lm-v2-o3";
     private static final String[] BUNDLE_FILES = {
         "mimi_encoder.bin", "mimi_decoder.bin", "dlc/frontend.bin", "dlc/head.bin",
         "dlc/depformer_codebook_0.bin", "dlc/depformer_codebook_1.bin", "dlc/depformer_codebook_2.bin",

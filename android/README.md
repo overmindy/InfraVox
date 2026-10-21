@@ -7,8 +7,8 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| App | `com.overmindy.mimicodecdemo` 2.8.0-temporal-v2（versionCode 13） |
-| 模型包 | `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v2-w4w8vd`，16 个 context，约 6.7 GB |
+| App | `com.overmindy.mimicodecdemo` 2.9.0-o3（versionCode 15）；内置演示 36 帧 7.03 s，RTF 2.44 |
+| 模型包 | `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v2-o3`，16 个 context，约 6.7 GB（legacy 图为 O3 编译；旧包 `lm-v2-w4w8vd` 仍在手机上） |
 | 38 帧输入（3.04 s） | 暖运行 6.9–7.3 s，首段 PCM 约 0.38 s，输出 2.96 s，RTF 约 2.4 |
 | 每帧耗时 | 约 180–195 ms：Temporal 110–135、DepFormer 33–38、Mimi 16–19、frontend 9–11、head 4 |
 | Temporal 质量（8 段 held-out，1558 帧，手机实测） | 文本 top-1 98.7%，音频 cb0 95.3%，8 路全对 90.6% |
@@ -156,7 +156,7 @@ token 与默认选项编译的版本完全一致。实测（2026-10-22）：
 模型包目录结构（App 只读，用 ADB 放入）：
 
 ```text
-lm-v2-w4w8vd/
+lm-v2-o3/
   CONTEXT_ONLY
   SHA256SUMS                 # sha256sum 格式，相对路径，16 行
   mimi_encoder.bin  mimi_decoder.bin
@@ -164,7 +164,7 @@ lm-v2-w4w8vd/
 ```
 
 ```sh
-M=/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v2-w4w8vd
+M=/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v2-o3
 adb shell mkdir -p $M/dlc
 adb push ... $M/                                   # 放入上面的文件
 adb shell chmod 755 $M $M/dlc                      # 目录必须可进入，否则 App 读取失败
