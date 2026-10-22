@@ -43,11 +43,6 @@ double elapsedMs(Clock::time_point start) {
   return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
-int environmentLevel(const char* name, int fallback) {
-  const char* value = std::getenv(name);
-  return value && *value ? std::atoi(value) : fallback;
-}
-
 void check(Qnn_ErrorHandle_t status, const std::string& operation) {
   if (status != QNN_SUCCESS)
     throw std::runtime_error(operation + " failed, QNN status " + std::to_string(status));
@@ -223,7 +218,7 @@ class SharedBuffer {
 
 class Runtime {
  public:
-  explicit Runtime(const std::string& libraryDir) : profileLevel_(environmentLevel("MOSHI_QNN_PROFILE", 0)) {
+  explicit Runtime(const std::string& libraryDir) {
     backendLibrary_ = openLibrary(libraryDir + "/libQnnHtp.so");
     systemLibrary_ = openLibrary(libraryDir + "/libQnnSystem.so");
     const QnnInterface_t** providers = nullptr;
@@ -253,14 +248,10 @@ class Runtime {
     check(qnn.backendCreate(nullptr, nullptr, &backend), "backendCreate");
     const auto status = qnn.deviceCreate(nullptr, nullptr, &device);
     if (status != QNN_SUCCESS && status != QNN_DEVICE_ERROR_UNSUPPORTED_FEATURE) check(status, "deviceCreate");
-    if (profileLevel_ && qnn.profileCreate)
-      check(qnn.profileCreate(backend, profileLevel_ > 1 ? QNN_PROFILE_LEVEL_DETAILED : QNN_PROFILE_LEVEL_BASIC, &profile),
-            "profileCreate");
   }
 
   ~Runtime() {
     endPerformanceVote();
-    if (profile && qnn.profileFree) qnn.profileFree(profile);
     if (device && qnn.deviceFree) qnn.deviceFree(device);
     if (backend && qnn.backendFree) qnn.backendFree(backend);
     // The HTP backend can retain process-wide cleanup hooks, so its library stays loaded.
@@ -311,45 +302,19 @@ class Runtime {
 
   void timing(const std::string& graph, const char* phase, double ms) { timings_.push_back({graph, phase, ms}); }
 
-  void collectProfile(const std::string& graph) {
-    if (!profile || !qnn.profileGetEvents || !qnn.profileGetEventData) return;
-    const QnnProfile_EventId_t* events = nullptr;
-    uint32_t count = 0;
-    if (qnn.profileGetEvents(profile, &events, &count) != QNN_SUCCESS) return;
-    std::function<void(QnnProfile_EventId_t, int)> visit = [&](QnnProfile_EventId_t id, int depth) {
-      QnnProfile_EventData_t data{};
-      if (qnn.profileGetEventData(id, &data) == QNN_SUCCESS)
-        profileRows_.push_back({graph, data.type, data.unit, data.value, data.identifier ? data.identifier : ""});
-      const QnnProfile_EventId_t* children = nullptr;
-      uint32_t number = 0;
-      if (depth < 4 && qnn.profileGetSubEvents && qnn.profileGetSubEvents(id, &children, &number) == QNN_SUCCESS)
-        for (uint32_t i = 0; i < number; ++i) visit(children[i], depth + 1);
-    };
-    for (uint32_t i = 0; i < count; ++i) visit(events[i], 0);
-  }
-
-  void clearTimings() { timings_.clear(); profileRows_.clear(); }
+  void clearTimings() { timings_.clear(); }
 
   void writeTimings(const std::string& path) const {
     std::ofstream file(path);
     file << "graph,phase,milliseconds\n";
     for (const auto& row : timings_) file << row.graph << ',' << row.phase << ',' << row.ms << '\n';
     if (!file) throw std::runtime_error("Cannot write performance CSV: " + path);
-    if (profileRows_.empty()) return;
-    std::ofstream events(path + ".qnn.csv");
-    events << "graph,event_type,event_unit,event_value,identifier\n";
-    for (const auto& row : profileRows_) {
-      std::string label;
-      for (char c : row.identifier) { if (c == '"') label += '"'; label += c; }
-      events << row.graph << ',' << row.type << ',' << row.unit << ',' << row.value << ",\"" << label << "\"\n";
-    }
   }
 
   QNN_INTERFACE_VER_TYPE qnn{};
   QNN_SYSTEM_INTERFACE_VER_TYPE system{};
   Qnn_BackendHandle_t backend = nullptr;
   Qnn_DeviceHandle_t device = nullptr;
-  Qnn_ProfileHandle_t profile = nullptr;
   // Sequentially executed LM contexts share one spill-fill buffer through an HTP group.
   Qnn_ContextHandle_t groupLeader = nullptr;
   uint64_t groupSpillBytes = 0;
@@ -357,10 +322,7 @@ class Runtime {
 
  private:
   struct Timing { std::string graph; const char* phase; double ms; };
-  struct ProfileRow { std::string graph; uint32_t type, unit; uint64_t value; std::string identifier; };
-  int profileLevel_;
   std::vector<Timing> timings_;
-  std::vector<ProfileRow> profileRows_;
   void* backendLibrary_ = nullptr;
   void* systemLibrary_ = nullptr;
   const QnnInterface_t* provider_ = nullptr;
@@ -426,22 +388,8 @@ class Graph {
 
   const std::string& label() const { return label_; }
   Buffer& input(const std::string& name) { return find(inputs_, name); }
-  bool hasOutput(const std::string& name) const {
-    return std::any_of(outputs_.begin(), outputs_.end(), [&](const Buffer& b) { return b.name == name; });
-  }
-  Buffer& output(const std::string& name) {
-    if (hasOutput(name)) return find(outputs_, name);
-    // AI Hub-compiled Mimi graphs keep input names but number their outputs.
-    static const std::map<std::string, std::string> numbered = {
-        {"codes", "output_0"}, {"audio", "output_0"}, {"position_out", "output_1"},
-        {"kv_cache_out", "output_2"}, {"conv_state_out", "output_3"}};
-    const auto alias = numbered.find(name);
-    if (alias == numbered.end()) throw std::runtime_error("Missing QNN graph output: " + name);
-    return find(outputs_, alias->second);
-  }
-
+  Buffer& output(const std::string& name) { return find(outputs_, name); }
   const std::vector<Buffer>& inputs() const { return inputs_; }
-  const std::vector<Buffer>& outputs() const { return outputs_; }
 
   // Binds a large input to externally owned storage; registered shared memory when possible.
   void bindInput(const std::string& name, const SharedBuffer& ring) {
@@ -467,20 +415,17 @@ class Graph {
         setClientBuffer(buffer.tensor, ring.data(), ring.bytes());
       }
       inputTensors_[i] = buffer.tensor;
-      sharedInputs_ += handle != nullptr;
       return;
     }
     throw std::runtime_error("Missing graph input: " + name);
   }
-  size_t sharedInputs() const { return sharedInputs_; }
 
   void execute() {
     const auto start = Clock::now();
     check(runtime_.qnn.graphExecute(graph_, inputTensors_.data(), inputTensors_.size(), outputTensors_.data(),
-                                    outputTensors_.size(), runtime_.profile, nullptr),
+                                    outputTensors_.size(), nullptr, nullptr),
           "graphExecute " + label_);
     runtime_.timing(label_, "execute", elapsedMs(start));
-    runtime_.collectProfile(label_);
   }
 
   // Mimi streaming state: swap the output into the next input instead of copying megabytes.
@@ -541,7 +486,6 @@ class Graph {
   std::vector<Buffer> inputs_, outputs_;
   std::vector<Qnn_Tensor_t> inputTensors_, outputTensors_;
   std::vector<Qnn_MemHandle_t> memHandles_;
-  size_t sharedInputs_ = 0;
 };
 
 void expect(const Buffer& buffer, Qnn_DataType_t type, size_t bytes) {
@@ -552,13 +496,6 @@ void expect(const Buffer& buffer, Qnn_DataType_t type, size_t bytes) {
 void set(Buffer& buffer, const void* data, size_t size, Qnn_DataType_t type) {
   expect(buffer, type, size);
   std::memcpy(buffer.data(), data, size);
-}
-
-void requireFinite(const Buffer& buffer) {
-  if (tensorType(buffer.tensor) != QNN_DATATYPE_FLOAT_32) throw std::runtime_error("Expected FP32: " + buffer.name);
-  const auto* values = reinterpret_cast<const float*>(buffer.bytes.data());
-  for (size_t i = 0; i < buffer.bytes.size() / sizeof(float); ++i)
-    if (!std::isfinite(values[i])) throw std::runtime_error("Nonfinite output: " + buffer.name);
 }
 
 int16_t toPcm16(float value) {
@@ -665,16 +602,16 @@ void getReal(const Buffer& buffer, float* dst, size_t count) {
   dequantizeFrom(a, buffer.bytes.data(), count, dst);
 }
 
-// One Qualcomm-LLM-layout Temporal part (moshi_temporal_part.py): host attention mask and
+// One Qualcomm-LLM-layout Temporal part (scripts/moshi_temporal.py): host attention mask and
 // RoPE cos/sin, fixed-point KV rings (key [H,1,D,P], value [H,1,P,D]), new K/V outputs only.
-class TemporalPartV2 {
-  struct Ring { Affine in, out; std::unique_ptr<SharedBuffer> storage; };
+class TemporalPart {
+  struct Ring { Affine affine; std::unique_ptr<SharedBuffer> storage; };
 
  public:
   static constexpr size_t kHeads = 32, kHeadDim = 128, kDim = 4096;
   static constexpr float kMaskMin = -50.0f;
 
-  TemporalPartV2(Runtime& runtime, const std::string& path, bool grouped = false)
+  TemporalPart(Runtime& runtime, const std::string& path, bool grouped = false)
       : runtime_(runtime), rings_(), graph_(runtime, path, grouped) {
     for (const auto& input : graph_.inputs()) {
       int layer = -1;
@@ -692,8 +629,9 @@ class TemporalPartV2 {
     for (int layer : layers_) {
       for (bool key : {true, false}) {
         const auto& in = graph_.input(cacheName(layer, key, true));
-        Ring ring{affineOf(in.tensor), affineOf(graph_.output(cacheName(layer, key, false)).tensor), nullptr};
-        if (affineWidth(ring.in) != 1 && affineWidth(ring.in) != 2) throw std::runtime_error("KV must be fixed point");
+        Ring ring{affineOf(in.tensor), nullptr};
+        if (affineWidth(ring.affine) != 1 || !(ring.affine == affineOf(graph_.output(cacheName(layer, key, false)).tensor)))
+          throw std::runtime_error("KV must be 8-bit with tied input/output encodings: " + in.name);
         ring.storage = std::make_unique<SharedBuffer>(runtime_.sharedMemory, in.bytes.size());
         graph_.bindInput(in.name, *ring.storage);
         rings_.push_back(std::move(ring));
@@ -703,22 +641,15 @@ class TemporalPartV2 {
   }
 
   const std::string& label() const { return graph_.label(); }
-  size_t sharedInputs() const { return graph_.sharedInputs(); }
 
   // Empty slots hold the quantized value of 0.0, as in the float graph; masked or not,
   // byte 0 would be -128*scale for a symmetric 8-bit encoding.
   void reset() {
     for (auto& ring : rings_) {
       const float zero = 0.0f;
-      uint8_t code[2];
-      quantizeTo(ring.in, &zero, 1, code);
-      if (affineWidth(ring.in) == 1) {
-        std::memset(ring.storage->data(), code[0], ring.storage->bytes());
-      } else {
-        uint16_t value;
-        std::memcpy(&value, code, sizeof(value));
-        std::fill_n(reinterpret_cast<uint16_t*>(ring.storage->data()), ring.storage->bytes() / 2, value);
-      }
+      uint8_t code;
+      quantizeTo(ring.affine, &zero, 1, &code);
+      std::memset(ring.storage->data(), code, ring.storage->bytes());
     }
   }
 
@@ -753,21 +684,14 @@ class TemporalPartV2 {
 
   // Key out [H,1,D,1] -> ring [H,1,D,P] column `slot`; value out [H,1,1,D] -> ring [H,1,P,D] row `slot`.
   void writeSlot(Ring& ring, const uint8_t* source, size_t slot, bool key) {
-    const size_t width = affineWidth(ring.in), count = kHeads * kHeadDim;
-    std::vector<uint8_t> converted;
-    if (!(ring.in == ring.out)) {
-      std::vector<float> values(count);
-      dequantizeFrom(ring.out, source, count, values.data());
-      converted.resize(count * width);
-      quantizeTo(ring.in, values.data(), count, converted.data());
-      source = converted.data();
-    }
     uint8_t* base = ring.storage->data();
-    for (size_t h = 0; h < kHeads; ++h)
-      for (size_t d = 0; d < kHeadDim; ++d) {
-        const size_t element = key ? (h * kHeadDim + d) * past_ + slot : (h * past_ + slot) * kHeadDim + d;
-        std::memcpy(base + element * width, source + (h * kHeadDim + d) * width, width);
+    for (size_t h = 0; h < kHeads; ++h) {
+      if (!key) {
+        std::memcpy(base + (h * past_ + slot) * kHeadDim, source + h * kHeadDim, kHeadDim);
+        continue;
       }
+      for (size_t d = 0; d < kHeadDim; ++d) base[(h * kHeadDim + d) * past_ + slot] = source[h * kHeadDim + d];
+    }
   }
 
   Runtime& runtime_;
@@ -867,7 +791,7 @@ class EmbeddingTable {
   std::vector<Table> tables_;
 };
 
-// Moshiko LM: CPU embedding sum -> 4 Temporal parts (8 layers each, moshi_temporal_part.py layout)
+// Moshiko LM: CPU embedding sum -> 4 Temporal parts (8 layers each, scripts/moshi_temporal.py layout)
 // -> head -> 8 sequential DepFormer codebooks.
 class MoshiLm {
  public:
@@ -875,7 +799,7 @@ class MoshiLm {
 
   MoshiLm(Runtime& runtime, const std::string& directory)
       : runtime_(runtime), embeddings_(directory + "/frontend_embeddings.bin") {
-    if (embeddings_.dim() != TemporalPartV2::kDim) throw std::runtime_error("Embedding width does not match Temporal");
+    if (embeddings_.dim() != TemporalPart::kDim) throw std::runtime_error("Embedding width does not match Temporal");
     std::vector<std::string> names = {"head"};
     for (int book = 0; book < 8; ++book) names.push_back("depformer_codebook_" + std::to_string(book));
     std::vector<std::string> parts;
@@ -886,10 +810,7 @@ class MoshiLm {
     for (const auto& path : parts) spill = std::max(spill, spillFillBytes(path));
     runtime_.groupSpillBytes = spill;
     for (const auto& name : names) graphs_[name] = std::make_unique<Graph>(runtime_, directory + "/dlc/" + name + ".bin", true);
-    for (const auto& path : parts) {
-      temporal_.push_back(std::make_unique<TemporalPartV2>(runtime_, path, true));
-      shared_ += temporal_.back()->sharedInputs();
-    }
+    for (const auto& path : parts) temporal_.push_back(std::make_unique<TemporalPart>(runtime_, path, true));
   }
 
   ~MoshiLm() {
@@ -901,8 +822,6 @@ class MoshiLm {
     runtime_.groupLeader = nullptr;
   }
 
-  size_t sharedKvInputs() const { return shared_; }
-
   void reset() {
     delay_.reset();
     for (auto& part : temporal_) part->reset();
@@ -911,7 +830,7 @@ class MoshiLm {
 
   std::optional<std::array<int32_t, 9>> step(const std::array<int32_t, 8>& user) {
     const auto sequence = delay_.begin(user);
-    std::vector<float> hidden(TemporalPartV2::kDim), next(TemporalPartV2::kDim);
+    std::vector<float> hidden(TemporalPart::kDim), next(TemporalPart::kDim);
     const auto start = Clock::now();
     embeddings_.sum(sequence.data(), sequence.size(), hidden.data());
     runtime_.timing("frontend_cpu", "execute", elapsedMs(start));
@@ -921,28 +840,23 @@ class MoshiLm {
     }
 
     Graph& head = *graphs_.at("head");
-    set(head.input("hidden"), hidden.data(), hidden.size() * sizeof(float), QNN_DATATYPE_FLOAT_32);
+    setReal(head.input("hidden"), hidden.data(), hidden.size());
     head.execute();
-    const auto& temporal = head.output("temporal");
-    requireFinite(temporal);
-    auto& logits = head.output("text_logits");
-    expect(logits, QNN_DATATYPE_FLOAT_32, 32000 * sizeof(float));
-    requireFinite(logits);
-    const auto* scores = reinterpret_cast<const float*>(logits.data());
-    const int32_t text = static_cast<int32_t>(std::max_element(scores, scores + 32000) - scores);
+    getReal(head.output("temporal"), next.data(), next.size());
+    getReal(head.output("text_logits"), logits_.data(), logits_.size());
+    const int32_t text = static_cast<int32_t>(std::max_element(logits_.begin(), logits_.end()) - logits_.begin());
 
-    // The depth cache restarts every frame and is shared across the 8 codebooks. I/O is FP32
-    // (legacy graphs) or 16-bit fixed point (moshi_depformer_quantize.py), each with its own encoding.
+    // The depth cache restarts every frame and is handed from codebook to codebook; each graph
+    // has its own 16-bit encodings, so the handoff requantizes unless they happen to match.
     constexpr size_t kCache = 16 * 8 * 64;
     std::array<int32_t, 8> audio{};
     int32_t previous = text;
     Graph* last = nullptr;
     std::vector<float> values(kCache);
-    const auto* temporalValues = reinterpret_cast<const float*>(temporal.bytes.data());
     for (int book = 0; book < 8; ++book) {
       Graph& graph = *graphs_.at("depformer_codebook_" + std::to_string(book));
       set(graph.input("previous_token"), &previous, sizeof(previous), QNN_DATATYPE_INT_32);
-      setReal(graph.input("temporal"), temporalValues, TemporalPartV2::kDim);
+      setReal(graph.input("temporal"), next.data(), next.size());
       for (int j = 0; j < 12; ++j) {
         auto& input = graph.input(cacheName(j / 2, j % 2));
         if (!last) {
@@ -990,10 +904,10 @@ class MoshiLm {
   Runtime& runtime_;
   EmbeddingTable embeddings_;
   std::map<std::string, std::unique_ptr<Graph>> graphs_;
-  std::vector<std::unique_ptr<TemporalPartV2>> temporal_;
+  std::vector<std::unique_ptr<TemporalPart>> temporal_;
+  std::vector<float> logits_ = std::vector<float>(32000);
   MoshiDelayRing delay_;
   int32_t position_ = 0;
-  size_t shared_ = 0;
 };
 
 using FrameCallback = std::function<void(size_t, size_t, double, const std::vector<int16_t>&)>;
@@ -1020,7 +934,6 @@ class Session {
       runtime_.timing("pipeline", "wall_total", elapsedMs(start));
       runtime_.endPerformanceVote();
       runtime_.writeTimings(outputWav + ".performance.csv");
-      writeConfiguration(outputWav + ".runtime.json", highPerformance);
       return emitted;
     } catch (...) {
       runtime_.endPerformanceVote();
@@ -1093,15 +1006,6 @@ class Session {
     return emitted;
   }
 
-  void writeConfiguration(const std::string& path, bool highPerformance) const {
-    std::ofstream file(path);
-    file << "{\"format\":\"moshi-runtime-configuration-v2\",\"burst_vote\":" << (highPerformance ? "true" : "false")
-         << ",\"lm\":" << (lm_ ? "true" : "false")
-         << ",\"shared_spill_bytes\":" << runtime_.groupSpillBytes
-         << ",\"shared_memory_kv_inputs\":" << (lm_ ? lm_->sharedKvInputs() : 0) << "}\n";
-    if (!file) throw std::runtime_error("Cannot write runtime configuration report");
-  }
-
   Runtime runtime_;
   std::unique_ptr<MoshiLm> lm_;
   std::unique_ptr<Codec> codec_;
@@ -1122,29 +1026,3 @@ size_t runMimiCodecSessionStreaming(void* session, const std::string& inputWav, 
 }
 
 void destroyMimiCodecSession(void* session) { delete static_cast<Session*>(session); }
-
-#ifndef MIMI_CODEC_LIBRARY
-int main(int argc, char** argv) {
-  try {
-    if (argc < 7 || argc > 9 || (argc == 9 && std::string(argv[8]) != "--repeat")) {
-      std::cerr << "Usage: mimi_qnn_runner LIB_DIR ENCODER.bin DECODER.bin INPUT.wav OUTPUT.wav FRAMES "
-                   "[LM_BUNDLE_DIR [--repeat]]  (FRAMES 0 = whole WAV; MOSHI_HTP_PERFORMANCE=0 disables burst)\n";
-      return 2;
-    }
-    const bool burst = environmentLevel("MOSHI_HTP_PERFORMANCE", 1) != 0;
-    const auto prepare = Clock::now();
-    Session session(argv[1], argv[2], argv[3], argc >= 8 ? argv[7] : "");
-    std::cerr << "prepare_ms=" << elapsedMs(prepare) << '\n';
-    for (int pass = 0; pass < (argc == 9 ? 2 : 1); ++pass) {
-      const auto start = Clock::now();
-      const std::string output = pass ? std::string(argv[5]) + ".repeat.wav" : argv[5];
-      const size_t emitted = session.run(argv[4], output, std::stoul(argv[6]), {}, burst);
-      std::cerr << "run=" << pass << " emitted_frames=" << emitted << " total_ms=" << elapsedMs(start) << '\n';
-    }
-    return 0;
-  } catch (const std::exception& error) {
-    std::cerr << "mimi_qnn_runner error: " << error.what() << '\n';
-    return 1;
-  }
-}
-#endif

@@ -7,112 +7,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import onnx
 import torch
-from torch import nn
-from typing_extensions import Self
 
-from qai_hub_models.models.templates.moshi.external_repos.moshi.moshi.moshi.models.compression import (
-    MimiModel,
-)
 from qai_hub_models.models.templates.moshi.external_repos.moshi.moshi.moshi.models.lm import (
     LMModel,
 )
 from qai_hub_models.models.templates.moshi.external_repos.moshi.moshi.moshi.models.loaders import (
     CheckpointInfo,
-    get_mimi,
 )
-from qai_hub_models.utils.base_model import PytorchWorkbenchModel, SerializationSettings
-from qai_hub_models.utils.input_spec import InputSpec, OutputSpec, TensorSpec
+from qai_hub_models.models.templates.moshi.external_repos.moshi.moshi.moshi.utils.compile import (
+    no_compile,
+)
 
 FRAME_SAMPLES = 1920
-CODEBOOKS = 8
 DEFAULT_HF_REPO = "kyutai/moshiko-pytorch-bf16"
 MODEL_WEIGHTS_NAME = "model.safetensors"
 MIMI_WEIGHTS_NAME = "tokenizer-e351c8d8-checkpoint125.safetensors"
 TOKENIZER_NAME = "tokenizer_spm_32k_3.model"
-
-
-class _StaticComponent(PytorchWorkbenchModel):
-    def __init__(self, module: nn.Module) -> None:
-        super().__init__(module, SerializationSettings(use_pt2=False, check_trace=False))
-
-
-class MimiEncoder(_StaticComponent):
-    def __init__(self, module: MimiModel) -> None:
-        super().__init__(module)
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str | None = None) -> Self:
-        return cls(get_mimi(checkpoint, num_codebooks=CODEBOOKS))
-
-    def forward(self, audio: torch.Tensor) -> torch.Tensor:
-        return self.model.encode(audio).to(torch.int32)
-
-    def get_input_spec(self) -> InputSpec:
-        return {"audio": TensorSpec((1, 1, FRAME_SAMPLES), "float32")}
-
-    def get_output_spec(self) -> OutputSpec:
-        return {"codes": TensorSpec((1, self.model.num_codebooks, 1), "int32")}
-
-
-class MoshiTemporal(_StaticComponent):
-    def __init__(self, module: LMModel) -> None:
-        super().__init__(module)
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str | None = None) -> Self:
-        return cls(get_moshi_lm(checkpoint, dtype=torch.bfloat16))
-
-    def forward(self, sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.model.forward_text(sequence)
-
-    def get_input_spec(self) -> InputSpec:
-        return {"sequence": TensorSpec((1, self.model.num_codebooks, 1), "int32")}
-
-    def get_output_spec(self) -> OutputSpec:
-        return {
-            "temporal": TensorSpec((1, 1, self.model.dim), "float32"),
-            "text_logits": TensorSpec((1, 1, 1, self.model.text_linear.out_features), "float32"),
-        }
-
-
-class MoshiDepFormer(_StaticComponent):
-    def __init__(self, module: LMModel) -> None:
-        super().__init__(module)
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str | None = None) -> Self:
-        return cls(get_moshi_lm(checkpoint, dtype=torch.bfloat16))
-
-    def forward(self, sequence: torch.Tensor, temporal: torch.Tensor) -> torch.Tensor:
-        return self.model.forward_depformer_training(sequence, temporal)
-
-    def get_input_spec(self) -> InputSpec:
-        return {
-            "sequence": TensorSpec((1, self.model.num_codebooks, 1), "int32"),
-            "temporal": TensorSpec((1, 1, self.model.dim), "float32"),
-        }
-
-    def get_output_spec(self) -> OutputSpec:
-        return {"logits": TensorSpec((1, self.model.dep_q, 1, self.model.card), "float32")}
-
-
-class MimiDecoder(_StaticComponent):
-    def __init__(self, module: MimiModel) -> None:
-        super().__init__(module)
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str | None = None) -> Self:
-        return cls(get_mimi(checkpoint, num_codebooks=CODEBOOKS))
-
-    def forward(self, codes: torch.Tensor) -> torch.Tensor:
-        return self.model.decode(codes.long())[..., :FRAME_SAMPLES]
-
-    def get_input_spec(self) -> InputSpec:
-        return {"codes": TensorSpec((1, self.model.num_codebooks, 1), "int32")}
-
-    def get_output_spec(self) -> OutputSpec:
-        return {"audio": TensorSpec((1, 1, FRAME_SAMPLES), "float32")}
 
 
 def resolve_moshi_checkpoint(
@@ -131,10 +43,13 @@ def resolve_moshi_checkpoint(
     moshi_weights = model_path / config.get("moshi_name", MODEL_WEIGHTS_NAME)
     mimi_weights = model_path / config.get("mimi_name", MIMI_WEIGHTS_NAME)
     tokenizer = model_path / config.get("tokenizer_name", TOKENIZER_NAME)
-    required_paths = [moshi_weights, mimi_weights, tokenizer]
-    missing = [str(path) for path in required_paths if not path.is_file()]
+    missing = [
+        str(p) for p in (moshi_weights, mimi_weights, tokenizer) if not p.is_file()
+    ]
     if missing:
-        raise FileNotFoundError(f"Missing files in local Moshi directory: {', '.join(missing)}")
+        raise FileNotFoundError(
+            f"Missing files in local Moshi directory: {', '.join(missing)}"
+        )
     if not config_path.is_file():
         return CheckpointInfo(moshi_weights, mimi_weights, tokenizer)
 
@@ -142,8 +57,9 @@ def resolve_moshi_checkpoint(
     mimi_config_path = model_path / mimi_config_name if mimi_config_name else None
     lora_name = config.get("lora_name")
     lora_path = model_path / lora_name if lora_name else None
-    optional_paths = [path for path in (mimi_config_path, lora_path) if path]
-    missing_optional = [str(path) for path in optional_paths if not path.is_file()]
+    missing_optional = [
+        str(p) for p in (mimi_config_path, lora_path) if p and not p.is_file()
+    ]
     if missing_optional:
         raise FileNotFoundError(
             "Missing files referenced by config.json: " + ", ".join(missing_optional)
@@ -165,17 +81,29 @@ def load_moshi_lm(
     device: str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
 ) -> LMModel:
-    """Load only the LM weights needed by the ONNX conversion path."""
     checkpoint = resolve_moshi_checkpoint(hf_repo=hf_repo, model_dir=model_dir)
     return checkpoint.get_moshi(device=device, dtype=dtype)
 
 
-def load_moshi_models(
-    hf_repo: str = DEFAULT_HF_REPO,
-    model_dir: str | Path | None = None,
-    device: str = "cpu",
-    dtype: torch.dtype = torch.bfloat16,
-) -> tuple[MimiModel, LMModel, MimiModel]:
-    checkpoint = resolve_moshi_checkpoint(hf_repo=hf_repo, model_dir=model_dir)
-    mimi = checkpoint.get_mimi(device=device)
-    return mimi, checkpoint.get_moshi(device=device, dtype=dtype), mimi
+def export_onnx(
+    module: torch.nn.Module,
+    inputs: tuple[torch.Tensor, ...],
+    path: Path,
+    input_names: list[str],
+    output_names: list[str],
+) -> None:
+    # Kyutai wraps RMSNorm and a few eager functions with torch.compile, which the
+    # TorchScript-based ONNX exporter cannot trace into.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with no_compile():
+        torch.onnx.export(
+            module,
+            inputs,
+            str(path),
+            opset_version=17,
+            dynamo=False,
+            do_constant_folding=True,
+            input_names=input_names,
+            output_names=output_names,
+        )
+    onnx.checker.check_model(str(path))

@@ -37,10 +37,6 @@ class MimiExplicitStateSpec:
     def conv_state_numel(self) -> int:
         return sum(prod(shape) for shape in self.conv_state_shapes)
 
-    @property
-    def first_state_count(self) -> int:
-        return len(self.first_state_names)
-
 
 class _ExplicitMimiFrame(nn.Module):
     """Common tensor-state plumbing around the pinned upstream Mimi modules."""
@@ -70,12 +66,16 @@ class _ExplicitMimiFrame(nn.Module):
                 continue
             previous = getattr(state, "previous", None)
             if isinstance(previous, torch.Tensor) and previous.numel():
-                conv_entries.append((name + ".previous", state, "previous", tuple(previous.shape)))
+                conv_entries.append(
+                    (name + ".previous", state, "previous", tuple(previous.shape))
+                )
                 if hasattr(state, "first"):
                     first_entries.append((name + ".first", state))
             partial = getattr(state, "partial", None)
             if isinstance(partial, torch.Tensor) and partial.numel():
-                conv_entries.append((name + ".partial", state, "partial", tuple(partial.shape)))
+                conv_entries.append(
+                    (name + ".partial", state, "partial", tuple(partial.shape))
+                )
             kv_cache = getattr(state, "kv_cache", None)
             if kv_cache is not None:
                 attention_entries.append((name, state))
@@ -92,7 +92,9 @@ class _ExplicitMimiFrame(nn.Module):
             tuple(entry[1].kv_cache.cache.shape) for entry in attention_entries
         }
         if len(cache_shapes) != 1:
-            raise RuntimeError(f"Heterogeneous {component} attention caches: {cache_shapes}")
+            raise RuntimeError(
+                f"Heterogeneous {component} attention caches: {cache_shapes}"
+            )
 
         self._conv_entries = conv_entries
         self._first_entries = first_entries
@@ -118,7 +120,9 @@ class _ExplicitMimiFrame(nn.Module):
         device = parameter.device
         dtype = parameter.dtype
         position = torch.zeros(1, dtype=torch.int64, device=device)
-        kv_cache = torch.zeros(self.state_spec.kv_cache_shape, dtype=dtype, device=device)
+        kv_cache = torch.zeros(
+            self.state_spec.kv_cache_shape, dtype=dtype, device=device
+        )
         conv_state = torch.zeros(
             1, self.state_spec.conv_state_numel, dtype=dtype, device=device
         )
@@ -139,7 +143,9 @@ class _ExplicitMimiFrame(nn.Module):
                     f"got {tuple(kv_cache.shape)}"
                 )
             if tuple(conv_state.shape) != (1, self.state_spec.conv_state_numel):
-                raise ValueError("conv_state shape does not match the explicit state spec")
+                raise ValueError(
+                    "conv_state shape does not match the explicit state spec"
+                )
         cursor = 0
         for _, state, field, shape in self._conv_entries:
             count = prod(shape)
@@ -176,7 +182,10 @@ class _ExplicitMimiFrame(nn.Module):
             [state.kv_cache.cache for _, state in self._attention_entries], dim=0
         )
         convolution = torch.cat(
-            [getattr(state, field).reshape(1, -1) for _, state, field, _ in self._conv_entries],
+            [
+                getattr(state, field).reshape(1, -1)
+                for _, state, field, _ in self._conv_entries
+            ],
             dim=1,
         )
         return position_out, caches, convolution

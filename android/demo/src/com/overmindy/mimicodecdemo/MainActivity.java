@@ -71,7 +71,7 @@ public final class MainActivity extends Activity {
     private Switch moshiMode, streamPlayback, htpPerformance;
     private EditText frameLimit;
     private AudioTrack streamTrack; // Worker thread owns creation/write/release.
-    private int streamedSamples, streamCallbacks, streamChunks, streamThresholdBefore, streamThresholdAfter;
+    private int streamedSamples;
     private MediaPlayer player;
     private boolean working, bundleVerified;
     private volatile boolean recording;
@@ -452,7 +452,6 @@ public final class MainActivity extends Activity {
         outputFile().delete();
         codesFile().delete();
         textTokensFile().delete();
-        new File(outputFile().getAbsolutePath() + ".playback.csv").delete();
         tokens.setText("正在执行 QNN 图…");
         replyText.setText(moshiMode.isChecked() ? "生成中…" : "codec 对照模式没有文本输出");
         status.setText(moshiMode.isChecked() ? "正在逐帧执行 Encoder → LM → Decoder…" : "正在逐帧执行 Encoder → Decoder…");
@@ -465,8 +464,6 @@ public final class MainActivity extends Activity {
             try {
                 stopStream();
                 streamedSamples = 0;
-                streamCallbacks = 0;
-                streamChunks = 0;
                 if (enableStreamPlayback) startStream();
                 int frames = nativeRunPrepared(sessionHandle, inputFile().getAbsolutePath(),
                         outputFile().getAbsolutePath(), requestedFrames, this, enableHtpPerformance);
@@ -505,20 +502,13 @@ public final class MainActivity extends Activity {
                 .setBufferSizeInBytes(Math.max(minimum, FRAME_SAMPLES * 2 * 4))
                 .setTransferMode(AudioTrack.MODE_STREAM).build();
         // The default start threshold is the whole buffer; start after one 80 ms frame instead.
-        if (android.os.Build.VERSION.SDK_INT >= 31) {
-            streamThresholdBefore = streamTrack.getStartThresholdInFrames();
-            streamThresholdAfter = streamTrack.setStartThresholdInFrames(FRAME_SAMPLES);
-        } else {
-            streamThresholdBefore = streamTrack.getBufferSizeInFrames();
-            streamTrack.setBufferSizeInFrames(FRAME_SAMPLES);
-            streamThresholdAfter = streamTrack.getBufferSizeInFrames();
-        }
+        if (android.os.Build.VERSION.SDK_INT >= 31) streamTrack.setStartThresholdInFrames(FRAME_SAMPLES);
+        else streamTrack.setBufferSizeInFrames(FRAME_SAMPLES);
         streamTrack.play();
     }
 
     // Called on the inference worker once per input frame, not the UI thread.
     private void onNativeFrame(int consumed, int emitted, double milliseconds, short[] pcm) {
-        ++streamCallbacks;
         if (streamTrack != null && pcm.length > 0) {
             int offset = 0;
             while (offset < pcm.length) {
@@ -527,7 +517,6 @@ public final class MainActivity extends Activity {
                 offset += count;
             }
             streamedSamples += pcm.length;
-            ++streamChunks;
         }
         runOnUiThread(() -> status.setText(String.format(Locale.US,
                 "已处理输入 %d 帧，输出 %d 帧；刚完成一帧 %.1f ms", consumed, emitted, milliseconds)));
@@ -537,20 +526,13 @@ public final class MainActivity extends Activity {
         if (streamTrack != null) { streamTrack.release(); streamTrack = null; }
     }
 
-    private String finishStreamPlayback() throws IOException, InterruptedException {
+    private String finishStreamPlayback() throws InterruptedException {
         if (streamTrack == null) return "";
         long deadline = android.os.SystemClock.uptimeMillis() + 2000;
         while (streamTrack.getPlaybackHeadPosition() < streamedSamples
                 && android.os.SystemClock.uptimeMillis() < deadline) Thread.sleep(10);
         int played = streamTrack.getPlaybackHeadPosition();
         boolean timedOut = played < streamedSamples;
-        String header = "callbacks,pcm_chunks,written_samples,played_samples,capacity_frames,threshold_before,threshold_after,underruns,drain_timeout\n";
-        String row = String.format(Locale.US, "%d,%d,%d,%d,%d,%d,%d,%d,%s\n",
-                streamCallbacks, streamChunks, streamedSamples, played, streamTrack.getBufferCapacityInFrames(),
-                streamThresholdBefore, streamThresholdAfter, streamTrack.getUnderrunCount(), timedOut);
-        try (FileOutputStream output = new FileOutputStream(outputFile().getAbsolutePath() + ".playback.csv")) {
-            output.write((header + row).getBytes(StandardCharsets.UTF_8));
-        }
         stopStream();
         return String.format(Locale.US, " 播放头消费 %d/%d 样本%s。", played, streamedSamples,
                 timedOut ? "（等待超时，请检查音频输出）" : "");
@@ -672,9 +654,6 @@ public final class MainActivity extends Activity {
                 String[][] extras = {
                     {textTokensFile().getAbsolutePath(), "-text-token-ids.csv", "text/csv"},
                     {base + ".performance.csv", "-performance.csv", "text/csv"},
-                    {base + ".performance.csv.qnn.csv", "-qnn-profile.csv", "text/csv"},
-                    {base + ".runtime.json", "-runtime.json", "application/json"},
-                    {base + ".playback.csv", "-playback.csv", "text/csv"},
                 };
                 for (String[] extra : extras) {
                     File file = new File(extra[0]);

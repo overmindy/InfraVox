@@ -1,4 +1,4 @@
-from .app import MoshiApp
-from .model import MimiDecoder, MimiEncoder, MoshiDepFormer, MoshiTemporal
-
-__all__ = ["MimiDecoder", "MimiEncoder", "MoshiDepFormer", "MoshiTemporal", "MoshiApp"]
+# ---------------------------------------------------------------------
+# Copyright (c) 2025 Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause
+# ---------------------------------------------------------------------
