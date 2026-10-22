@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -30,8 +31,10 @@ from qai_hub_models.models.templates.llm._utils import (
 
 
 def cuda_providers() -> list:
-    # TF32 matmuls perturb the simulation by ~1e-4 relative; keep full FP32.
-    return [("CUDAExecutionProvider", {"use_tf32": "0"}), "CPUExecutionProvider"]
+    # TF32 matmuls perturb the simulation by ~1e-4 relative; keep full FP32. MOSHI_ORT_DEVICE puts
+    # the QuantSim on another GPU than the BF16 model when one GPU cannot hold both.
+    options = {"use_tf32": "0", "device_id": os.environ.get("MOSHI_ORT_DEVICE", "0")}
+    return [("CUDAExecutionProvider", options), "CPUExecutionProvider"]
 
 
 def hold_at_int8(sim: QuantizationSimModel, pattern: str) -> int:
@@ -57,8 +60,9 @@ def create_sim(model: onnx.ModelProto, weights: str, config: str, providers: lis
                block_size: int = 64) -> QuantizationSimModel:
     """QuantSim configured like the official w4a16 LLM recipes, before any calibration.
 
-    lpbq4_w8vd (the chosen layout) holds attention value and MLP down projections at int8:
-    teacher-forced audio cb0 agreement 98.4% vs 95.9% for all-LPBQ on held-out speech.
+    lpbq4 (deployed) is LPBQ int4 everywhere. lpbq4_w8vd holds attention value and MLP down at int8:
+    on the 8 held-out clips, 4 parts chained, all-8 audio agreement 90.1% vs 85.1% for lpbq4, but
+    about 22% more weight bytes per frame (the phone is memory-bound; ~25 ms per frame slower).
     """
     AimetLogger.set_level_for_all_areas(logging.WARNING)
     quantsim.op_types_to_tie_qtzrs = ["Concat"]
@@ -93,7 +97,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--part-dir", type=Path, required=True)
     parser.add_argument("--providers", default="CUDAExecutionProvider,CPUExecutionProvider")
-    parser.add_argument("--weights", choices=WEIGHTS, default="lpbq4_w8vd",
+    parser.add_argument("--weights", choices=WEIGHTS, default="lpbq4",
                         help="LPBQ int4 (+int8 value/down), int4 per-channel, or int8 per-channel weights")
     parser.add_argument("--config", default="htp_v81")
     parser.add_argument("--name", default="model", help="Encodings file prefix")

@@ -145,7 +145,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--parts", default="0,1,2,3")
     parser.add_argument("--mode", choices=("each", "together"), default="each")
-    parser.add_argument("--weights", choices=WEIGHTS, default="lpbq4_w8vd")
+    parser.add_argument("--weights", choices=WEIGHTS, default="lpbq4")
     parser.add_argument("--held-out-clips", type=int, default=4)
     parser.add_argument("--shard", default="0/1", help="i/n: evaluate every n-th selected clip from i (multi-GPU)")
     parser.add_argument("--calibration-clips", type=int, default=8)

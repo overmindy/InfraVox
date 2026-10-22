@@ -7,11 +7,11 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| App | `com.overmindy.mimicodecdemo` 3.0.0-dep8（versionCode 16）；内置演示 36 帧 6.12 s，RTF 2.13，加载 3.4 s |
-| 模型包 | `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v3-dep8`，15 个 context + CPU embedding 表，约 6.0 GB（上一版 `lm-v2-o3` 仍在手机上） |
-| 38 帧输入（3.04 s） | 暖运行 5.6–6.5 s，首段 PCM 约 0.33 s，输出 2.96 s，RTF 约 2.0 |
-| 每帧耗时 | 约 145–160 ms：Temporal 105–125、DepFormer 15–20、Mimi 13–14、head 3、frontend（CPU）0.03 |
-| Temporal 质量（8 段 held-out，1558 帧，手机实测） | 文本 top-1 98.7%，音频 cb0 95.3%，8 路全对 90.6% |
+| App | `com.overmindy.mimicodecdemo` 4.0.0-lpbq4（versionCode 17）；内置演示 36 帧 5.75 s，RTF 2.00，加载 3.4 s |
+| 模型包 | `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v4-lpbq4`，15 个 context + CPU embedding 表，约 5.0 GB（上一版 `lm-v3-dep8` 仍在手机上） |
+| 38 帧输入（3.04 s） | 暖运行 5.7–6.0 s（同期 W8 value/down 版 6.5–7.2 s），首段 PCM 约 0.31 s，输出 2.96 s |
+| 每帧耗时 | 约 125–140 ms：Temporal 85–100、DepFormer 15–20、Mimi 13–14、head 3、frontend（CPU）0.03 |
+| Temporal 质量（8 段 held-out，1558 帧，4 段串联 QuantSim，对 BF16） | 全 LPBQ W4：文本 top-1 97.95%，音频 cb0 94.4%，8 路全对 85.1%；之前的 W8 value/down：98.4% / 95.4% / 90.1% |
 | DepFormer W8 质量（同一批 1558 帧，QuantSim，对 BF16） | 串联 8 路全对 92.4%（旧 FP16 权重的 legacy 图 85.3%，FP32 上限 94.0%） |
 
 质量指标是 teacher-forced 的：每帧给相同的 BF16 历史，比较该帧的文本 argmax 和 DepFormer 贪心音频 token。
@@ -101,24 +101,29 @@ export SAMPLE_WAV=/path/to/24k_mono_pcm16.wav                          # 打进 
      --test-roots .../test-clean .../test-other --output-dir $W/capture
    ```
 
-2. **校准并做 token 级门限**（AIMET + CUDA）：每个 part 生成一个 QuantSim。权重 `lpbq4_w8vd` 即 LPBQ int4（block 64），
-   其中 value 和 MLP down 保持 int8 per-channel；激活 int16；KV 为 8-bit，输入输出绑定。
+2. **校准并做 token 级门限**（AIMET + CUDA）：每个 part 生成一个 QuantSim。部署用 `--weights lpbq4`：
+   全部权重 LPBQ int4（block 64）；激活 int16；KV 为 8-bit，输入输出绑定。
+   `lpbq4_w8vd`（value 和 MLP down 为 int8）质量更好，但每帧多读约 1 GB 权重，慢约 25 ms，见上面的现状表。
    校准样本取 8 段校准音频的前 120 帧，共 64 个 AR1 步，**必须包含第 0–3 帧**（第 0 帧是全初始 token 的 attention sink）。
    部署用的 encodings 就是这一步生成的，没有使用 SeqMSE。
 
    ```sh
    source /data2/yejialei/envs/aimet228/env.sh
    TMPDIR=$W/tmp python moshi_temporal_segment_eval.py --model-dir $BF16 --capture-dir $W/capture \
-     --work-dir $W/w4w8vd --parts 0,1,2,3 --mode each      # 逐段：保存 temporal_part_{p}.encodings
+     --work-dir $W/lpbq4 --parts 0,1,2,3 --mode each --held-out-clips 8   # 逐段：保存 temporal_part_{p}.encodings
    TMPDIR=$W/tmp python moshi_temporal_segment_eval.py ... --mode together   # 4 段串联；复用 encodings，不重新校准
    ```
+
+   BF16 模型（15 GB）和 7 GB 的 FP32 QuantSim 放不进一块只剩 ~27 GB 的共享 GPU 时，
+   用 `CUDA_VISIBLE_DEVICES=a,b MOSHI_ORT_DEVICE=1` 把 QuantSim 放到第二块卡。8 段 held-out 的门限在共享 GPU 上
+   每段 `each` 约 70 分钟、`together` 约 3.5–4 小时；筛选变体先用 `moshi_temporal_token_eval.py`。
 
 3. **构建 context**（每段约 8 分钟）：导出 ONNX，拷入 encodings，然后转换、量化、编译。
 
    ```sh
    python moshi_temporal_part.py --model-dir $BF16 --output-dir $W/build/part$P \
      --first-layer $((8*P)) --layers 8 --parity-steps 4 --calibration-steps 0
-   cp $W/w4w8vd/temporal_part_$P.encodings $W/build/part$P/
+   cp $W/lpbq4/temporal_part_$P.encodings $W/build/part$P/
    bash moshi_quantized_build.sh $W/build/part$P temporal_part_$P      # 默认 O3 + vtcm 8 MB
    ```
 
@@ -154,6 +159,8 @@ bash moshi_depformer_build.sh $W/depformer_w8   # 8 个 context 并行构建，�
   数学上等价。用 −inf mask 时 16-bit 激活的范围被撑爆，只有不需要 mask 的 codebook 0 和 7 正常，其余掉到 55–80%。
 - 转换器没有保留 FP32 I/O，图的 I/O 是 uint16 定点。运行器按每个张量自己的 scale/offset 写入和读出，
   FP32 的旧图也能用同一段代码。
+- W4 不可用：`--weights pc4` 串联 8 路全对 49.6%，`lpbq4` 62.6%（W8 为 92.4%）。
+  另外 DepFormer 的 Linear 导出为 MatMul/FC，LPBQ FC 会让 context 生成器直接退出，要用 W4 得先改成 1×1 Conv。
 
 ## CPU frontend
 
@@ -183,7 +190,7 @@ token 与默认选项编译的版本完全一致。实测（2026-10-22）：
 模型包目录结构（App 只读，用 ADB 放入）：
 
 ```text
-lm-v3-dep8/
+lm-v4-lpbq4/
   CONTEXT_ONLY
   SHA256SUMS                 # sha256sum 格式，相对路径，16 行
   frontend_embeddings.bin  mimi_encoder.bin  mimi_decoder.bin
@@ -191,7 +198,7 @@ lm-v3-dep8/
 ```
 
 ```sh
-M=/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v3-dep8
+M=/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/lm-v4-lpbq4
 adb shell mkdir -p $M/dlc
 adb push ... $M/                                   # 放入上面的文件
 adb shell chmod 755 $M $M/dlc                      # 目录必须可进入，否则 App 读取失败
@@ -199,7 +206,8 @@ adb shell "chmod 644 $M/*.bin $M/dlc/*.bin"
 adb shell "cd $M && sha256sum frontend_embeddings.bin mimi_encoder.bin mimi_decoder.bin dlc/*.bin > SHA256SUMS"
 ```
 
-Mac 上的副本：Temporal context 在 `/Users/e1ainay/d_personal/moshi-models/temporal-v2/`，
+Mac 上的副本：全 LPBQ Temporal context 在 `/Users/e1ainay/d_personal/moshi-models/temporal-lpbq4/`
+（之前的 W8 value/down 版在 `.../temporal-v2/`），
 W8 DepFormer 在 `.../depformer_w8/`，embedding 表在 `.../frontend_table/`，O3 编译的 head 和 Mimi 在 `.../legacy-o3/`。
 
 构建并安装 App：
@@ -226,10 +234,14 @@ adb shell "LD_LIBRARY_PATH=$LIB ADSP_LIBRARY_PATH=$LIB ./moshi_graph_bench $LIB 
 
 ## 已知限制与下一步
 
-- 实时率约 2，还没到实时。每帧约 145–160 ms，其中 Temporal 占 105–125 ms，整体受权重读取带宽限制。
-  4 个 Temporal part 大小相同，但在链路里各需 23–36 ms，原因还没查清（需要逐算子 profile）。
-  要进一步减少读取字节，可以把 Temporal 的 value/down 也降到 W4（每帧约少读 1 GB，会损失一些质量）。
-- part 3（第 24–31 层）是最主要的误差来源。单独量化 part 3 时 cb0 为 96.3%，其他 part 都在 99% 以上。
-  可以考虑 part 3 全部用 W8，代价是每步约多 20 ms。
-- 没有做听感、ASR 和长音频评测。超过 1000 帧窗口后的环绕没有在真实模型上验证。
+- 实时率约 2，还没到实时。每帧约 125–140 ms，其中 Temporal 占 85–100 ms，受权重读取带宽限制：
+  - 只把带宽档从 MAX 降到 TURBO，一段从约 30 ms 变成 39–45 ms；核心电压档、HMX 投票都不影响速度。
+  - 去掉 KV Split 的 batched attention 反而更慢；KV 窗口从 999 缩到 249 也不变快（attention 与权重读取重叠）。
+  - 对照（2026-10-22，同一手机、同一计时工具，2.50 运行库）：高通官方 Qwen3-4B 的 W4 context
+    （QAIRT 2.50，O3，vtcm 8）有效带宽 32–33 GB/s，我们的 Temporal 31–32 GB/s，效率基本一致。
+    官方公布的 Galaxy S26 数字（约 28 tok/s）在这台手机上达不到；换 QAIRT 2.50 运行库也不变快。
+  - 继续提速只能减少每帧读取的字节数，代价是质量。
+- 全 LPBQ 的 Temporal 在 part 0 误差最大（单独量化时 cb0 96.9%，part 1 为 98.6%）。
+  若要找回质量，可只把 part 0 恢复为 W8 value/down，代价约每帧 6 ms。
+- 没有做 ASR 和长音频评测；只做了 3 段 held-out 的人工试听。超过 1000 帧窗口后的环绕没有在真实模型上验证。
 - context 绑定这台手机和这个 QNN runtime；换芯片或换 runtime 都要重新编译。

@@ -106,7 +106,7 @@ def main() -> None:
     parser.add_argument("--num-candidates", type=int, default=20)
     parser.add_argument("--seqmse-scope", choices=("large", "all"), default="large",
                         help="large: output/gate/up/down only; per-head q/k/v (768 tiny convs) keep min-max")
-    parser.add_argument("--weights", default="lpbq4_w8vd", choices=WEIGHTS)
+    parser.add_argument("--weights", default="lpbq4", choices=WEIGHTS)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
     device = torch.device(args.device)

@@ -1,11 +1,11 @@
-"""Quantize the 8 DepFormer codebook graphs with AIMET (int8 per-channel weights, int16 activations)
-and gate them on held-out speech against BF16 greedy tokens.
+"""Quantize the 8 DepFormer codebook graphs with AIMET (int16 activations; weights int8 per-channel,
+int4 per-channel or int4 LPBQ) and gate them on held-out speech against BF16 greedy tokens.
 
 DepFormer inputs come from moshi_temporal_capture.py: the BF16 layer-31 output goes through the
 BF16 head, whose normalized hidden and argmax text token condition the DepFormer. Scores per frame:
   chain:   each codebook is fed the previous codebook's own token and cache (what the phone runs)
   forced:  each codebook is fed the BF16 reference token and the FP32 cache built from it
-for FP32 ONNX (floor), the deployed legacy AI Hub QDQ graphs, and the new W8 QuantSim.
+for FP32 ONNX (floor), the deployed legacy AI Hub QDQ graphs, and the new QuantSim.
 Writes WORK/depformer_codebook_{k}/onnx/model.onnx plus .encodings for moshi_quantized_build.sh.
 """
 
@@ -22,7 +22,7 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import torch
-from aimet_onnx.quantsim import QuantizationSimModel, QuantScheme, load_encodings_to_sim
+from aimet_onnx.quantsim import QuantizationSimModel, QuantScheme, load_encodings_to_sim, set_lpbq_for_params
 
 from moshi_export_lm_onnx import _export
 from moshi_temporal_calibrate import load_clips
@@ -34,6 +34,19 @@ BOOKS = 8
 CACHE = [f"layer_{layer}_{kind}" for layer in range(6) for kind in ("key", "value")]
 INPUTS = ["previous_token", "temporal", *CACHE]
 OUTPUTS = ["audio_token", *(f"output_{name}" for name in CACHE)]
+
+
+def create_sim(model: onnx.ModelProto, weights: str) -> QuantizationSimModel:
+    sim = QuantizationSimModel(model, param_type="int8" if weights == "w8" else "int4", activation_type="int16",
+                               quant_scheme=QuantScheme.min_max, config_file="htp_v81", providers=cuda_providers())
+    if weights == "lpbq4":
+        four_bit = set()
+        for op in sim.connected_graph.ordered_ops:
+            weight = sim.get_op_quantizers(op)[2].get("weight") if op.type in {"Conv", "Gemm", "MatMul"} else None
+            if weight is not None and weight.bitwidth == 4:
+                four_bit.add(op.name)
+        set_lpbq_for_params(sim, bitwidth=4, block_size=64, nodes_to_include=four_bit)
+    return sim
 
 
 class StepWithoutLogits(torch.nn.Module):
@@ -93,6 +106,7 @@ def main() -> None:
     parser.add_argument("--calibration-frames", type=int, default=32, help="Evenly spaced frames per clip")
     parser.add_argument("--held-out-clips", type=int, default=8)
     parser.add_argument("--no-legacy", action="store_true", help="Skip the slow CPU legacy QDQ reference")
+    parser.add_argument("--weights", choices=("w8", "pc4", "lpbq4"), default="w8")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -135,9 +149,7 @@ def main() -> None:
         if not onnx_path.exists():
             example = [torch.from_numpy(samples[book][0][n]) for n in INPUTS]
             _export(StepWithoutLogits(copy.deepcopy(steps[book]).cpu()), tuple(example), onnx_path, INPUTS, OUTPUTS)
-        sim = QuantizationSimModel(onnx.load(str(onnx_path)), param_type="int8", activation_type="int16",
-                                   quant_scheme=QuantScheme.min_max, config_file="htp_v81",
-                                   providers=cuda_providers())
+        sim = create_sim(onnx.load(str(onnx_path)), args.weights)
         encodings = args.work_dir / name / f"{name}.encodings"
         if encodings.exists():
             load_encodings_to_sim(sim, str(encodings))
@@ -152,13 +164,13 @@ def main() -> None:
         print(json.dumps({"calibrated": name, "samples": len(samples[book]),
                           "seconds": round(time.monotonic() - start)}), flush=True)
 
-    def w8(book, feed):
+    def quantized(book, feed):
         return sessions[book].session.run(None, feed)  # QuantSim renames outputs; order is kept.
 
     def old(book, feed):
         return legacy[book].run(OUTPUTS, feed)
 
-    keys = ["fp32_chain", "w8_chain", "w8_forced"] + ([] if args.no_legacy else ["legacy_chain", "legacy_forced"])
+    keys = ["fp32_chain", "quant_chain", "quant_forced"] + ([] if args.no_legacy else ["legacy_chain", "legacy_forced"])
     results = {key: [] for key in keys}
     references = []
     for temporal, text, reference in evaluation:
@@ -168,14 +180,14 @@ def main() -> None:
             forced_caches.append(previous_caches)
             previous = np.array([text if book == 0 else reference[book - 1]], np.int64)
             _, *previous_caches = fp32(book, dict(zip(INPUTS, [previous, temporal, *previous_caches])))
-        results["w8_chain"].append(run_chain(w8, temporal, text))
-        results["w8_forced"].append(run_chain(w8, temporal, text, reference, forced_caches))
+        results["quant_chain"].append(run_chain(quantized, temporal, text))
+        results["quant_forced"].append(run_chain(quantized, temporal, text, reference, forced_caches))
         if not args.no_legacy:
             results["legacy_chain"].append(run_chain(old, temporal, text))
             results["legacy_forced"].append(run_chain(old, temporal, text, reference, forced_caches))
         references.append(reference)
     references = np.stack(references)
-    report = {"frames": len(references), "calibration_frames": len(calibration_frames)}
+    report = {"weights": args.weights, "frames": len(references), "calibration_frames": len(calibration_frames)}
     for key, tokens in results.items():
         match = np.stack(tokens) == references
         report[key] = {"all8": round(float(match.all(axis=1).mean()), 4),

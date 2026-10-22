@@ -56,7 +56,7 @@ public final class MainActivity extends Activity {
     private static final int ACCENT = Color.rgb(68, 222, 194);
     private static final int MUTED = Color.rgb(176, 193, 210);
     // Mimi + head/8 DepFormer + 4 Temporal contexts and the CPU embedding table, listed in SHA256SUMS.
-    private static final String BUNDLE = "lm-v3-dep8";
+    private static final String BUNDLE = "lm-v4-lpbq4";
     private static final String[] BUNDLE_FILES = {
         "mimi_encoder.bin", "mimi_decoder.bin", "frontend_embeddings.bin", "dlc/head.bin",
         "dlc/depformer_codebook_0.bin", "dlc/depformer_codebook_1.bin", "dlc/depformer_codebook_2.bin",
@@ -134,7 +134,7 @@ public final class MainActivity extends Activity {
 
         LinearLayout result = card(column);
         label(result, "③ 手机本地推理", 19, Color.WHITE, true);
-        label(result, "帧数填 0 跑整段；每帧 80 ms。Temporal 为 4 段 W4/W8 量化，KV 窗口 1000 帧（约 80 秒）。",
+        label(result, "帧数填 0 跑整段；每帧 80 ms。Temporal 为 4 段 LPBQ W4 量化，KV 窗口 1000 帧（约 80 秒）。",
               14, MUTED, false);
         frameLimit = new EditText(this);
         frameLimit.setInputType(InputType.TYPE_CLASS_NUMBER);
