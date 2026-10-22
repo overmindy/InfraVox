@@ -50,10 +50,9 @@
 
 ## 服务器：从 BF16 到模型包
 
-`ssh -p 40023 user@117.74.67.2`，仓库在 `/home/user/yejialei/qairt_moshi`（editable 安装）。
+在带 GPU 的 Linux 服务器上以 editable 方式安装本仓库，然后：
 
 ```sh
-cd /home/user/yejialei/qairt_moshi && git pull
 nohup bash scripts/moshi_build_all.sh > /data2/yejialei/moshi/build.log 2>&1 &
 ```
 
