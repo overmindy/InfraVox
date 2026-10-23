@@ -98,7 +98,7 @@ public final class MainActivity extends Activity {
 
     private EditText endpointField, repoField, tokenField;
     private final TextView[] endpointChoices = new TextView[3];
-    private Switch highPerformance, echoCancel, codecOnly;
+    private Switch highPerformance, echoCancel, codecOnly, textSampling;
 
     private static final class VariantViews {
         TextView status;
@@ -311,6 +311,9 @@ public final class MainActivity extends Activity {
         ui.eyebrow(runtime, "推理");
         highPerformance = ui.toggle(runtime, "HTP 高性能档", "对话期间请求 burst 性能投票，更耗电", preferences.getBoolean("high_performance", true));
         echoCancel = ui.toggle(runtime, "回声消除", "用通话模式麦克风 + AEC；外放时减少模型听到自己", preferences.getBoolean("echo_cancel", true));
+        textSampling = ui.toggle(runtime, "文本采样", "温度 0.7、top-k 25（Kyutai 默认）；关闭则贪心解码，模型容易一直沉默",
+                preferences.getBoolean("text_sampling", true));
+        textSampling.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("text_sampling", on).apply());
         codecOnly = ui.toggle(runtime, "仅编解码回环（调试）", "只跑 Mimi encoder → decoder，不跑语言模型", preferences.getBoolean("codec_only", false));
         highPerformance.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("high_performance", on).apply());
         echoCancel.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("echo_cancel", on).apply());
@@ -714,6 +717,7 @@ public final class MainActivity extends Activity {
         stopPlayer();
         ConversationSession.Config config = new ConversationSession.Config();
         config.highPerformance = highPerformance.isChecked();
+        config.textTemperature = textSampling.isChecked() ? 0.7f : 0f;
         config.echoCancel = echoCancel.isChecked();
         config.directory = sessionDir();
         try {

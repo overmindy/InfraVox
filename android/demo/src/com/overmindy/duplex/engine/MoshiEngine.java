@@ -35,10 +35,10 @@ public final class MoshiEngine implements DuplexEngine {
     }
 
     @Override
-    public void begin(boolean highPerformance) {
+    public void begin(boolean highPerformance, float textTemperature) {
         textBytes.reset();
         emittedBytes = 0;
-        MoshiNative.nativeBegin(handle, highPerformance);
+        MoshiNative.nativeBegin(handle, highPerformance, textTemperature, (int) System.nanoTime());
     }
 
     @Override

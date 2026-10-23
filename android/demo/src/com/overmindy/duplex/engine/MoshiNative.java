@@ -9,7 +9,7 @@ final class MoshiNative {
     private MoshiNative() { }
 
     static native long nativeCreate(String libraryDir, String modelDir, boolean codecOnly);
-    static native void nativeBegin(long handle, boolean highPerformance);
+    static native void nativeBegin(long handle, boolean highPerformance, float textTemperature, int seed);
     static native boolean nativeStep(long handle, short[] input, short[] output, int[] tokens);
     static native void nativeEnd(long handle, String performanceCsv);
     static native void nativeRelease(long handle);

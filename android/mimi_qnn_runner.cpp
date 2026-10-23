@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -785,10 +786,14 @@ class MoshiLm {
     runtime_.groupLeader = nullptr;
   }
 
-  void reset() {
+  // textTemperature 0 is greedy. Kyutai samples text at 0.7 with top-k 25; the quantized LM
+  // tends to stay silent forever under greedy text after its first turn.
+  void reset(float textTemperature, uint32_t seed) {
     delay_.reset();
     for (auto& part : temporal_) part->reset();
     position_ = 0;
+    textTemperature_ = textTemperature;
+    random_.seed(seed);
   }
 
   std::optional<std::array<int32_t, 9>> step(const std::array<int32_t, 8>& user) {
@@ -807,7 +812,7 @@ class MoshiLm {
     head.execute();
     getReal(head.output("temporal"), next.data(), next.size());
     getReal(head.output("text_logits"), logits_.data(), logits_.size());
-    const int32_t text = static_cast<int32_t>(std::max_element(logits_.begin(), logits_.end()) - logits_.begin());
+    const int32_t text = sampleText();
 
     // The depth cache restarts every frame and is handed from codebook to codebook; each graph
     // has its own 16-bit encodings, so the handoff requantizes unless they happen to match.
@@ -847,6 +852,20 @@ class MoshiLm {
   }
 
  private:
+  int32_t sampleText() {
+    const auto best = std::max_element(logits_.begin(), logits_.end());
+    if (textTemperature_ <= 0.0f) return static_cast<int32_t>(best - logits_.begin());
+    constexpr size_t kTopK = 25;
+    std::vector<int32_t> ids(logits_.size());
+    for (size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<int32_t>(i);
+    std::partial_sort(ids.begin(), ids.begin() + kTopK, ids.end(),
+                      [&](int32_t a, int32_t b) { return logits_[a] > logits_[b]; });
+    std::array<double, kTopK> weights{};
+    for (size_t i = 0; i < kTopK; ++i) weights[i] = std::exp((logits_[ids[i]] - *best) / textTemperature_);
+    std::discrete_distribution<size_t> pick(weights.begin(), weights.end());
+    return ids[pick(random_)];
+  }
+
   uint64_t spillFillBytes(const std::string& path) {
     MappedFile binary(path);
     QnnSystemContext_Handle_t context = nullptr;
@@ -871,6 +890,8 @@ class MoshiLm {
   std::vector<float> logits_ = std::vector<float>(32000);
   MoshiDelayRing delay_;
   int32_t position_ = 0;
+  float textTemperature_ = 0.0f;
+  std::mt19937 random_;
 };
 
 // Frame-by-frame duplex session: the app feeds one 80 ms microphone frame per step and plays
@@ -886,11 +907,11 @@ class Session {
 
   ~Session() { runtime_.endPerformanceVote(); codec_.reset(); lm_.reset(); }
 
-  void begin(bool highPerformance) {
+  void begin(bool highPerformance, float textTemperature, uint32_t seed) {
     runtime_.endPerformanceVote();
     runtime_.clearTimings();
     codec_->reset();
-    if (lm_) lm_->reset();
+    if (lm_) lm_->reset(textTemperature, seed);
     started_ = Clock::now();
     if (highPerformance) runtime_.beginPerformanceVote();
   }
@@ -934,7 +955,9 @@ void* moshiCreate(const std::string& libraryDir, const std::string& modelDirecto
   return new Session(libraryDir, modelDirectory, codecOnly);
 }
 
-void moshiBegin(void* session, bool highPerformance) { static_cast<Session*>(session)->begin(highPerformance); }
+void moshiBegin(void* session, bool highPerformance, float textTemperature, uint32_t seed) {
+  static_cast<Session*>(session)->begin(highPerformance, textTemperature, seed);
+}
 
 bool moshiStep(void* session, const int16_t* input, int16_t* pcm, int32_t* tokens) {
   return static_cast<Session*>(session)->step(input, pcm, tokens);

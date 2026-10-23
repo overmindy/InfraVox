@@ -32,8 +32,8 @@ public interface DuplexEngine {
 
     void load(Context context, File modelDir, Options options) throws Exception;
 
-    /** Resets the conversation state. */
-    void begin(boolean highPerformance);
+    /** Resets the conversation state; textTemperature 0 decodes greedily. */
+    void begin(boolean highPerformance, float textTemperature);
 
     /** Consumes one input frame; returns null while the model has no output for it yet. */
     Frame step(short[] input);

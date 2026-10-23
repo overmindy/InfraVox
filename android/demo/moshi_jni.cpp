@@ -8,7 +8,7 @@
 #include <string>
 
 void* moshiCreate(const std::string& libraryDir, const std::string& modelDirectory, bool codecOnly);
-void moshiBegin(void* session, bool highPerformance);
+void moshiBegin(void* session, bool highPerformance, float textTemperature, uint32_t seed);
 bool moshiStep(void* session, const int16_t* input, int16_t* pcm, int32_t* tokens);
 void moshiEnd(void* session, const std::string& performanceCsv);
 void moshiDestroy(void* session);
@@ -60,9 +60,10 @@ Java_com_overmindy_duplex_engine_MoshiNative_nativeCreate(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_overmindy_duplex_engine_MoshiNative_nativeBegin(JNIEnv* env, jclass, jlong handle, jboolean highPerformance) {
+Java_com_overmindy_duplex_engine_MoshiNative_nativeBegin(
+    JNIEnv* env, jclass, jlong handle, jboolean highPerformance, jfloat textTemperature, jint seed) {
   try {
-    moshiBegin(session(handle), highPerformance == JNI_TRUE);
+    moshiBegin(session(handle), highPerformance == JNI_TRUE, textTemperature, static_cast<uint32_t>(seed));
   } catch (const std::exception& error) {
     throwJava(env, error.what());
   }

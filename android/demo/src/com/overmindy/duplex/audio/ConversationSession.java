@@ -36,6 +36,7 @@ public final class ConversationSession {
     public static final class Config {
         public short[] fileInput;  // null: microphone
         public boolean highPerformance = true;
+        public float textTemperature = 0.7f;
         public boolean echoCancel = true;
         public File directory;
     }
@@ -175,7 +176,7 @@ public final class ConversationSession {
         Writer tokens = null;
         StringBuilder transcript = new StringBuilder();
         try {
-            engine.begin(config.highPerformance);
+            engine.begin(config.highPerformance, config.textTemperature);
             input = new Wav.Writer(inputWav(), rate);
             output = new Wav.Writer(outputWav(), rate);
             tokens = new BufferedWriter(new OutputStreamWriter(
