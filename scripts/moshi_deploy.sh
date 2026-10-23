@@ -52,4 +52,4 @@ adb shell "chmod 755 $M $M/dlc && chmod 644 $M/*.bin $M/*.txt $M/dlc/*.bin $M/SH
 echo "== app"
 remote cat "$MOSHI_ROOT/inputs/validation_input.wav" > "$TMP/demo.wav"
 SAMPLE_WAV=$TMP/demo.wav OUT_DIR=$TMP/apk bash "$R/android/demo/build.sh"
-adb install -r "$TMP/apk/duplex-voice.apk"
+adb install -r "$TMP/apk/infravox.apk"

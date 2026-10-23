@@ -222,7 +222,8 @@ public final class MainActivity extends Activity {
         panel.setBackgroundColor(Ui.SURFACE);
         panel.setClickable(true);
         panel.setPadding(ui.dp(12), ui.dp(18), ui.dp(12), ui.dp(12));
-        ui.text(panel, "Duplex", 22, Ui.TEXT, true).setPadding(ui.dp(8), 0, 0, ui.dp(10));
+        ui.text(panel, "InfraVox", 24, Ui.TEXT, true).setPadding(ui.dp(8), 0, 0, 0);
+        ui.text(panel, "端侧全双工语音对话", 12.5f, Ui.MUTED, false).setPadding(ui.dp(8), 0, 0, ui.dp(10));
         ui.primary(panel, "＋  新对话", () -> { openConversation(null); setDrawer(false); });
         TextView label = ui.eyebrow(panel, "历史对话");
         label.setPadding(ui.dp(8), ui.dp(18), 0, ui.dp(6));
@@ -391,7 +392,7 @@ public final class MainActivity extends Activity {
         chatList.addView(box, new LinearLayout.LayoutParams(-1, -2));
         ui.spacer(box, 48);
         ModelCatalog.Variant variant = selectedVariant();
-        TextView heading = ui.text(box, variant == null ? "Duplex" : variant.model.name, 26, Ui.TEXT, true);
+        TextView heading = ui.text(box, variant == null ? "InfraVox" : variant.model.name, 26, Ui.TEXT, true);
         heading.setGravity(Gravity.CENTER);
         TextView lead = ui.text(box, "全双工语音对话，在手机上本地运行。\n点下方按钮后直接说话，模型会边听边说，你也可以随时打断它。",
                 15, Ui.MUTED, false);
@@ -1138,14 +1139,14 @@ public final class MainActivity extends Activity {
         ioThread.execute(() -> {
             String message;
             try {
-                String prefix = "duplex-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date(meta.createdMillis));
+                String prefix = "infravox-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date(meta.createdMillis));
                 String[][] files = {{"input.wav", "audio/wav"}, {"output.wav", "audio/wav"}, {"transcript.txt", "text/plain"},
                                     {"tokens.csv", "text/csv"}, {"performance.csv", "text/csv"}};
                 for (String[] file : files) {
                     File source = new File(conversations.dir(meta.id), file[0]);
                     if (source.isFile()) saveDownload(source, prefix + "-" + file[0], file[1]);
                 }
-                message = "已保存到 Download/DuplexVoice（" + prefix + "-*）";
+                message = "已保存到 Download/InfraVox（" + prefix + "-*）";
             } catch (Exception error) {
                 message = "导出失败：" + error.getMessage();
             }
@@ -1158,7 +1159,7 @@ public final class MainActivity extends Activity {
         ContentValues values = new ContentValues();
         values.put(MediaStore.Downloads.DISPLAY_NAME, name);
         values.put(MediaStore.Downloads.MIME_TYPE, mime);
-        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/DuplexVoice");
+        values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/InfraVox");
         Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
         if (uri == null) throw new IOException("无法创建下载文件");
         try (InputStream input = new FileInputStream(source); OutputStream output = getContentResolver().openOutputStream(uri)) {

@@ -50,7 +50,13 @@
 | `android/models/catalog.json` | 所有模型和变体（文件、大小、sha256）的唯一来源，App 内置一份并可从仓库刷新 |
 | `android/demo/` | Android App（Java UI、JNI、`build.sh`） |
 
-## App（Duplex 语音）
+## App：InfraVox
+
+<img src="demo/branding/logo.svg" width="96" alt="InfraVox logo">
+
+InfraVox 是承载多个全双工语音模型的端侧底座（Infra）加语音（Vox）。图标是两组交错的声波，代表两个声音同时进行。
+母版在 `android/demo/branding/logo.svg`，
+启动器图标是同一几何的自适应图标（`android/demo/res/`）。
 
 面向多个全双工语音模型的端侧 App，主页是聊天界面，左侧抽屉里是历史对话、模型管理和设置。
 

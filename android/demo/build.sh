@@ -51,9 +51,10 @@ find "$SCRIPT_DIR/src" -name '*.java' > "$OUT/sources.txt"
 find "$OUT/classes" -name '*.class' > "$OUT/classes.txt"
 "$BUILD_TOOLS/d8" --min-api 29 --lib "$PLATFORM" --output "$OUT/dex" @"$OUT/classes.txt"
 
+"$BUILD_TOOLS/aapt2" compile --dir "$SCRIPT_DIR/res" -o "$OUT/resources.zip"
 "$BUILD_TOOLS/aapt2" link --manifest "$SCRIPT_DIR/AndroidManifest.xml" \
   -I "$PLATFORM" --min-sdk-version 29 --target-sdk-version 34 \
-  -o "$OUT/unsigned.apk"
+  -o "$OUT/unsigned.apk" "$OUT/resources.zip"
 cp "$OUT/dex/classes.dex" "$OUT/stage/classes.dex"
 (cd "$OUT/stage" && zip -q -0 -r "$OUT/unsigned.apk" classes.dex lib assets)
 "$BUILD_TOOLS/zipalign" -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
@@ -66,6 +67,6 @@ if [[ ! -f "$KEYSTORE" ]]; then
 fi
 "$BUILD_TOOLS/apksigner" sign --ks "$KEYSTORE" --ks-key-alias mimi-demo \
   --ks-pass pass:android --key-pass pass:android \
-  --out "$OUT/duplex-voice.apk" "$OUT/aligned.apk"
-"$BUILD_TOOLS/apksigner" verify "$OUT/duplex-voice.apk"
-echo "Built $OUT/duplex-voice.apk"
+  --out "$OUT/infravox.apk" "$OUT/aligned.apk"
+"$BUILD_TOOLS/apksigner" verify "$OUT/infravox.apk"
+echo "Built $OUT/infravox.apk"

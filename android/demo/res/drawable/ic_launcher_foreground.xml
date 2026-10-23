@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Two interleaved voices (blue and green bars); master artwork in branding/logo.svg. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+        android:width="108dp" android:height="108dp"
+        android:viewportWidth="108" android:viewportHeight="108">
+    <path android:strokeColor="#7B96FF" android:strokeWidth="4.6" android:strokeLineCap="round"
+          android:pathData="M26,49V59 M40,39V69 M54,34V74 M68,45V63 M82,50V58" />
+    <path android:strokeColor="#46E0A6" android:strokeWidth="4.6" android:strokeLineCap="round"
+          android:pathData="M33,49V59 M47,43V65 M61,36V72 M75,42V66" />
+</vector>

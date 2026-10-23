@@ -134,7 +134,7 @@ public final class HubDownloader {
             connection.setInstanceFollowRedirects(false);
             connection.setConnectTimeout(20_000);
             connection.setReadTimeout(60_000);
-            connection.setRequestProperty("User-Agent", "DuplexVoice-Android/1.0");
+            connection.setRequestProperty("User-Agent", "InfraVox-Android/1.0");
             connection.setRequestProperty("Accept-Encoding", "identity");
             if (offset > 0) connection.setRequestProperty("Range", "bytes=" + offset + "-");
             int code = connection.getResponseCode();
