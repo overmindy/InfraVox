@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "models": [
+    {
+      "id": "moshiko",
+      "engine": "moshi",
+      "name": "Moshi · Moshiko",
+      "publisher": "Kyutai",
+      "summary": "7B 全双工语音对话模型（英文），Mimi 24 kHz 编解码，80 ms 一帧，边听边说。",
+      "languages": [
+        "en"
+      ],
+      "license": "CC-BY-4.0",
+      "upstream": "kyutai/moshiko-pytorch-bf16",
+      "variants": [
+        {
+          "id": "moshiko-lm-v4-lpbq4-sm8850",
+          "title": "Temporal LPBQ W4 · DepFormer W8 · Mimi W8/W4",
+          "path": "moshi/moshiko-lm-v4-lpbq4-sm8850",
+          "socs": [
+            "SM8850"
+          ],
+          "htp": "v81",
+          "qairt": "2.45.0.260326",
+          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；实测 RTF≈2（每帧 125–140 ms 加调度开销），对话中延迟会逐渐累积。",
+          "files": [
+            {
+              "path": "frontend_embeddings.bin",
+              "size": 530718808,
+              "sha256": "2a2dc300998820869cd0a89e86d25f5e48753937d1f41df55b9dc1cb17d6100d"
+            },
+            {
+              "path": "mimi_encoder.bin",
+              "size": 128479232,
+              "sha256": "9fbff087226185d87ed3dc33cc8ccf8b644a34d17154a1188858d4e3c929b6c5"
+            },
+            {
+              "path": "mimi_decoder.bin",
+              "size": 53813248,
+              "sha256": "d20e273ecdb15e6d59d9e141ec96e81db4157e79116aef49ba6836ad366600c0"
+            },
+            {
+              "path": "dlc/head.bin",
+              "size": 131706880,
+              "sha256": "69d06212626ce728693bdc21dcf62dd70a4b3e2a77f63d10aa120cb28c0a1067"
+            },
+            {
+              "path": "dlc/depformer_codebook_0.bin",
+              "size": 150396928,
+              "sha256": "13b7d99126940df72757d7db16dea3578a9a143592ac5af115201ebbf749ab6f"
+            },
+            {
+              "path": "dlc/depformer_codebook_1.bin",
+              "size": 89055232,
+              "sha256": "e753db4c32e3b1c69e9162927d6e23f135d29ed2f0aa305c303dfb2486f2fee0"
+            },
+            {
+              "path": "dlc/depformer_codebook_2.bin",
+              "size": 89038848,
+              "sha256": "53fceb1e0c20a66d36854a919a77064890b79b84924ebb388ca01d9313189aeb"
+            },
+            {
+              "path": "dlc/depformer_codebook_3.bin",
+              "size": 89022464,
+              "sha256": "4f2a2f29d1433f0ecf8d4894d35a434158bb17417cc5f84b41a2cf6e99a1fa5e"
+            },
+            {
+              "path": "dlc/depformer_codebook_4.bin",
+              "size": 89026560,
+              "sha256": "75e658815ce90fb28ee73648f4917a874589370daddd30ad81f4a42efa84fdfa"
+            },
+            {
+              "path": "dlc/depformer_codebook_5.bin",
+              "size": 89022464,
+              "sha256": "290190f47716fa420dc607e3226fbec9fb4e61e9965a4fb831e8820693e32d37"
+            },
+            {
+              "path": "dlc/depformer_codebook_6.bin",
+              "size": 89030656,
+              "sha256": "cfd12a20bdfc338c2c0a19d284798803911dcc9cb486bfd2df7dfe3398bdccf4"
+            },
+            {
+              "path": "dlc/depformer_codebook_7.bin",
+              "size": 89022464,
+              "sha256": "7f76966b10d15ddc6449653462744fd7512357a0f19bcddbf7cefd8fe395affb"
+            },
+            {
+              "path": "dlc/temporal_part_0.bin",
+              "size": 859291648,
+              "sha256": "fc83d22b6e1caa027a3c12a3d456197ec9c09e9c32f4dc43310dd5f9da90bea3"
+            },
+            {
+              "path": "dlc/temporal_part_1.bin",
+              "size": 859312128,
+              "sha256": "97c8216ff9be49defee60f60b7b77bd87c84bdc7adf234eb513e2c067d982bca"
+            },
+            {
+              "path": "dlc/temporal_part_2.bin",
+              "size": 859287552,
+              "sha256": "608ef5b8fc26a1a1a6a2996224dc86e5a1eee4200b3aca84531139fe679f4cc2"
+            },
+            {
+              "path": "dlc/temporal_part_3.bin",
+              "size": 859308032,
+              "sha256": "e1b7e60f2d7e5f55981e241fb043ed83f57e39829127925dd8037fd346dc29dd"
+            },
+            {
+              "path": "text_vocab.txt",
+              "size": 296134,
+              "sha256": "3ffec0c8b77830b019735efe8844dff234a4fb24ae241cad3a8ca1475467eb6d"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -61,6 +61,7 @@ await ${pids[@]+"${pids[@]}"}
 echo "== bundle $B"
 ln -f "$W/mimi_encoder/mimi_encoder.bin" "$W/mimi_decoder/mimi_decoder.bin" "$B/"
 for name in head depformer_codebook_{0..7} temporal_part_{0..3}; do ln -f "$W/$name/$name.bin" "$B/dlc/"; done
-(cd "$B" && sha256sum frontend_embeddings.bin mimi_encoder.bin mimi_decoder.bin dlc/*.bin > SHA256SUMS)
+"$PY" "$S/moshi_text_vocab.py" --model-dir "$MOSHI_BF16" --output "$B/text_vocab.txt"
+(cd "$B" && sha256sum frontend_embeddings.bin mimi_encoder.bin mimi_decoder.bin text_vocab.txt dlc/*.bin > SHA256SUMS)
 cat "$B/SHA256SUMS"
 [ "${KEEP_WORK:-0}" = 1 ] || rm -rf "$W"

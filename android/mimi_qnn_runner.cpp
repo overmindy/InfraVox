@@ -35,8 +35,7 @@
 
 namespace {
 
-constexpr size_t kFrameSamples = 1920;
-constexpr uint32_t kSampleRate = 24000;
+constexpr size_t kFrameSamples = 1920;  // 80 ms at 24 kHz
 
 using Clock = std::chrono::steady_clock;
 double elapsedMs(Clock::time_point start) {
@@ -300,7 +299,10 @@ class Runtime {
     hasPowerConfig_ = false;
   }
 
-  void timing(const std::string& graph, const char* phase, double ms) { timings_.push_back({graph, phase, ms}); }
+  // A streaming session adds ~25 rows per frame; the cap keeps hours-long sessions bounded.
+  void timing(const std::string& graph, const char* phase, double ms) {
+    if (timings_.size() < kMaxTimings) timings_.push_back({graph, phase, ms});
+  }
 
   void clearTimings() { timings_.clear(); }
 
@@ -321,6 +323,7 @@ class Runtime {
   SharedMemory sharedMemory;
 
  private:
+  static constexpr size_t kMaxTimings = 1 << 20;
   struct Timing { std::string graph; const char* phase; double ms; };
   std::vector<Timing> timings_;
   void* backendLibrary_ = nullptr;
@@ -504,46 +507,6 @@ int16_t toPcm16(float value) {
 }
 
 uint32_t read32(const uint8_t* d) { return d[0] | d[1] << 8 | d[2] << 16 | uint32_t(d[3]) << 24; }
-uint16_t read16(const uint8_t* d) { return uint16_t(d[0] | d[1] << 8); }
-
-std::vector<int16_t> readWav(const std::string& path) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) throw std::runtime_error("Cannot open input WAV: " + path);
-  std::vector<uint8_t> file((std::istreambuf_iterator<char>(input)), {});
-  if (file.size() < 44 || std::memcmp(file.data(), "RIFF", 4) || std::memcmp(file.data() + 8, "WAVE", 4))
-    throw std::runtime_error("Expected RIFF/WAVE input");
-  bool formatSeen = false;
-  std::vector<int16_t> samples;
-  for (size_t cursor = 12; cursor + 8 <= file.size();) {
-    const uint32_t length = read32(file.data() + cursor + 4);
-    const size_t start = cursor + 8;
-    if (length > file.size() - start) throw std::runtime_error("Malformed WAV chunk");
-    if (!std::memcmp(file.data() + cursor, "fmt ", 4)) {
-      if (length < 16 || read16(file.data() + start) != 1 || read16(file.data() + start + 2) != 1 ||
-          read32(file.data() + start + 4) != kSampleRate || read16(file.data() + start + 14) != 16)
-        throw std::runtime_error("Expected 24 kHz mono PCM16 WAV");
-      formatSeen = true;
-    } else if (!std::memcmp(file.data() + cursor, "data", 4)) {
-      samples.resize(length / 2);
-      std::memcpy(samples.data(), file.data() + start, samples.size() * 2);  // Android is little-endian.
-    }
-    cursor = start + length + (length & 1);
-  }
-  if (!formatSeen || samples.empty()) throw std::runtime_error("Missing WAV fmt or data chunk");
-  return samples;
-}
-
-void writeWav(const std::string& path, const std::vector<int16_t>& samples) {
-  std::ofstream output(path, std::ios::binary);
-  const auto put32 = [&](uint32_t v) { output.write(reinterpret_cast<const char*>(&v), 4); };
-  const auto put16 = [&](uint16_t v) { output.write(reinterpret_cast<const char*>(&v), 2); };
-  const uint32_t dataBytes = static_cast<uint32_t>(samples.size() * 2);
-  output.write("RIFF", 4); put32(36 + dataBytes); output.write("WAVEfmt ", 8);
-  put32(16); put16(1); put16(1); put32(kSampleRate); put32(kSampleRate * 2); put16(2); put16(16);
-  output.write("data", 4); put32(dataBytes);
-  output.write(reinterpret_cast<const char*>(samples.data()), dataBytes);
-  if (!output) throw std::runtime_error("Failed writing output WAV: " + path);
-}
 
 // Fixed-point I/O of a QNN tensor: real = scale * (q + offset). FLOAT_32 tensors pass through.
 struct Affine {
@@ -726,11 +689,11 @@ class Codec {
     return codes;
   }
 
-  void decode(const int32_t* codes, std::vector<int16_t>& pcm) {
+  void decode(const int32_t* codes, int16_t* pcm) {
     set(decoder_.input("codes"), codes, 8 * sizeof(int32_t), QNN_DATATYPE_INT_32);
     decoder_.execute();
     const auto* audio = reinterpret_cast<const float*>(decoder_.output("audio").data());
-    for (size_t i = 0; i < kFrameSamples; ++i) pcm.push_back(toPcm16(audio[i]));
+    for (size_t i = 0; i < kFrameSamples; ++i) pcm[i] = toPcm16(audio[i]);
     checkPosition(decoder_, ++decoded_);
     decoder_.advanceState();
   }
@@ -910,119 +873,73 @@ class MoshiLm {
   int32_t position_ = 0;
 };
 
-using FrameCallback = std::function<void(size_t, size_t, double, const std::vector<int16_t>&)>;
-
+// Frame-by-frame duplex session: the app feeds one 80 ms microphone frame per step and plays
+// whatever comes back. All calls for one session come from a single thread.
 class Session {
  public:
-  Session(const std::string& libraryDir, const std::string& encoder, const std::string& decoder,
-          const std::string& lmDirectory)
+  Session(const std::string& libraryDir, const std::string& modelDirectory, bool codecOnly)
       : runtime_(libraryDir) {
-    if (!lmDirectory.empty()) lm_ = std::make_unique<MoshiLm>(runtime_, lmDirectory);
-    codec_ = std::make_unique<Codec>(runtime_, encoder, decoder);
+    if (!codecOnly) lm_ = std::make_unique<MoshiLm>(runtime_, modelDirectory);
+    codec_ = std::make_unique<Codec>(runtime_, modelDirectory + "/mimi_encoder.bin",
+                                     modelDirectory + "/mimi_decoder.bin");
   }
 
-  ~Session() { codec_.reset(); lm_.reset(); }
+  ~Session() { runtime_.endPerformanceVote(); codec_.reset(); lm_.reset(); }
 
-  size_t run(const std::string& inputWav, const std::string& outputWav, size_t frames,
-             const FrameCallback& callback, bool highPerformance) {
+  void begin(bool highPerformance) {
+    runtime_.endPerformanceVote();
     runtime_.clearTimings();
-    const auto start = Clock::now();
+    codec_->reset();
+    if (lm_) lm_->reset();
+    started_ = Clock::now();
     if (highPerformance) runtime_.beginPerformanceVote();
-    try {
-      const size_t emitted = lm_ ? runMoshi(inputWav, outputWav, frames, callback)
-                                 : runCodec(inputWav, outputWav, frames, callback);
-      runtime_.timing("pipeline", "wall_total", elapsedMs(start));
-      runtime_.endPerformanceVote();
-      runtime_.writeTimings(outputWav + ".performance.csv");
-      return emitted;
-    } catch (...) {
-      runtime_.endPerformanceVote();
-      runtime_.timing("pipeline", "wall_failed", elapsedMs(start));
-      try { runtime_.writeTimings(outputWav + ".performance.csv"); } catch (...) {}
-      throw;
+  }
+
+  // Returns whether `pcm` holds a new frame. `tokens` gets the text token (-1 in codec mode)
+  // then 8 audio codes. Moshi's first frame only primes the delay ring and returns false.
+  bool step(const int16_t* input, int16_t* pcm, int32_t* tokens) {
+    const auto start = Clock::now();
+    const auto codes = codec_->encode(input);
+    std::array<int32_t, 9> out{};
+    if (lm_) {
+      const auto generated = lm_->step(codes);
+      if (!generated) { runtime_.timing("frame", "total", elapsedMs(start)); return false; }
+      out = *generated;
+    } else {
+      out[0] = -1;
+      std::copy(codes.begin(), codes.end(), out.begin() + 1);
     }
+    codec_->decode(out.data() + 1, pcm);
+    std::copy(out.begin(), out.end(), tokens);
+    runtime_.timing("frame", "total", elapsedMs(start));
+    return true;
+  }
+
+  void end(const std::string& performanceCsv) {
+    runtime_.timing("pipeline", "wall_total", elapsedMs(started_));
+    runtime_.endPerformanceVote();
+    if (!performanceCsv.empty()) runtime_.writeTimings(performanceCsv);
   }
 
  private:
-  static std::vector<int16_t> readFrames(const std::string& path, size_t& frames, size_t minimum) {
-    auto samples = readWav(path);
-    const size_t available = samples.size() / kFrameSamples;
-    if (!frames) frames = available;
-    if (frames < minimum || frames > available || frames > 3000)
-      throw std::runtime_error("Requested frame count is outside 1..3000 complete 80 ms frames of the WAV");
-    return samples;
-  }
-
-  size_t runCodec(const std::string& inputWav, const std::string& outputWav, size_t frames,
-                  const FrameCallback& callback) {
-    const auto samples = readFrames(inputWav, frames, 1);
-    codec_->reset();
-    std::vector<int16_t> result;
-    std::ofstream codesFile(outputWav + ".codes.txt");
-    for (size_t frame = 0; frame < frames; ++frame) {
-      const auto start = Clock::now();
-      const auto codes = codec_->encode(samples.data() + frame * kFrameSamples);
-      std::vector<int16_t> chunk;
-      codec_->decode(codes.data(), chunk);
-      result.insert(result.end(), chunk.begin(), chunk.end());
-      codesFile << frame;
-      for (auto code : codes) codesFile << ',' << code;
-      codesFile << '\n';
-      if (callback) callback(frame + 1, frame + 1, elapsedMs(start), chunk);
-    }
-    if (!codesFile) throw std::runtime_error("Failed writing codes file");
-    writeWav(outputWav, result);
-    return frames;
-  }
-
-  // The first input frame only primes the delay ring, so N input frames yield N-1 output frames.
-  size_t runMoshi(const std::string& inputWav, const std::string& outputWav, size_t frames,
-                  const FrameCallback& callback) {
-    const auto samples = readFrames(inputWav, frames, 2);
-    codec_->reset();
-    lm_->reset();
-    std::vector<int16_t> result;
-    std::ofstream codes(outputWav + ".codes.txt"), text(outputWav + ".text_tokens.txt");
-    size_t emitted = 0;
-    for (size_t frame = 0; frame < frames; ++frame) {
-      const auto start = Clock::now();
-      const auto generated = lm_->step(codec_->encode(samples.data() + frame * kFrameSamples));
-      std::vector<int16_t> chunk;
-      if (generated) {
-        codec_->decode(generated->data() + 1, chunk);
-        result.insert(result.end(), chunk.begin(), chunk.end());
-        codes << emitted;
-        for (size_t i = 1; i < 9; ++i) codes << ',' << (*generated)[i];
-        codes << '\n';
-        text << emitted << ',' << (*generated)[0] << '\n';
-        ++emitted;
-      }
-      const double ms = elapsedMs(start);
-      runtime_.timing("frame", "total", ms);
-      if (callback) callback(frame + 1, emitted, ms, chunk);
-    }
-    if (!codes || !text) throw std::runtime_error("Failed writing Moshi token files");
-    writeWav(outputWav, result);
-    return emitted;
-  }
-
   Runtime runtime_;
   std::unique_ptr<MoshiLm> lm_;
   std::unique_ptr<Codec> codec_;
+  Clock::time_point started_ = Clock::now();
 };
 
 }  // namespace
 
-// An empty lmDirectory runs the Mimi encoder -> decoder loopback only.
-void* createSession(const std::string& libraryDir, const std::string& encoder,
-                    const std::string& decoder, const std::string& lmDirectory) {
-  return new Session(libraryDir, encoder, decoder, lmDirectory);
+void* moshiCreate(const std::string& libraryDir, const std::string& modelDirectory, bool codecOnly) {
+  return new Session(libraryDir, modelDirectory, codecOnly);
 }
 
-size_t runMimiCodecSessionStreaming(void* session, const std::string& inputWav, const std::string& outputWav,
-                                    size_t frames, const FrameCallback& callback, bool highPerformance) {
-  if (!session) throw std::runtime_error("Models have not been loaded");
-  return static_cast<Session*>(session)->run(inputWav, outputWav, frames, callback, highPerformance);
+void moshiBegin(void* session, bool highPerformance) { static_cast<Session*>(session)->begin(highPerformance); }
+
+bool moshiStep(void* session, const int16_t* input, int16_t* pcm, int32_t* tokens) {
+  return static_cast<Session*>(session)->step(input, pcm, tokens);
 }
 
-void destroyMimiCodecSession(void* session) { delete static_cast<Session*>(session); }
+void moshiEnd(void* session, const std::string& performanceCsv) { static_cast<Session*>(session)->end(performanceCsv); }
+
+void moshiDestroy(void* session) { delete static_cast<Session*>(session); }

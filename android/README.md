@@ -8,7 +8,7 @@
 
 | 项目 | 当前值 |
 | --- | --- |
-| 模型包 | 15 个 context + CPU embedding 表，约 5.0 GB，App 内放在 `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/<BUNDLE>` |
+| 模型包 | 15 个 context + CPU embedding 表 + 文本词表，约 4.7 GB；App 从 Hugging Face（或镜像）下载到 `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/<variant id>` |
 | 38 帧输入（3.04 s） | 暖运行 5.7–6.0 s（RTF 约 2），首段 PCM 约 0.31 s |
 | 每帧耗时 | 约 125–140 ms：Temporal 85–100、DepFormer 15–20、Mimi 13–14、head 3、frontend（CPU）0.03 |
 | Temporal 质量（8 段 held-out，1558 帧，对 BF16，teacher-forced） | 全 LPBQ W4：文本 top-1 97.95%，音频 cb0 94.4%，8 路全对 85.1% |
@@ -43,10 +43,40 @@
 | `scripts/moshi_mimi.py` | Mimi 流式 encoder/decoder 导出，并直接写出 QAIRT encodings（encoder W8，decoder LPBQ W4） |
 | `scripts/moshi_frontend_table.py` | 17 张 BF16 embedding 表导出为 `frontend_embeddings.bin` |
 | `scripts/moshi_qairt_build.sh` | 单个图：转换（经 `moshi_guard_qairt_converter.py`）→ 量化 → O3 + VTCM 8 MB 编译成 context |
-| `scripts/moshi_deploy.sh` | Mac 一键部署：从服务器流式推送模型包到手机、构建并安装 App |
-| `android/mimi_qnn_runner.cpp` | 原生运行器：加载 context、burst 性能投票、共享内存 KV、Temporal、Mimi、DepFormer |
+| `scripts/moshi_deploy.sh` | 开发用：从服务器经 ADB 推送模型包到手机、构建并安装 App |
+| `scripts/hf_publish.py` | 把一个模型变体上传到 HF 模型仓库的 main 分支，并更新 `catalog.json` |
+| `android/mimi_qnn_runner.cpp` | 原生运行器：加载 context、burst 性能投票、共享内存 KV、Temporal、Mimi、DepFormer；按帧 `begin/step/end` |
 | `android/moshi_lm_scheduler.h` | Moshi `LMGen` 的 17 路延迟环 |
+| `android/models/catalog.json` | 所有模型和变体（文件、大小、sha256）的唯一来源，App 内置一份并可从仓库刷新 |
 | `android/demo/` | Android App（Java UI、JNI、`build.sh`） |
+
+## App（Duplex 语音）
+
+面向多个全双工语音模型的端侧 App，三个页面：对话、模型、设置。
+
+- **对话**：麦克风（或按实时速度送入的演示音频 / WAV）每 80 ms 一帧进入队列，推理线程逐帧 `step`，
+  每产生一帧输出就立即播放并逐字显示文本。模型慢于实时（RTF>1）时队列变长、延迟累积，界面实时显示延迟、
+  每帧耗时、RTF 和积压帧。第一次点击停止收音并处理剩余帧，再点一次立即结束。录音、文本、tokens 和性能 CSV 可导出。
+- **模型**：读取仓库根目录的 `catalog.json`，按设备 SoC 标出可用变体；下载支持断点续传、逐文件 SHA-256 校验，
+  `SHA256SUMS` 最后写入作为完成标记。
+- **设置**：下载源（hf-mirror.com / huggingface.co / 自定义）、仓库名、私有仓库令牌、HTP 性能档、回声消除、编解码回环调试。
+
+Java 代码按层拆分（`android/demo/src/com/overmindy/duplex/`）：`engine/`（`DuplexEngine` 接口与 Moshi 实现）、
+`model/`（catalog、本地存储、下载器）、`audio/`（流式会话、WAV）、`ui/`。
+**接入新模型**：实现 `DuplexEngine`，在 `Engines` 里按 catalog 的 `engine` 字段注册，再在 `catalog.json` 加一个 model/variant。
+应用包名保持 `com.overmindy.mimicodecdemo`，以便覆盖安装后保留数据；旧版 ADB 放入的 `models/lm-v4-lpbq4` 会自动迁移。
+
+## 发布到 Hugging Face
+
+仓库布局：根目录 `catalog.json`、`README.md`，每个变体在 `<engine>/<variant id>/` 下。App 只读 `main` 分支。
+在能访问 huggingface.co 的机器上（服务器只能访问 hf-mirror，镜像不能上传）先 `hf auth login`（写权限令牌），然后：
+
+```sh
+python scripts/hf_publish.py --repo <用户名>/duplex-voice-models \
+  --variant moshiko-lm-v4-lpbq4-sm8850 --bundle-dir <本地模型包目录>
+```
+
+脚本会校验并更新 `android/models/catalog.json`（记得提交），可中断后重跑续传。
 
 ## 服务器：从 BF16 到模型包
 
@@ -78,9 +108,9 @@ Android 运行库（默认路径见 `scripts/moshi_deploy.sh` 开头），以及
 bash scripts/moshi_deploy.sh
 ```
 
-脚本部署的是 `MainActivity.BUNDLE` 指定的模型包；换成新模型包时只改这一个常量。
+脚本把服务器上的 `MOSHI_BUNDLE` 推到手机的 `models/$MOSHI_VARIANT`（catalog 里的变体 id）；正常使用时 App 直接从 HF 下载，不需要这一步。
 只能用原 keystore 覆盖安装，不要卸载，否则会丢失 App 数据。
-App 启动时按 `SHA256SUMS` 校验全部 16 个文件；文件大小和修改时间不变时跳过重新哈希。
+App 第一次加载时按 catalog 的 sha256 校验全部文件；之后文件大小和修改时间不变就跳过重新哈希。
 
 ## 关键约束
 
