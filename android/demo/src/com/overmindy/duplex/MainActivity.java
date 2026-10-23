@@ -25,6 +25,7 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
@@ -390,7 +391,10 @@ public final class MainActivity extends Activity {
         LinearLayout box = ui.column(8);
         box.setGravity(Gravity.CENTER_HORIZONTAL);
         chatList.addView(box, new LinearLayout.LayoutParams(-1, -2));
-        ui.spacer(box, 48);
+        ui.spacer(box, 36);
+        LinearLayout.LayoutParams face = new LinearLayout.LayoutParams(ui.dp(96), ui.dp(96));
+        face.bottomMargin = ui.dp(14);
+        box.addView(avatar(), face);
         ModelCatalog.Variant variant = selectedVariant();
         TextView heading = ui.text(box, variant == null ? "InfraVox" : variant.model.name, 26, Ui.TEXT, true);
         heading.setGravity(Gravity.CENTER);
@@ -445,9 +449,26 @@ public final class MainActivity extends Activity {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
         params.gravity = user ? Gravity.END : Gravity.START;
         params.topMargin = ui.dp(10);
-        if (user) params.leftMargin = ui.dp(64);
-        else params.rightMargin = ui.dp(40);
-        chatList.addView(bubble, params);
+        if (user) {
+            params.leftMargin = ui.dp(64);
+            chatList.addView(bubble, params);
+            return;
+        }
+        params.rightMargin = ui.dp(28);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams face = new LinearLayout.LayoutParams(ui.dp(36), ui.dp(36));
+        face.rightMargin = ui.dp(8);
+        row.addView(avatar(), face);
+        row.addView(bubble, new LinearLayout.LayoutParams(-2, -2));
+        chatList.addView(row, params);
+    }
+
+    private ImageView avatar() {
+        ImageView view = new ImageView(this);
+        view.setImageResource(getResources().getIdentifier("avatar_elaina", "drawable", getPackageName()));
+        view.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        return view;
     }
 
     private String[] engineChip(ModelCatalog.Variant variant) {
