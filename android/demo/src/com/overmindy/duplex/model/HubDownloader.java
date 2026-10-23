@@ -23,7 +23,7 @@ public final class HubDownloader {
     public void cancel() { cancelled = true; }
 
     public static String fetchText(HubConfig hub, String path) throws IOException {
-        HttpURLConnection connection = open(hub, hub.resolve(path), 0);
+        HttpURLConnection connection = open(hub.resolve(path), 0);
         try {
             int code = connection.getResponseCode();
             if (code != 200) throw httpError(code, path);
@@ -87,7 +87,7 @@ public final class HubDownloader {
 
     private void fetchInto(HubConfig hub, String repoPath, ModelCatalog.FileEntry entry, File partial, long offset,
                            MessageDigest digest, long base, Meter meter) throws IOException, InterruptedException {
-        HttpURLConnection connection = open(hub, hub.resolve(repoPath), offset);
+        HttpURLConnection connection = open(hub.resolve(repoPath), offset);
         try {
             int code = connection.getResponseCode();
             boolean append = code == 206;
@@ -126,9 +126,9 @@ public final class HubDownloader {
         return read;
     }
 
-    // Redirects are followed by hand so Range survives the hop to the CDN and the token never leaves the hub host.
-    private static HttpURLConnection open(HubConfig hub, String url, long offset) throws IOException {
-        URL origin = new URL(url), current = origin;
+    // Redirects are followed by hand so the Range header survives the hop to the CDN.
+    private static HttpURLConnection open(String url, long offset) throws IOException {
+        URL current = new URL(url);
         for (int hop = 0; hop < 10; hop++) {
             HttpURLConnection connection = (HttpURLConnection) current.openConnection();
             connection.setInstanceFollowRedirects(false);
@@ -137,8 +137,6 @@ public final class HubDownloader {
             connection.setRequestProperty("User-Agent", "DuplexVoice-Android/1.0");
             connection.setRequestProperty("Accept-Encoding", "identity");
             if (offset > 0) connection.setRequestProperty("Range", "bytes=" + offset + "-");
-            if (!hub.token.isEmpty() && current.getHost().equals(origin.getHost()))
-                connection.setRequestProperty("Authorization", "Bearer " + hub.token);
             int code = connection.getResponseCode();
             if (code < 300 || code >= 400 || code == 304) return connection;
             String location = connection.getHeaderField("Location");
@@ -150,7 +148,7 @@ public final class HubDownloader {
     }
 
     private static IOException httpError(int code, String path) {
-        if (code == 401 || code == 403) return new IOException("无权访问（HTTP " + code + "）：仓库可能是私有的，请在设置里填写访问令牌");
+        if (code == 401 || code == 403) return new IOException("无权访问（HTTP " + code + "）：仓库不存在或不是公开仓库");
         if (code == 404) return new IOException("仓库里找不到 " + path + "（HTTP 404），请检查仓库名");
         return new IOException("下载 " + path + " 失败：HTTP " + code);
     }

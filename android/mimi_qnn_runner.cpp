@@ -852,18 +852,26 @@ class MoshiLm {
   }
 
  private:
+  // Only "speak or stay silent" is sampled (pad versus everything else, temperature + top-k as Kyutai);
+  // the word itself is the best non-pad token, because the quantized head's tail holds junk like "<".
   int32_t sampleText() {
+    constexpr int32_t kPad = 3;
+    constexpr size_t kTopK = 25;
     const auto best = std::max_element(logits_.begin(), logits_.end());
     if (textTemperature_ <= 0.0f) return static_cast<int32_t>(best - logits_.begin());
-    constexpr size_t kTopK = 25;
     std::vector<int32_t> ids(logits_.size());
     for (size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<int32_t>(i);
     std::partial_sort(ids.begin(), ids.begin() + kTopK, ids.end(),
                       [&](int32_t a, int32_t b) { return logits_[a] > logits_[b]; });
-    std::array<double, kTopK> weights{};
-    for (size_t i = 0; i < kTopK; ++i) weights[i] = std::exp((logits_[ids[i]] - *best) / textTemperature_);
-    std::discrete_distribution<size_t> pick(weights.begin(), weights.end());
-    return ids[pick(random_)];
+    double pad = 0, total = 0;
+    int32_t word = -1;
+    for (size_t i = 0; i < kTopK; ++i) {
+      const double weight = std::exp((logits_[ids[i]] - *best) / textTemperature_);
+      total += weight;
+      if (ids[i] == kPad) pad = weight;
+      else if (word < 0) word = ids[i];
+    }
+    return std::uniform_real_distribution<double>(0, total)(random_) < pad ? kPad : word;
   }
 
   uint64_t spillFillBytes(const std::string& path) {

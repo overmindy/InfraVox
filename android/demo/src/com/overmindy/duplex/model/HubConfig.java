@@ -5,32 +5,34 @@ import android.content.SharedPreferences;
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
 
-/** Where models come from: a Hugging Face compatible endpoint (official or mirror) and a repo on its main branch. */
+/**
+ * Where models come from: a Hugging Face compatible endpoint (official or mirror) and the public model repo,
+ * always on its main branch. Downloads are anonymous; the repo is only configurable for development.
+ */
 public final class HubConfig {
     public static final String HUGGING_FACE = "https://huggingface.co";
     public static final String MIRROR = "https://hf-mirror.com";
     public static final String DEFAULT_REPO = "ELAINAy/duplex-voice-models";
     public static final String REVISION = "main";
 
-    public final String endpoint, repo, token;
+    public final String endpoint, repo;
 
-    public HubConfig(String endpoint, String repo, String token) {
+    public HubConfig(String endpoint, String repo) {
         String trimmed = endpoint.trim();
         while (trimmed.endsWith("/")) trimmed = trimmed.substring(0, trimmed.length() - 1);
         this.endpoint = trimmed;
-        this.repo = repo.trim();
-        this.token = token.trim();
+        this.repo = repo.trim().isEmpty() ? DEFAULT_REPO : repo.trim();
     }
 
     public static HubConfig load(SharedPreferences preferences) {
-        return new HubConfig(preferences.getString("hub_endpoint", MIRROR),
-                preferences.getString("hub_repo", DEFAULT_REPO), preferences.getString("hub_token", ""));
+        return new HubConfig(preferences.getString("hub_endpoint", MIRROR), preferences.getString("hub_repo", DEFAULT_REPO));
     }
 
     public void save(SharedPreferences preferences) {
-        preferences.edit().putString("hub_endpoint", endpoint).putString("hub_repo", repo)
-                .putString("hub_token", token).apply();
+        preferences.edit().putString("hub_endpoint", endpoint).putString("hub_repo", repo).remove("hub_token").apply();
     }
+
+    public boolean isDefaultRepo() { return repo.equals(DEFAULT_REPO); }
 
     public String label() {
         if (endpoint.equals(HUGGING_FACE)) return "Hugging Face";

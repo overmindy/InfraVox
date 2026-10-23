@@ -9,6 +9,8 @@ import android.media.audiofx.AcousticEchoCanceler;
 import android.os.Build;
 
 import com.overmindy.duplex.engine.DuplexEngine;
+import com.overmindy.duplex.history.Turn;
+import com.overmindy.duplex.history.TurnTracker;
 
 import java.io.BufferedWriter;
 import java.io.File;
@@ -17,6 +19,7 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -29,8 +32,8 @@ import java.util.concurrent.TimeUnit;
 public final class ConversationSession {
     public interface Listener {
         void onStats(Stats stats);
-        void onText(String delta);
-        void onFinished(Throwable error, Stats stats);
+        void onTurns(List<Turn> turns);
+        void onFinished(Throwable error, Stats stats, List<Turn> turns);
     }
 
     public static final class Config {
@@ -64,12 +67,16 @@ public final class ConversationSession {
         Captured(short[] pcm, long nanos) { this.pcm = pcm; this.nanos = nanos; }
     }
 
+    private static final int TAIL_QUIET = 25;   // 2 s of silence fed without new text ends the call
+    private static final int TAIL_MAX = 125;    // never feed more than 10 s of silence
+
     private final DuplexEngine engine;
     private final Config config;
     private final Listener listener;
     private final int frame, rate;
     private final LinkedBlockingQueue<Captured> queue = new LinkedBlockingQueue<>();
     private final Stats stats = new Stats();
+    private final TurnTracker turns = new TurnTracker();
     private volatile boolean capturing = true, captureDone, aborted;
     private volatile double inputLevel;
     private volatile Throwable captureError;
@@ -184,12 +191,15 @@ public final class ConversationSession {
             tokens.write("frame,text,codes\n");
             track = openTrack();
             final double frameMs = 1000.0 * frame / rate;
+            int tail = 0, lastText = -TAIL_QUIET;
             while (!aborted) {
                 Captured captured = queue.poll(40, TimeUnit.MILLISECONDS);
                 if (captured == null) {
-                    if (captureDone) break;
-                    publish(frameMs);
-                    continue;
+                    if (!captureDone) { publish(frameMs); continue; }
+                    // Input ended: Moshi only speaks while frames keep coming, so feed silence until it finishes its turn.
+                    if (captureError != null || tail >= TAIL_MAX || (tail >= TAIL_QUIET && stats.processed - lastText >= TAIL_QUIET)) break;
+                    captured = new Captured(new short[frame], System.nanoTime());
+                    tail++;
                 }
                 input.write(captured.pcm);
                 long start = System.nanoTime();
@@ -199,17 +209,18 @@ public final class ConversationSession {
                 stats.lastMs = ms;
                 stats.averageMs = stats.processed == 1 ? ms : stats.averageMs * 0.9 + ms * 0.1;
                 stats.latencySeconds = (System.nanoTime() - captured.nanos) / 1e9 + frameMs / 1000;
+                String text = "";
                 if (result != null) {
                     stats.emitted++;
                     writeFully(track, result.pcm);
                     output.write(result.pcm);
                     stats.outputLevel = level(result.pcm);
                     tokens.write(stats.emitted + "," + csv(result.text) + "," + join(result.codes) + "\n");
-                    if (!result.text.isEmpty()) {
-                        transcript.append(result.text);
-                        listener.onText(result.text);
-                    }
+                    text = result.text;
+                    transcript.append(text);
+                    if (!text.isEmpty()) lastText = stats.processed;
                 }
+                if (turns.onFrame(stats.processed - 1, decibels(captured.pcm), text)) listener.onTurns(turns.snapshot());
                 publish(frameMs);
             }
             if (captureError != null) throw captureError;
@@ -229,7 +240,7 @@ public final class ConversationSession {
             if (track != null) finishTrack(track, output == null ? 0 : output.samples(), aborted);
             stats.backlog = queue.size();
             queue.clear();
-            listener.onFinished(failure, stats.copy());
+            listener.onFinished(failure, stats.copy(), turns.snapshot());
         }
     }
 
@@ -277,6 +288,12 @@ public final class ConversationSession {
         }
         try { track.stop(); } catch (IllegalStateException ignored) { }
         track.release();
+    }
+
+    private static double decibels(short[] pcm) {
+        double sum = 0;
+        for (short sample : pcm) sum += (double) sample * sample;
+        return 10 * Math.log10(Math.max(sum / Math.max(1, pcm.length), 1e-3) / (32768.0 * 32768.0));
     }
 
     private static double level(short[] pcm) {

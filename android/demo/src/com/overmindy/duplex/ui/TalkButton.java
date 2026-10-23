@@ -18,9 +18,11 @@ public final class TalkButton extends View {
     private Mode mode = Mode.DISABLED;
     private String title = "开始对话", subtitle = "";
     private float input, output, shownInput, shownOutput, phase;
+    private final int sizeDp;
 
-    public TalkButton(Context context) {
+    public TalkButton(Context context, int sizeDp) {
         super(context);
+        this.sizeDp = sizeDp;
         ring.setStyle(Paint.Style.STROKE);
         label.setTextAlign(Paint.Align.CENTER);
         label.setColor(Color.WHITE);
@@ -45,13 +47,14 @@ public final class TalkButton extends View {
 
     @Override
     protected void onMeasure(int widthSpec, int heightSpec) {
-        int size = Math.round(getResources().getDisplayMetrics().density * 240);
+        int size = Math.round(getResources().getDisplayMetrics().density * sizeDp);
         setMeasuredDimension(resolveSize(size, widthSpec), size);
     }
 
     @Override
     protected void onDraw(Canvas canvas) {
-        float density = getResources().getDisplayMetrics().density;
+        // Drawing constants were tuned at 240 dp; everything scales with the requested size.
+        float density = getResources().getDisplayMetrics().density * sizeDp / 240f;
         float cx = getWidth() / 2f, cy = getHeight() / 2f;
         float core = 78 * density;
         boolean live = mode == Mode.LIVE;
@@ -79,13 +82,14 @@ public final class TalkButton extends View {
         fill.setColor(base);
         canvas.drawCircle(cx, cy, core, fill);
 
-        label.setTextSize(20 * density);
+        float text = getResources().getDisplayMetrics().density * Math.max(0.8f, sizeDp / 240f);
+        label.setTextSize(20 * text);
         label.setColor(mode == Mode.DISABLED ? Ui.MUTED : mode == Mode.IDLE ? Color.rgb(8, 12, 24) : Color.WHITE);
         caption.setColor(withAlpha(label.getColor(), 190));
-        caption.setTextSize(12.5f * density);
-        boolean two = subtitle != null && !subtitle.isEmpty();
-        canvas.drawText(title, cx, cy + (two ? -2 : 7) * density, label);
-        if (two) canvas.drawText(subtitle, cx, cy + 20 * density, caption);
+        caption.setTextSize(12.5f * text);
+        boolean two = subtitle != null && !subtitle.isEmpty() && sizeDp >= 160;
+        canvas.drawText(title, cx, cy + (two ? -2 : 7) * text, label);
+        if (two) canvas.drawText(subtitle, cx, cy + 20 * text, caption);
         if (live || mode == Mode.BUSY || Math.abs(shownInput) + Math.abs(shownOutput) > 0.01f) postInvalidateOnAnimation();
     }
 

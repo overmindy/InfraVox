@@ -1,19 +1,24 @@
 package com.overmindy.duplex;
 
 import android.Manifest;
+import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.graphics.Typeface;
+import android.graphics.Color;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.InputType;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -21,15 +26,19 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.PopupMenu;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import com.overmindy.duplex.audio.ConversationSession;
 import com.overmindy.duplex.audio.Wav;
 import com.overmindy.duplex.engine.DuplexEngine;
 import com.overmindy.duplex.engine.Engines;
+import com.overmindy.duplex.history.ConversationStore;
+import com.overmindy.duplex.history.Turn;
 import com.overmindy.duplex.model.HubConfig;
 import com.overmindy.duplex.model.HubDownloader;
 import com.overmindy.duplex.model.ModelCatalog;
@@ -43,7 +52,11 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -52,18 +65,22 @@ import java.util.concurrent.Executors;
 public final class MainActivity extends Activity {
     private static final int PICK_AUDIO = 1;
     private static final int REQUEST_MICROPHONE = 2;
+    private static final double FRAME_SECONDS = 0.08;
 
     private enum EngineState { NONE, VERIFYING, LOADING, READY, ERROR }
     private enum Source { MICROPHONE, DEMO, FILE }
+    private enum Screen { CHAT, MODELS, SETTINGS }
 
     private Ui ui;
     private SharedPreferences preferences;
     private ModelStore store;
+    private ConversationStore conversations;
     private ModelCatalog catalog;
     private HubConfig hub;
     private final String soc = Build.VERSION.SDK_INT >= 31 ? Build.SOC_MODEL : "";
+    private final Handler main = new Handler(Looper.getMainLooper());
 
-    // The engine thread owns the native model: load, every step of a session, and release.
+    // The engine thread owns the native model: load, every step of a call, and release.
     private final ExecutorService engineThread = Executors.newSingleThreadExecutor();
     private final ExecutorService ioThread = Executors.newSingleThreadExecutor();
 
@@ -71,10 +88,15 @@ public final class MainActivity extends Activity {
     private String loadedVariant;
     private EngineState engineState = EngineState.NONE;
     private String engineMessage = "";
+    private boolean startAfterLoad;
+
     private ConversationSession session;
-    private boolean hasRecording;
+    private ConversationStore.Meta current;  // null: a new, empty conversation
+    private List<Turn> turns = new ArrayList<>();
+    private ConversationSession.Stats liveStats;
     private Source source = Source.MICROPHONE;
     private MediaPlayer player;
+    private final Runnable stopPlayback = this::stopPlayer;
 
     private HubDownloader downloader;
     private String downloadingVariant;
@@ -82,22 +104,21 @@ public final class MainActivity extends Activity {
     private final Map<String, String> variantErrors = new HashMap<>();
     private final Map<String, VariantViews> variantViews = new HashMap<>();
 
-    private final View[] pages = new View[3];
-    private final TextView[] tabs = new TextView[3];
-    private TextView headerModel;
-
-    private TextView modelName, modelVariant, modelChip, modelDetail, talkHint, transcript, sessionStatus;
-    private Button modelAction, playInput, playOutput, exportButton;
+    private Screen screen = Screen.CHAT;
+    private View chatPage, modelsPage, settingsPage, bottomBar, scrim;
+    private LinearLayout drawer, drawerList, chatList;
+    private ScrollView chatScroll;
+    private TextView navButton, actionButton, title, subtitle, statusLine, sourceChip, callStats;
     private TalkButton talk;
-    private final TextView[] metrics = new TextView[4];
-    private final TextView[] sources = new TextView[3];
+    private boolean drawerOpen;
 
     private LinearLayout modelsList;
     private TextView hubSummary, hubStatus;
     private Button refreshButton;
 
-    private EditText endpointField, repoField, tokenField;
+    private EditText endpointField, repoField;
     private final TextView[] endpointChoices = new TextView[3];
+    private LinearLayout advanced;
     private Switch highPerformance, echoCancel, codecOnly, textSampling;
 
     private static final class VariantViews {
@@ -115,54 +136,78 @@ public final class MainActivity extends Activity {
         hub = HubConfig.load(preferences);
         store = new ModelStore(this, preferences);
         store.migrateLegacy();
+        conversations = new ConversationStore(this);
         try {
             catalog = store.loadCatalog();
         } catch (Exception error) {
             throw new IllegalStateException("内置模型列表损坏", error);
         }
         getWindow().setStatusBarColor(Ui.BACKGROUND);
-        getWindow().setNavigationBarColor(Ui.SURFACE);
+        getWindow().setNavigationBarColor(Ui.BACKGROUND);
         setContentView(buildShell());
         renderModels();
-        selectTab(store.status(selectedVariant()).state == ModelStore.State.READY ? 0 : 1);
+        showScreen(Screen.CHAT);
         refreshAll();
     }
 
-    // ---------------------------------------------------------------- layout
+    // ---------------------------------------------------------------- shell, drawer, navigation
 
     private View buildShell() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
+        FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Ui.BACKGROUND);
 
-        LinearLayout header = ui.column(0);
-        header.setPadding(ui.dp(20), ui.dp(18), ui.dp(20), ui.dp(6));
-        ui.text(header, "Duplex", 26, Ui.TEXT, true);
-        headerModel = ui.text(header, "", 13, Ui.MUTED, false);
-        root.addView(header);
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+        root.addView(column, new FrameLayout.LayoutParams(-1, -1));
+
+        LinearLayout bar = ui.row();
+        bar.setPadding(ui.dp(8), ui.dp(10), ui.dp(8), ui.dp(6));
+        navButton = iconButton(bar, "☰", this::onNav);
+        LinearLayout titles = ui.column(0);
+        titles.setPadding(ui.dp(6), 0, ui.dp(6), 0);
+        title = ui.text(titles, "", 18, Ui.TEXT, true);
+        title.setSingleLine(true);
+        title.setEllipsize(TextUtils.TruncateAt.END);
+        subtitle = ui.text(titles, "", 12.5f, Ui.MUTED, false);
+        subtitle.setSingleLine(true);
+        subtitle.setEllipsize(TextUtils.TruncateAt.END);
+        bar.addView(titles, new LinearLayout.LayoutParams(0, -2, 1));
+        actionButton = iconButton(bar, "＋", this::onAction);
+        column.addView(bar);
+
+        statusLine = ui.text(column, "", 12.5f, Ui.LIVE, false);
+        statusLine.setGravity(Gravity.CENTER);
+        statusLine.setPadding(ui.dp(16), ui.dp(6), ui.dp(16), ui.dp(6));
+        statusLine.setBackgroundColor(Color.argb(28, 64, 220, 160));
 
         FrameLayout content = new FrameLayout(this);
-        pages[0] = scroll(buildChatPage());
-        pages[1] = scroll(buildModelsPage());
-        pages[2] = scroll(buildSettingsPage());
-        for (View page : pages) content.addView(page, new FrameLayout.LayoutParams(-1, -1));
-        root.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
+        chatPage = buildChatPage();
+        modelsPage = scroll(buildModelsPage());
+        settingsPage = scroll(buildSettingsPage());
+        for (View page : new View[]{chatPage, modelsPage, settingsPage}) content.addView(page, new FrameLayout.LayoutParams(-1, -1));
+        column.addView(content, new LinearLayout.LayoutParams(-1, 0, 1));
+        bottomBar = buildBottomBar();
+        column.addView(bottomBar);
 
-        LinearLayout nav = ui.row();
-        nav.setBackgroundColor(Ui.SURFACE);
-        nav.setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(10));
-        String[] titles = {"对话", "模型", "设置"};
-        for (int i = 0; i < 3; i++) {
-            final int index = i;
-            TextView tab = ui.text(null, titles[i], 15, Ui.MUTED, true);
-            tab.setGravity(Gravity.CENTER);
-            tab.setPadding(0, ui.dp(10), 0, ui.dp(10));
-            tab.setOnClickListener(v -> selectTab(index));
-            nav.addView(tab, new LinearLayout.LayoutParams(0, -2, 1));
-            tabs[i] = tab;
-        }
-        root.addView(nav);
+        scrim = new View(this);
+        scrim.setBackgroundColor(Color.argb(150, 0, 0, 0));
+        scrim.setAlpha(0f);
+        scrim.setVisibility(View.GONE);
+        scrim.setOnClickListener(v -> setDrawer(false));
+        root.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
+        drawer = buildDrawer();
+        root.addView(drawer, new FrameLayout.LayoutParams(ui.dp(300), -1, Gravity.START));
+        drawer.setTranslationX(-ui.dp(300));
         return root;
+    }
+
+    private TextView iconButton(LinearLayout parent, String glyph, Runnable action) {
+        TextView view = ui.text(parent, glyph, 22, Ui.TEXT, false);
+        view.setGravity(Gravity.CENTER);
+        view.setBackground(ui.pressable(Ui.rounded(Color.TRANSPARENT, ui.dp(22)), ui.dp(22)));
+        view.setOnClickListener(v -> action.run());
+        view.setLayoutParams(new LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)));
+        return view;
     }
 
     private ScrollView scroll(View child) {
@@ -172,170 +217,526 @@ public final class MainActivity extends Activity {
         return scroll;
     }
 
-    private void selectTab(int index) {
-        for (int i = 0; i < 3; i++) {
-            pages[i].setVisibility(i == index ? View.VISIBLE : View.GONE);
-            tabs[i].setTextColor(i == index ? Ui.TEXT : Ui.MUTED);
-            tabs[i].setBackground(i == index ? Ui.rounded(Ui.SURFACE_HIGH, ui.dp(12)) : null);
+    private LinearLayout buildDrawer() {
+        LinearLayout panel = ui.column(0);
+        panel.setBackgroundColor(Ui.SURFACE);
+        panel.setClickable(true);
+        panel.setPadding(ui.dp(12), ui.dp(18), ui.dp(12), ui.dp(12));
+        ui.text(panel, "Duplex", 22, Ui.TEXT, true).setPadding(ui.dp(8), 0, 0, ui.dp(10));
+        ui.primary(panel, "＋  新对话", () -> { openConversation(null); setDrawer(false); });
+        TextView label = ui.eyebrow(panel, "历史对话");
+        label.setPadding(ui.dp(8), ui.dp(18), 0, ui.dp(6));
+        drawerList = ui.column(0);
+        ScrollView list = new ScrollView(this);
+        list.addView(drawerList);
+        panel.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
+        View divider = new View(this);
+        divider.setBackgroundColor(Ui.OUTLINE);
+        panel.addView(divider, new LinearLayout.LayoutParams(-1, 1));
+        drawerRow(panel, "模型管理", null, () -> { showScreen(Screen.MODELS); setDrawer(false); });
+        drawerRow(panel, "设置", null, () -> { showScreen(Screen.SETTINGS); setDrawer(false); });
+        return panel;
+    }
+
+    private TextView drawerRow(LinearLayout parent, String text, String detail, Runnable action) {
+        TextView row = ui.text(parent, detail == null ? text : text + "\n" + detail, 15, Ui.TEXT, false);
+        row.setPadding(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12));
+        row.setBackground(ui.pressable(Ui.rounded(Color.TRANSPARENT, ui.dp(12)), ui.dp(12)));
+        row.setOnClickListener(v -> action.run());
+        return row;
+    }
+
+    private void renderDrawer() {
+        drawerList.removeAllViews();
+        List<ConversationStore.Meta> metas = conversations.list();
+        if (metas.isEmpty()) {
+            ui.text(drawerList, "还没有对话。", 14, Ui.MUTED, false).setPadding(ui.dp(12), ui.dp(8), 0, 0);
+            return;
+        }
+        SimpleDateFormat format = new SimpleDateFormat("M月d日 HH:mm", Locale.CHINA);
+        for (ConversationStore.Meta meta : metas) {
+            String name = meta.title.isEmpty() ? "语音对话" : meta.title;
+            String detail = format.format(new Date(meta.createdMillis)) + String.format(Locale.US, " · %.0f 秒", meta.seconds);
+            TextView row = drawerRow(drawerList, name, detail, () -> { openConversation(meta); setDrawer(false); });
+            row.setSingleLine(false);
+            row.setMaxLines(2);
+            row.setEllipsize(TextUtils.TruncateAt.END);
+            if (current != null && current.id.equals(meta.id)) row.setBackground(Ui.rounded(Ui.SURFACE_HIGH, ui.dp(12)));
+            row.setOnLongClickListener(v -> { confirmDelete(meta); return true; });
         }
     }
+
+    private void setDrawer(boolean open) {
+        if (open && session != null) { toast("通话中不能切换对话"); return; }
+        drawerOpen = open;
+        if (open) { renderDrawer(); scrim.setVisibility(View.VISIBLE); }
+        float from = drawer.getTranslationX(), to = open ? 0 : -drawer.getWidth();
+        ValueAnimator animator = ValueAnimator.ofFloat(from, to).setDuration(220);
+        animator.addUpdateListener(a -> {
+            float x = (float) a.getAnimatedValue();
+            drawer.setTranslationX(x);
+            scrim.setAlpha(1 + x / Math.max(1, drawer.getWidth()));
+            if (!open && x <= to) scrim.setVisibility(View.GONE);
+        });
+        animator.start();
+    }
+
+    private void showScreen(Screen next) {
+        screen = next;
+        chatPage.setVisibility(next == Screen.CHAT ? View.VISIBLE : View.GONE);
+        modelsPage.setVisibility(next == Screen.MODELS ? View.VISIBLE : View.GONE);
+        settingsPage.setVisibility(next == Screen.SETTINGS ? View.VISIBLE : View.GONE);
+        bottomBar.setVisibility(next == Screen.CHAT ? View.VISIBLE : View.GONE);
+        navButton.setText(next == Screen.CHAT ? "☰" : "←");
+        refreshAll();
+    }
+
+    private void onNav() {
+        if (screen != Screen.CHAT) showScreen(Screen.CHAT);
+        else setDrawer(!drawerOpen);
+    }
+
+    private void onAction() {
+        if (screen != Screen.CHAT || session != null) return;
+        if (current == null) return;
+        PopupMenu menu = new PopupMenu(this, actionButton);
+        menu.getMenu().add(0, 1, 0, "新对话");
+        menu.getMenu().add(0, 2, 1, "导出音频与文本");
+        menu.getMenu().add(0, 3, 2, "删除此对话");
+        menu.setOnMenuItemClickListener(item -> {
+            if (item.getItemId() == 1) openConversation(null);
+            if (item.getItemId() == 2) exportConversation(current);
+            if (item.getItemId() == 3) confirmDelete(current);
+            return true;
+        });
+        menu.show();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (drawerOpen) setDrawer(false);
+        else if (screen != Screen.CHAT) showScreen(Screen.CHAT);
+        else super.onBackPressed();
+    }
+
+    // ---------------------------------------------------------------- chat
 
     private View buildChatPage() {
-        LinearLayout page = ui.column(16);
-        page.setPadding(ui.dp(16), 0, ui.dp(16), ui.dp(24));
+        chatScroll = new ScrollView(this);
+        chatScroll.setFillViewport(true);
+        chatList = ui.column(0);
+        chatList.setPadding(ui.dp(14), ui.dp(8), ui.dp(14), ui.dp(16));
+        chatScroll.addView(chatList);
+        return chatScroll;
+    }
 
-        LinearLayout modelCard = ui.card(page);
+    private View buildBottomBar() {
+        LinearLayout bar = ui.row();
+        bar.setPadding(ui.dp(14), ui.dp(8), ui.dp(14), ui.dp(12));
+        bar.setBackgroundColor(Ui.BACKGROUND);
+        sourceChip = ui.chip(null, "", Ui.TEXT);
+        sourceChip.setTextSize(13);
+        sourceChip.setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(8));
+        sourceChip.setOnClickListener(v -> chooseSourceMenu());
+        LinearLayout left = ui.row();
+        left.addView(sourceChip);
+        bar.addView(left, new LinearLayout.LayoutParams(0, -2, 1));
+        talk = new TalkButton(this, 96);
+        talk.setOnClickListener(v -> onTalk());
+        bar.addView(talk, new LinearLayout.LayoutParams(ui.dp(110), -2));
+        callStats = ui.text(null, "", 12, Ui.MUTED, false);
+        callStats.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        bar.addView(callStats, new LinearLayout.LayoutParams(0, -2, 1));
+        return bar;
+    }
+
+    private void openConversation(ConversationStore.Meta meta) {
+        if (session != null) return;
+        stopPlayer();
+        current = meta;
+        turns = meta == null ? new ArrayList<>() : conversations.turns(meta.id);
+        liveStats = null;
+        renderChat();
+        refreshAll();
+    }
+
+    private void renderChat() {
+        chatList.removeAllViews();
+        if (turns.isEmpty() && session == null) {
+            renderEmptyState();
+            return;
+        }
+        boolean live = session != null;
+        for (Turn turn : turns) renderBubble(turn, live);
+        if (live && turns.isEmpty()) {
+            TextView waiting = ui.text(chatList, "正在聆听…直接说话，模型会边听边说。", 14, Ui.MUTED, false);
+            waiting.setGravity(Gravity.CENTER);
+            waiting.setPadding(0, ui.dp(40), 0, 0);
+        }
+        if (!live && current != null) {
+            String summary = String.format(Locale.US, "通话 %.1f 秒 · 平均每帧 %.0f ms（RTF %.2f）· %s",
+                    current.seconds, current.averageMs, current.averageMs / (FRAME_SECONDS * 1000), current.modelName);
+            TextView footer = ui.text(chatList, summary, 12, Ui.MUTED, false);
+            footer.setGravity(Gravity.CENTER);
+            footer.setPadding(0, ui.dp(18), 0, ui.dp(4));
+            TextView hint = ui.text(chatList, "模型不会记住上一通对话；点下方按钮开始一通新的对话。", 12, Ui.MUTED, false);
+            hint.setGravity(Gravity.CENTER);
+        }
+        chatScroll.post(() -> chatScroll.fullScroll(View.FOCUS_DOWN));
+    }
+
+    private void renderEmptyState() {
+        LinearLayout box = ui.column(8);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        chatList.addView(box, new LinearLayout.LayoutParams(-1, -2));
+        ui.spacer(box, 48);
+        ModelCatalog.Variant variant = selectedVariant();
+        TextView heading = ui.text(box, variant == null ? "Duplex" : variant.model.name, 26, Ui.TEXT, true);
+        heading.setGravity(Gravity.CENTER);
+        TextView lead = ui.text(box, "全双工语音对话，在手机上本地运行。\n点下方按钮后直接说话，模型会边听边说，你也可以随时打断它。",
+                15, Ui.MUTED, false);
+        lead.setGravity(Gravity.CENTER);
+        lead.setPadding(0, ui.dp(8), 0, ui.dp(20));
+        if (variant == null) return;
+
+        LinearLayout card = ui.card(box);
         LinearLayout top = ui.row();
         LinearLayout names = ui.column(0);
-        ui.eyebrow(names, "当前模型");
-        modelName = ui.text(names, "", 18, Ui.TEXT, true);
-        modelVariant = ui.text(names, "", 13, Ui.MUTED, false);
+        ui.text(names, variant.title, 14, Ui.TEXT, true);
+        ui.text(names, Ui.bytes(variant.totalBytes()) + (variant.model.languages.isEmpty() ? "" : " · " + String.join("/", variant.model.languages)),
+                12, Ui.MUTED, false);
         top.addView(names, new LinearLayout.LayoutParams(0, -2, 1));
-        modelChip = ui.chip(top, "", Ui.MUTED);
-        modelCard.addView(top);
-        modelDetail = ui.text(modelCard, "", 13, Ui.MUTED, false);
-        modelDetail.setPadding(0, ui.dp(8), 0, 0);
-        modelAction = ui.primary(modelCard, "加载模型", this::onModelAction);
-
-        LinearLayout stage = ui.card(page);
-        stage.setGravity(Gravity.CENTER_HORIZONTAL);
-        talk = new TalkButton(this);
-        talk.setOnClickListener(v -> onTalk());
-        stage.addView(talk, new LinearLayout.LayoutParams(-1, -2));
-        talkHint = ui.text(stage, "", 13, Ui.MUTED, false);
-        talkHint.setGravity(Gravity.CENTER);
-
-        LinearLayout sourceRow = ui.row();
-        sourceRow.setBackground(Ui.rounded(Ui.SURFACE_HIGH, ui.dp(14)));
-        sourceRow.setPadding(ui.dp(4), ui.dp(4), ui.dp(4), ui.dp(4));
-        String[] labels = {"麦克风", "演示音频", "WAV 文件"};
-        for (int i = 0; i < 3; i++) {
-            final Source value = Source.values()[i];
-            TextView option = ui.text(null, labels[i], 14, Ui.MUTED, true);
-            option.setGravity(Gravity.CENTER);
-            option.setPadding(0, ui.dp(9), 0, ui.dp(9));
-            option.setOnClickListener(v -> chooseSource(value));
-            sourceRow.addView(option, new LinearLayout.LayoutParams(0, -2, 1));
-            sources[i] = option;
+        String[] chip = engineChip(variant);
+        ui.chip(top, chip[0], Integer.parseInt(chip[1]));
+        card.addView(top);
+        if (!engineMessage.isEmpty()) {
+            TextView message = ui.text(card, engineMessage, 13, engineState == EngineState.ERROR ? Ui.ERROR : Ui.MUTED, false);
+            message.setPadding(0, ui.dp(8), 0, 0);
         }
-        LinearLayout.LayoutParams sourceParams = new LinearLayout.LayoutParams(-1, -2);
-        sourceParams.topMargin = ui.dp(14);
-        stage.addView(sourceRow, sourceParams);
+        ModelStore.State state = store.status(variant).state;
+        if (state != ModelStore.State.READY) {
+            ui.primary(card, "下载模型（" + Ui.bytes(variant.totalBytes()) + "）", () -> showScreen(Screen.MODELS));
+        } else if (engineState != EngineState.READY && !engineBusy()) {
+            ui.secondary(card, "预先加载模型", this::onLoadModel);
+        }
+    }
 
-        LinearLayout grid = ui.card(page);
-        ui.eyebrow(grid, "实时指标");
-        String[] names2 = {"端到端延迟", "每帧耗时", "实时率 RTF", "积压帧"};
-        for (int r = 0; r < 2; r++) {
-            LinearLayout row = ui.row();
-            for (int c = 0; c < 2; c++) {
-                int i = r * 2 + c;
-                LinearLayout tile = ui.column(12);
-                tile.setBackground(Ui.rounded(Ui.SURFACE_HIGH, ui.dp(14)));
-                metrics[i] = ui.text(tile, "—", 22, Ui.TEXT, true);
-                metrics[i].setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-                ui.text(tile, names2[i], 12, Ui.MUTED, false);
-                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
-                params.setMargins(c == 0 ? 0 : ui.dp(5), ui.dp(5), c == 0 ? ui.dp(5) : 0, ui.dp(5));
-                row.addView(tile, params);
+    private void renderBubble(Turn turn, boolean live) {
+        boolean user = turn.role == Turn.Role.USER;
+        double seconds = (turn.endFrame - turn.startFrame + 1) * FRAME_SECONDS;
+        LinearLayout bubble = ui.column(0);
+        bubble.setPadding(ui.dp(14), ui.dp(10), ui.dp(14), ui.dp(10));
+        bubble.setBackground(user ? Ui.rounded(Color.rgb(37, 49, 92), ui.dp(18)) : Ui.rounded(Ui.SURFACE_HIGH, ui.dp(18)));
+        if (user) {
+            ui.text(bubble, String.format(Locale.US, "🎤  你的语音 · %.1f 秒", seconds), 15, Ui.TEXT, false);
+        } else {
+            ui.text(bubble, turn.text.trim().isEmpty() ? "…" : turn.text.trim(), 16.5f, Ui.TEXT, false);
+        }
+        if (!live && current != null) {
+            File dir = conversations.dir(current.id);
+            // Output frame k answers input frame k + 1 (the first input frame only primes the model).
+            double start = user ? turn.startFrame * FRAME_SECONDS : Math.max(0, turn.startFrame - 1) * FRAME_SECONDS;
+            double length = seconds + (user ? 0.1 : 0.5);
+            TextView play = ui.text(bubble, "▶ 播放", 13, Ui.ACCENT, true);
+            play.setPadding(0, ui.dp(6), 0, 0);
+            play.setOnClickListener(v -> playSegment(new File(dir, user ? "input.wav" : "output.wav"), start, length));
+        }
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
+        params.gravity = user ? Gravity.END : Gravity.START;
+        params.topMargin = ui.dp(10);
+        if (user) params.leftMargin = ui.dp(64);
+        else params.rightMargin = ui.dp(40);
+        chatList.addView(bubble, params);
+    }
+
+    private String[] engineChip(ModelCatalog.Variant variant) {
+        boolean loaded = variant.id.equals(loadedVariant) && engineState == EngineState.READY;
+        if (engineBusy()) return new String[]{engineState == EngineState.VERIFYING ? "校验中" : "加载中", String.valueOf(Ui.WARN)};
+        if (loaded) return new String[]{"已就绪", String.valueOf(Ui.LIVE)};
+        if (engineState == EngineState.ERROR) return new String[]{"出错", String.valueOf(Ui.ERROR)};
+        if (store.status(variant).state == ModelStore.State.READY) return new String[]{"未加载", String.valueOf(Ui.ACCENT)};
+        return new String[]{"未下载", String.valueOf(Ui.MUTED)};
+    }
+
+    private void chooseSourceMenu() {
+        if (session != null) return;
+        PopupMenu menu = new PopupMenu(this, sourceChip);
+        menu.getMenu().add(0, 0, 0, "🎤 麦克风");
+        if (hasDemo()) menu.getMenu().add(0, 1, 1, "♪ 演示音频");
+        menu.getMenu().add(0, 2, 2, "📄 选择 WAV 文件（24 kHz 单声道）");
+        menu.setOnMenuItemClickListener(item -> {
+            if (item.getItemId() == 2) {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.setType("audio/*");
+                startActivityForResult(intent, PICK_AUDIO);
+            } else {
+                source = item.getItemId() == 0 ? Source.MICROPHONE : Source.DEMO;
+                refreshAll();
             }
-            grid.addView(row);
-        }
-        sessionStatus = ui.text(grid, "", 13, Ui.MUTED, false);
-        sessionStatus.setPadding(0, ui.dp(6), 0, 0);
-
-        LinearLayout reply = ui.card(page);
-        ui.eyebrow(reply, "模型回复（文本流）");
-        transcript = ui.text(reply, "开始对话后，这里会逐字显示模型说出的内容。", 17, Ui.MUTED, false);
-        transcript.setTextIsSelectable(true);
-
-        LinearLayout record = ui.card(page);
-        ui.eyebrow(record, "本次对话录音");
-        LinearLayout buttons = ui.buttonRow(record);
-        playInput = ui.secondary(buttons, "▶ 我的输入", () -> play(new File(sessionDir(), "input.wav")));
-        ui.gap(buttons);
-        playOutput = ui.secondary(buttons, "▶ 模型输出", () -> play(new File(sessionDir(), "output.wav")));
-        exportButton = ui.secondary(record, "导出音频、文本与性能数据到下载目录", this::exportSession);
-        hasRecording = new File(sessionDir(), "output.wav").isFile();
-        return page;
-    }
-
-    private View buildModelsPage() {
-        LinearLayout page = ui.column(16);
-        page.setPadding(ui.dp(16), 0, ui.dp(16), ui.dp(24));
-        LinearLayout hubCard = ui.card(page);
-        ui.eyebrow(hubCard, "模型仓库");
-        hubSummary = ui.text(hubCard, "", 14, Ui.TEXT, false);
-        hubStatus = ui.text(hubCard, "", 13, Ui.MUTED, false);
-        hubStatus.setPadding(0, ui.dp(4), 0, 0);
-        refreshButton = ui.secondary(hubCard, "从仓库刷新模型列表", this::refreshCatalog);
-        modelsList = ui.column(0);
-        page.addView(modelsList);
-        return page;
-    }
-
-    private View buildSettingsPage() {
-        LinearLayout page = ui.column(16);
-        page.setPadding(ui.dp(16), 0, ui.dp(16), ui.dp(24));
-
-        LinearLayout source = ui.card(page);
-        ui.eyebrow(source, "下载源");
-        LinearLayout choices = ui.row();
-        String[] titles = {"HF 镜像", "Hugging Face", "自定义"};
-        for (int i = 0; i < 3; i++) {
-            final int index = i;
-            TextView option = ui.chip(choices, titles[i], Ui.MUTED);
-            option.setTextSize(14);
-            option.setGravity(Gravity.CENTER);
-            option.setPadding(0, ui.dp(9), 0, ui.dp(9));
-            option.setOnClickListener(v -> chooseEndpoint(index));
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
-            params.setMargins(i == 0 ? 0 : ui.dp(4), 0, i == 2 ? 0 : ui.dp(4), 0);
-            choices.removeView(option);
-            choices.addView(option, params);
-            endpointChoices[i] = option;
-        }
-        source.addView(choices);
-        endpointField = ui.field(source, "https://your-mirror.example.com", hub.endpoint);
-        endpointField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        ui.text(source, "国内网络建议用 hf-mirror.com；所有模型都从仓库的 main 分支下载。", 12, Ui.MUTED, false)
-                .setPadding(0, ui.dp(8), 0, 0);
-
-        LinearLayout repo = ui.card(page);
-        ui.eyebrow(repo, "模型仓库");
-        repoField = ui.field(repo, "用户名/仓库名", hub.repo);
-        tokenField = ui.field(repo, "访问令牌（仅私有仓库需要）", hub.token);
-        tokenField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        ui.primary(repo, "保存并刷新模型列表", this::saveHub);
-
-        LinearLayout runtime = ui.card(page);
-        ui.eyebrow(runtime, "推理");
-        highPerformance = ui.toggle(runtime, "HTP 高性能档", "对话期间请求 burst 性能投票，更耗电", preferences.getBoolean("high_performance", true));
-        echoCancel = ui.toggle(runtime, "回声消除", "用通话模式麦克风 + AEC；外放时减少模型听到自己", preferences.getBoolean("echo_cancel", true));
-        textSampling = ui.toggle(runtime, "文本采样", "温度 0.7、top-k 25（Kyutai 默认）；关闭则贪心解码，模型容易一直沉默",
-                preferences.getBoolean("text_sampling", true));
-        textSampling.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("text_sampling", on).apply());
-        codecOnly = ui.toggle(runtime, "仅编解码回环（调试）", "只跑 Mimi encoder → decoder，不跑语言模型", preferences.getBoolean("codec_only", false));
-        highPerformance.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("high_performance", on).apply());
-        echoCancel.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("echo_cancel", on).apply());
-        codecOnly.setOnCheckedChangeListener((b, on) -> {
-            preferences.edit().putBoolean("codec_only", on).apply();
-            if (session == null) releaseEngine("模式已切换，请重新加载");
+            return true;
         });
-
-        LinearLayout about = ui.card(page);
-        ui.eyebrow(about, "关于");
-        String version;
-        try {
-            version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
-        } catch (PackageManager.NameNotFoundException error) {
-            version = "?";
-        }
-        ui.text(about, "版本 " + version + "\n设备 SoC：" + (soc.isEmpty() ? "未知" : soc)
-                + "\n模型目录：" + store.root().getAbsolutePath(), 13, Ui.MUTED, false);
-        return page;
+        menu.show();
     }
 
-    // ---------------------------------------------------------------- models
+    @Override
+    protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != PICK_AUDIO || result != RESULT_OK || data == null || data.getData() == null) return;
+        Uri uri = data.getData();
+        ioThread.execute(() -> {
+            File target = pickedFile();
+            String message;
+            try (InputStream input = getContentResolver().openInputStream(uri);
+                 OutputStream output = new FileOutputStream(target)) {
+                if (input == null) throw new IOException("无法读取");
+                byte[] buffer = new byte[1 << 16];
+                int count;
+                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+                output.close();
+                try (InputStream check = new FileInputStream(target)) {
+                    short[] samples = Wav.readMono16(check, 24_000);
+                    message = String.format(Locale.US, "已选择 WAV：%.1f 秒，会按实时速度送入模型", samples.length / 24_000.0);
+                }
+            } catch (Exception error) {
+                target.delete();
+                message = "无法使用此文件：" + error.getMessage();
+            }
+            final String status = message;
+            runOnUiThread(() -> {
+                if (pickedFile().isFile()) source = Source.FILE;
+                toast(status);
+                refreshAll();
+            });
+        });
+    }
+
+    private void onTalk() {
+        if (session != null) {
+            if (session.isDraining()) session.abort();
+            else session.stopInput();
+            refreshAll();
+            return;
+        }
+        ModelCatalog.Variant variant = selectedVariant();
+        if (variant == null || store.status(variant).state != ModelStore.State.READY) { showScreen(Screen.MODELS); return; }
+        if (source == Source.MICROPHONE
+                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_MICROPHONE);
+            return;
+        }
+        if (engineState == EngineState.READY && engine != null && variant.id.equals(loadedVariant)) startSession();
+        else if (!engineBusy()) { startAfterLoad = true; loadEngine(variant); }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request != REQUEST_MICROPHONE) return;
+        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) onTalk();
+        else toast("需要麦克风权限；也可以在左下角改用演示音频或 WAV 文件");
+    }
+
+    private void startSession() {
+        if (session != null || engine == null) return;
+        stopPlayer();
+        ModelCatalog.Variant variant = selectedVariant();
+        ConversationStore.Meta meta = conversations.create(variant.model.name, variant.id);
+        ConversationSession.Config config = new ConversationSession.Config();
+        config.highPerformance = highPerformance.isChecked();
+        config.echoCancel = echoCancel.isChecked();
+        config.textTemperature = textSampling.isChecked() ? 0.7f : 0f;
+        config.directory = conversations.dir(meta.id);
+        try {
+            if (source == Source.DEMO) {
+                try (InputStream input = getAssets().open("demo.wav")) { config.fileInput = Wav.readMono16(input, engine.sampleRate()); }
+            } else if (source == Source.FILE) {
+                try (InputStream input = new FileInputStream(pickedFile())) { config.fileInput = Wav.readMono16(input, engine.sampleRate()); }
+            }
+        } catch (IOException error) {
+            conversations.delete(meta.id);
+            toast("读取音频失败：" + error.getMessage());
+            return;
+        }
+        current = meta;
+        turns = new ArrayList<>();
+        liveStats = null;
+        session = new ConversationSession(engine, config, new ConversationSession.Listener() {
+            @Override public void onStats(ConversationSession.Stats stats) { runOnUiThread(() -> showStats(stats)); }
+
+            @Override public void onTurns(List<Turn> snapshot) { runOnUiThread(() -> { turns = snapshot; renderChat(); }); }
+
+            @Override
+            public void onFinished(Throwable error, ConversationSession.Stats stats, List<Turn> snapshot) {
+                runOnUiThread(() -> finishSession(meta, error, stats, snapshot));
+            }
+        });
+        session.start(engineThread);
+        renderChat();
+        refreshAll();
+    }
+
+    private void finishSession(ConversationStore.Meta meta, Throwable error, ConversationSession.Stats stats, List<Turn> snapshot) {
+        session = null;
+        turns = snapshot;
+        liveStats = null;
+        talk.levels(0, 0);
+        if (stats.processed == 0) {
+            conversations.delete(meta.id);
+            current = null;
+        } else {
+            meta.seconds = stats.inputSeconds;
+            meta.averageMs = stats.averageMs;
+            meta.title = ConversationStore.titleFrom(snapshot);
+            if (meta.title.isEmpty())
+                meta.title = "语音对话 " + new SimpleDateFormat("HH:mm", Locale.US).format(new Date(meta.createdMillis));
+            try {
+                conversations.save(meta, snapshot);
+            } catch (Exception saveError) {
+                toast("保存对话失败：" + saveError.getMessage());
+            }
+        }
+        if (error != null) toast("对话中断：" + error.getMessage());
+        renderChat();
+        refreshAll();
+    }
+
+    private void showStats(ConversationSession.Stats stats) {
+        liveStats = stats;
+        talk.levels(stats.inputLevel, stats.outputLevel);
+        refreshStatus();
+        if (stats.draining) refreshTalk();
+    }
+
+    // ---------------------------------------------------------------- engine
+
+    private boolean engineBusy() {
+        return engineState == EngineState.VERIFYING || engineState == EngineState.LOADING;
+    }
+
+    private void onLoadModel() {
+        ModelCatalog.Variant variant = selectedVariant();
+        if (variant == null || store.status(variant).state != ModelStore.State.READY) { showScreen(Screen.MODELS); return; }
+        if (!engineBusy() && session == null) loadEngine(variant);
+    }
+
+    private void loadEngine(ModelCatalog.Variant variant) {
+        final boolean verified = store.verified(variant);
+        final DuplexEngine.Options options = new DuplexEngine.Options();
+        options.codecOnly = codecOnly.isChecked();
+        engineState = verified ? EngineState.LOADING : EngineState.VERIFYING;
+        engineMessage = verified ? "正在把模型载入 HTP…" : "首次使用，正在校验模型文件…";
+        refreshAll();
+        engineThread.execute(() -> {
+            try {
+                if (!verified) {
+                    store.verify(variant, (done, total, file) -> postEngine(EngineState.VERIFYING,
+                            "校验模型文件 " + (100 * done / Math.max(1, total)) + "%"));
+                }
+                postEngine(EngineState.LOADING, "正在把模型载入 HTP…");
+                if (engine != null) engine.release();
+                engine = null;
+                long start = System.nanoTime();
+                DuplexEngine created = Engines.create(variant.model.engine);
+                created.load(this, store.dir(variant), options);
+                double seconds = (System.nanoTime() - start) / 1e9;
+                runOnUiThread(() -> {
+                    engine = created;
+                    loadedVariant = variant.id;
+                    engineState = EngineState.READY;
+                    engineMessage = String.format(Locale.US, "%s 已就绪 · 加载 %.1f 秒", created.describe(), seconds);
+                    refreshAll();
+                    if (startAfterLoad) { startAfterLoad = false; startSession(); }
+                });
+            } catch (Throwable error) {
+                runOnUiThread(() -> {
+                    engine = null;
+                    loadedVariant = null;
+                    startAfterLoad = false;
+                    engineState = EngineState.ERROR;
+                    engineMessage = "加载失败：" + error.getMessage();
+                    refreshAll();
+                });
+            }
+        });
+    }
+
+    private void postEngine(EngineState state, String message) {
+        runOnUiThread(() -> {
+            engineState = state;
+            engineMessage = message;
+            refreshAll();
+        });
+    }
+
+    private void releaseEngine(String message) {
+        final DuplexEngine old = engine;
+        engine = null;
+        loadedVariant = null;
+        engineState = EngineState.NONE;
+        engineMessage = message;
+        if (old != null) engineThread.execute(old::release);
+        refreshAll();
+    }
+
+    // ---------------------------------------------------------------- refresh
+
+    private void refreshAll() {
+        refreshHeader();
+        refreshStatus();
+        refreshTalk();
+        if (screen == Screen.CHAT && session == null && turns.isEmpty()) renderChat();
+        refreshModels();
+        refreshSettings();
+        boolean keepAwake = session != null || downloadingVariant != null || engineBusy();
+        if (keepAwake) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    }
+
+    private void refreshHeader() {
+        ModelCatalog.Variant variant = selectedVariant();
+        actionButton.setVisibility(screen == Screen.CHAT && current != null && session == null ? View.VISIBLE : View.INVISIBLE);
+        actionButton.setText("⋮");
+        if (screen == Screen.MODELS) { title.setText("模型管理"); subtitle.setText(hub.label()); return; }
+        if (screen == Screen.SETTINGS) { title.setText("设置"); subtitle.setText(""); return; }
+        title.setText(current == null || current.title.isEmpty() ? (session != null ? "通话中" : "新对话") : current.title);
+        if (variant == null) { subtitle.setText("没有可用模型"); return; }
+        String state = engineChip(variant)[0];
+        if (engineBusy()) state = engineMessage;
+        subtitle.setText(variant.model.name + " · " + state);
+    }
+
+    private void refreshStatus() {
+        if (session == null || screen != Screen.CHAT) { statusLine.setVisibility(View.GONE); callStats.setText(""); return; }
+        statusLine.setVisibility(View.VISIBLE);
+        ConversationSession.Stats s = liveStats;
+        if (s == null) { statusLine.setText("● 正在接通…"); return; }
+        double rtf = s.averageMs / (FRAME_SECONDS * 1000);
+        String line = String.format(Locale.US, "● 通话中 %.0f 秒 · 延迟 %.1f 秒 · 每帧 %.0f ms · RTF %.2f · 积压 %d",
+                s.inputSeconds, s.latencySeconds, s.averageMs, rtf, s.backlog);
+        if (s.draining) line = (s.backlog > 0 ? "已停止收音，正在处理剩余 " + s.backlog + " 帧" : "已停止收音，等模型说完")
+                + " · 再点一次立即结束";
+        statusLine.setText(line);
+        statusLine.setTextColor(s.draining ? Ui.WARN : rtf <= 1 ? Ui.LIVE : Ui.WARN);
+        callStats.setText(String.format(Locale.US, "延迟\n%.1f s", s.latencySeconds));
+    }
+
+    private void refreshTalk() {
+        sourceChip.setText(source == Source.MICROPHONE ? "🎤 麦克风" : source == Source.DEMO ? "♪ 演示音频" : "📄 WAV");
+        Ui.enable(sourceChip, session == null);
+        if (session != null) {
+            if (session.isDraining()) talk.set(TalkButton.Mode.BUSY, "处理中", "");
+            else talk.set(TalkButton.Mode.LIVE, "结束", "");
+        } else if (engineBusy()) {
+            talk.set(TalkButton.Mode.BUSY, "准备", "");
+        } else {
+            ModelCatalog.Variant variant = selectedVariant();
+            boolean ready = variant != null && store.status(variant).state == ModelStore.State.READY;
+            talk.set(ready ? TalkButton.Mode.IDLE : TalkButton.Mode.DISABLED, "通话", "");
+        }
+    }
+
+    // ---------------------------------------------------------------- models page
 
     private ModelCatalog.Variant selectedVariant() {
         ModelCatalog.Variant chosen = catalog.variant(preferences.getString("selected_variant", ""));
@@ -347,6 +748,20 @@ public final class MainActivity extends Activity {
                 if (variant.supports(soc) && Engines.supports(model.engine)) return variant;
             }
         return fallback;
+    }
+
+    private View buildModelsPage() {
+        LinearLayout page = ui.column(16);
+        page.setPadding(ui.dp(16), 0, ui.dp(16), ui.dp(24));
+        LinearLayout hubCard = ui.card(page);
+        ui.eyebrow(hubCard, "模型来源");
+        hubSummary = ui.text(hubCard, "", 14, Ui.TEXT, false);
+        hubStatus = ui.text(hubCard, "", 13, Ui.MUTED, false);
+        hubStatus.setPadding(0, ui.dp(4), 0, 0);
+        refreshButton = ui.secondary(hubCard, "刷新模型列表", this::refreshCatalog);
+        modelsList = ui.column(0);
+        page.addView(modelsList);
+        return page;
     }
 
     private void renderModels() {
@@ -400,9 +815,9 @@ public final class MainActivity extends Activity {
     }
 
     private void refreshModels() {
-        hubSummary.setText(hub.label() + "\n" + hub.repo + " @ " + HubConfig.REVISION);
+        hubSummary.setText(hub.label() + (hub.isDefaultRepo() ? " · 官方模型仓库" : "\n" + hub.repo));
         Ui.enable(refreshButton, !catalogRefreshing);
-        if (catalogRefreshing) hubStatus.setText("正在获取 catalog.json…");
+        if (catalogRefreshing) hubStatus.setText("正在获取模型列表…");
         else if (hubStatus.getText().length() == 0)
             hubStatus.setText("剩余空间 " + Ui.bytes(store.freeBytes()) + " · 设备 " + (soc.isEmpty() ? "未知 SoC" : soc));
         ModelCatalog.Variant selected = selectedVariant();
@@ -455,7 +870,7 @@ public final class MainActivity extends Activity {
                 String text = HubDownloader.fetchText(config, "catalog.json");
                 fresh = ModelCatalog.parse(text);
                 store.saveCatalog(text);
-                message = "已更新：" + fresh.models.size() + " 个模型（" + timeNow() + "）";
+                message = "已更新：" + fresh.models.size() + " 个模型（" + new SimpleDateFormat("HH:mm", Locale.US).format(new Date()) + "）";
             } catch (Exception error) {
                 message = "刷新失败：" + error.getMessage() + "\n仍使用本地模型列表";
             }
@@ -476,7 +891,7 @@ public final class MainActivity extends Activity {
     private void startDownload(ModelCatalog.Variant variant) {
         if (downloadingVariant != null) return;
         String problem = hub.validate();
-        if (problem != null) { selectTab(2); toastStatus(problem); return; }
+        if (problem != null) { toast(problem); return; }
         long needed = variant.totalBytes() - store.status(variant).presentBytes;
         if (needed > store.freeBytes()) {
             variantErrors.put(variant.id, "空间不足：还需要 " + Ui.bytes(needed) + "，剩余 " + Ui.bytes(store.freeBytes()));
@@ -488,8 +903,7 @@ public final class MainActivity extends Activity {
         downloader = new HubDownloader();
         final HubDownloader active = downloader;
         final HubConfig config = hub;
-        VariantViews views = variantViews.get(variant.id);
-        views.status.setText("正在连接 " + config.label() + "…");
+        variantViews.get(variant.id).status.setText("正在连接 " + config.label() + "…");
         refreshAll();
         ioThread.execute(() -> {
             String error = null;
@@ -547,7 +961,7 @@ public final class MainActivity extends Activity {
 
     private void deleteVariant(ModelCatalog.Variant variant) {
         if (session != null || downloadingVariant != null) return;
-        new android.app.AlertDialog.Builder(this)
+        new AlertDialog.Builder(this)
                 .setTitle("删除 " + variant.model.name + "？")
                 .setMessage("将删除本地 " + Ui.bytes(store.status(variant).presentBytes) + " 的模型文件，之后可以重新下载。")
                 .setNegativeButton("取消", null)
@@ -566,286 +980,80 @@ public final class MainActivity extends Activity {
         if (session != null) return;
         preferences.edit().putString("selected_variant", variant.id).apply();
         if (loadedVariant != null && !loadedVariant.equals(variant.id)) releaseEngine("");
-        refreshAll();
-        selectTab(0);
+        openConversation(null);
+        showScreen(Screen.CHAT);
     }
 
-    // ---------------------------------------------------------------- engine
+    // ---------------------------------------------------------------- settings page
 
-    private boolean engineBusy() {
-        return engineState == EngineState.VERIFYING || engineState == EngineState.LOADING;
-    }
+    private View buildSettingsPage() {
+        LinearLayout page = ui.column(16);
+        page.setPadding(ui.dp(16), 0, ui.dp(16), ui.dp(24));
 
-    private void onModelAction() {
-        ModelCatalog.Variant variant = selectedVariant();
-        if (variant == null || store.status(variant).state != ModelStore.State.READY) { selectTab(1); return; }
-        if (engineBusy() || session != null) return;
-        loadEngine(variant);
-    }
-
-    private void loadEngine(ModelCatalog.Variant variant) {
-        final boolean verified = store.verified(variant);
-        final DuplexEngine.Options options = new DuplexEngine.Options();
-        options.codecOnly = codecOnly.isChecked();
-        engineState = verified ? EngineState.LOADING : EngineState.VERIFYING;
-        engineMessage = verified ? "正在把模型载入 HTP…" : "首次使用，正在校验模型文件…";
-        refreshAll();
-        engineThread.execute(() -> {
-            try {
-                if (!verified) {
-                    store.verify(variant, (done, total, file) -> postEngine(EngineState.VERIFYING,
-                            "校验 " + (100 * done / Math.max(1, total)) + "% · " + file));
-                }
-                postEngine(EngineState.LOADING, "正在把模型载入 HTP…");
-                if (engine != null) engine.release();
-                engine = null;
-                long start = System.nanoTime();
-                DuplexEngine created = Engines.create(variant.model.engine);
-                created.load(this, store.dir(variant), options);
-                double seconds = (System.nanoTime() - start) / 1e9;
-                runOnUiThread(() -> {
-                    engine = created;
-                    loadedVariant = variant.id;
-                    engineState = EngineState.READY;
-                    engineMessage = String.format(Locale.US, "%s 已就绪 · 加载 %.1f 秒", created.describe(), seconds);
-                    refreshAll();
-                });
-            } catch (Throwable error) {
-                runOnUiThread(() -> {
-                    engine = null;
-                    loadedVariant = null;
-                    engineState = EngineState.ERROR;
-                    engineMessage = "加载失败：" + error.getMessage();
-                    refreshAll();
-                });
-            }
-        });
-    }
-
-    private void postEngine(EngineState state, String message) {
-        runOnUiThread(() -> {
-            engineState = state;
-            engineMessage = message;
-            refreshAll();
-        });
-    }
-
-    private void releaseEngine(String message) {
-        final DuplexEngine old = engine;
-        engine = null;
-        loadedVariant = null;
-        engineState = EngineState.NONE;
-        engineMessage = message;
-        if (old != null) engineThread.execute(old::release);
-        refreshAll();
-    }
-
-    // ---------------------------------------------------------------- conversation
-
-    private void chooseSource(Source value) {
-        if (session != null) return;
-        if (value == Source.FILE) {
-            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            intent.setType("audio/*");
-            startActivityForResult(intent, PICK_AUDIO);
-            return;
-        }
-        if (value == Source.DEMO && !hasDemo()) { toastStatus("此安装包没有内置演示音频"); return; }
-        source = value;
-        refreshAll();
-    }
-
-    @Override
-    protected void onActivityResult(int request, int result, Intent data) {
-        super.onActivityResult(request, result, data);
-        if (request != PICK_AUDIO || result != RESULT_OK || data == null || data.getData() == null) return;
-        Uri uri = data.getData();
-        ioThread.execute(() -> {
-            File target = pickedFile();
-            String message;
-            try (InputStream input = getContentResolver().openInputStream(uri);
-                 OutputStream output = new FileOutputStream(target)) {
-                if (input == null) throw new IOException("无法读取");
-                byte[] buffer = new byte[1 << 16];
-                int count;
-                while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
-                output.close();
-                try (InputStream check = new FileInputStream(target)) {
-                    short[] samples = Wav.readMono16(check, 24_000);
-                    message = String.format(Locale.US, "已选择 WAV：%.1f 秒，将按实时速度送入模型", samples.length / 24_000.0);
-                }
-            } catch (Exception error) {
-                target.delete();
-                message = "无法使用此文件：" + error.getMessage();
-            }
-            final String status = message;
-            runOnUiThread(() -> {
-                if (pickedFile().isFile()) source = Source.FILE;
-                toastStatus(status);
-                refreshAll();
-            });
-        });
-    }
-
-    private void onTalk() {
-        if (session != null) {
-            if (session.isDraining()) session.abort();
-            else session.stopInput();
-            refreshAll();
-            return;
-        }
-        if (engineState != EngineState.READY || engine == null) { onModelAction(); return; }
-        if (source == Source.MICROPHONE
-                && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_MICROPHONE);
-            return;
-        }
-        startSession();
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
-        super.onRequestPermissionsResult(request, permissions, results);
-        if (request != REQUEST_MICROPHONE) return;
-        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) startSession();
-        else toastStatus("需要麦克风权限；也可以改用演示音频或 WAV 文件");
-    }
-
-    private void startSession() {
-        if (session != null || engine == null) return;
-        stopPlayer();
-        ConversationSession.Config config = new ConversationSession.Config();
-        config.highPerformance = highPerformance.isChecked();
-        config.textTemperature = textSampling.isChecked() ? 0.7f : 0f;
-        config.echoCancel = echoCancel.isChecked();
-        config.directory = sessionDir();
-        try {
-            if (source == Source.DEMO) {
-                try (InputStream input = getAssets().open("demo.wav")) { config.fileInput = Wav.readMono16(input, engine.sampleRate()); }
-            } else if (source == Source.FILE) {
-                try (InputStream input = new FileInputStream(pickedFile())) { config.fileInput = Wav.readMono16(input, engine.sampleRate()); }
-            }
-        } catch (IOException error) {
-            toastStatus("读取音频失败：" + error.getMessage());
-            return;
-        }
-        final double frameMs = 1000.0 * engine.frameSamples() / engine.sampleRate();
-        transcript.setText("");
-        transcript.setTextColor(Ui.TEXT);
-        hasRecording = false;
-        session = new ConversationSession(engine, config, new ConversationSession.Listener() {
-            @Override public void onStats(ConversationSession.Stats stats) { runOnUiThread(() -> showStats(stats, frameMs)); }
-
-            @Override public void onText(String delta) { runOnUiThread(() -> transcript.append(delta)); }
-
-            @Override
-            public void onFinished(Throwable error, ConversationSession.Stats stats) {
-                runOnUiThread(() -> {
-                    session = null;
-                    hasRecording = new File(sessionDir(), "output.wav").isFile();
-                    showStats(stats, frameMs);
-                    talk.levels(0, 0);
-                    if (transcript.getText().length() == 0) {
-                        transcript.setTextColor(Ui.MUTED);
-                        transcript.setText(codecOnly.isChecked() ? "编解码回环模式没有文本输出" : "（这段对话里模型没有说出文字）");
-                    }
-                    sessionStatus.setText(error != null ? "对话中断：" + error.getMessage()
-                            : String.format(Locale.US, "对话结束：输入 %.1f 秒，输出 %d 帧，平均每帧 %.0f ms%s", stats.inputSeconds,
-                              stats.emitted, stats.averageMs, stats.backlog > 0 ? "，丢弃积压 " + stats.backlog + " 帧" : ""));
-                    sessionStatus.setTextColor(error != null ? Ui.ERROR : Ui.MUTED);
-                    refreshAll();
-                });
-            }
-        });
-        sessionStatus.setText("");
-        session.start(engineThread);
-        refreshAll();
-    }
-
-    private void showStats(ConversationSession.Stats stats, double frameMs) {
-        metrics[0].setText(String.format(Locale.US, "%.1f s", stats.latencySeconds));
-        metrics[1].setText(String.format(Locale.US, "%.0f ms", stats.averageMs));
-        double rtf = stats.realTimeFactor(frameMs);
-        metrics[2].setText(stats.processed == 0 ? "—" : String.format(Locale.US, "%.2f", rtf));
-        metrics[2].setTextColor(stats.processed == 0 ? Ui.TEXT : rtf <= 1 ? Ui.LIVE : Ui.WARN);
-        metrics[3].setText(String.valueOf(stats.backlog));
-        if (session != null) {
-            talk.levels(stats.inputLevel, stats.outputLevel);
-            sessionStatus.setTextColor(Ui.MUTED);
-            sessionStatus.setText(String.format(Locale.US, "已处理 %.1f 秒输入 · 输出 %d 帧%s", stats.inputSeconds, stats.emitted,
-                    stats.draining ? " · 已停止收音，正在处理剩余 " + stats.backlog + " 帧（再点一次立即结束）" : ""));
-            if (stats.draining) refreshTalk();
-        }
-    }
-
-    // ---------------------------------------------------------------- refresh
-
-    private void refreshAll() {
-        refreshChat();
-        refreshModels();
-        refreshSettings();
-        boolean keepAwake = session != null || downloadingVariant != null || engineBusy();
-        if (keepAwake) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-    }
-
-    private void refreshChat() {
-        ModelCatalog.Variant variant = selectedVariant();
-        if (variant == null) {
-            modelName.setText("没有可用模型");
-            modelVariant.setText("请在“模型”页刷新模型列表");
-            headerModel.setText("全双工语音 · 端侧推理");
-            Ui.enable(modelAction, false);
-            refreshTalk();
-            return;
-        }
-        modelName.setText(variant.model.name);
-        modelVariant.setText(variant.title);
-        headerModel.setText("全双工语音 · " + variant.model.name);
-        ModelStore.Status status = store.status(variant);
-        boolean loaded = variant.id.equals(loadedVariant) && engineState == EngineState.READY;
-        String chip;
-        int color;
-        if (engineBusy()) { chip = engineState == EngineState.VERIFYING ? "校验中" : "加载中"; color = Ui.WARN; }
-        else if (loaded) { chip = "已就绪"; color = Ui.LIVE; }
-        else if (engineState == EngineState.ERROR) { chip = "出错"; color = Ui.ERROR; }
-        else if (status.state == ModelStore.State.READY) { chip = "未加载"; color = Ui.ACCENT; }
-        else { chip = "未下载"; color = Ui.MUTED; }
-        modelChip.setText(chip);
-        Ui.setChipColor(modelChip, color);
-        String detail = engineMessage;
-        if (detail.isEmpty()) detail = status.state == ModelStore.State.READY
-                ? "模型约 " + Ui.bytes(variant.totalBytes()) + "，加载后全部常驻 HTP。"
-                : "需要先下载约 " + Ui.bytes(variant.totalBytes()) + " 的模型文件。";
-        modelDetail.setText(detail);
-        modelDetail.setTextColor(engineState == EngineState.ERROR ? Ui.ERROR : Ui.MUTED);
-        modelAction.setText(status.state != ModelStore.State.READY ? "前往下载" : loaded ? "重新加载" : "加载模型");
-        Ui.enable(modelAction, session == null && !engineBusy() && downloadingVariant == null);
+        LinearLayout source = ui.card(page);
+        ui.eyebrow(source, "下载源");
+        LinearLayout choices = ui.row();
+        String[] titles = {"HF 镜像", "Hugging Face", "自定义"};
         for (int i = 0; i < 3; i++) {
-            boolean active = Source.values()[i] == source;
-            sources[i].setTextColor(active ? Ui.TEXT : Ui.MUTED);
-            sources[i].setBackground(active ? Ui.rounded(Ui.OUTLINE, ui.dp(11)) : null);
-            Ui.enable(sources[i], session == null && (i != 1 || hasDemo()));
+            final int index = i;
+            TextView option = ui.chip(null, titles[i], Ui.MUTED);
+            option.setTextSize(14);
+            option.setGravity(Gravity.CENTER);
+            option.setPadding(0, ui.dp(9), 0, ui.dp(9));
+            option.setOnClickListener(v -> chooseEndpoint(index));
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
+            params.setMargins(i == 0 ? 0 : ui.dp(4), 0, i == 2 ? 0 : ui.dp(4), 0);
+            choices.addView(option, params);
+            endpointChoices[i] = option;
         }
-        Ui.enable(playInput, session == null && hasRecording);
-        Ui.enable(playOutput, session == null && hasRecording);
-        Ui.enable(exportButton, session == null && hasRecording);
-        refreshTalk();
-    }
+        source.addView(choices);
+        endpointField = ui.field(source, "https://your-mirror.example.com", hub.endpoint);
+        endpointField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        ui.text(source, "模型是公开的，下载不需要账号或令牌。国内网络建议用 hf-mirror.com。", 12, Ui.MUTED, false)
+                .setPadding(0, ui.dp(8), 0, 0);
 
-    private void refreshTalk() {
-        if (session != null) {
-            if (session.isDraining()) talk.set(TalkButton.Mode.BUSY, "处理剩余", "再点立即结束");
-            else talk.set(TalkButton.Mode.LIVE, "结束", source == Source.MICROPHONE ? "正在收音" : "正在送入音频");
-            talkHint.setText("模型边听边说；实时率大于 1 时延迟会逐渐累积。外放请开启回声消除，建议戴耳机。");
-        } else if (engineState == EngineState.READY && engine != null) {
-            talk.set(TalkButton.Mode.IDLE, "开始对话", source == Source.MICROPHONE ? "麦克风" : source == Source.DEMO ? "演示音频" : "WAV 文件");
-            talkHint.setText("点击开始，像打电话一样直接说话；再点一次结束收音。");
-        } else {
-            talk.set(engineBusy() ? TalkButton.Mode.BUSY : TalkButton.Mode.DISABLED, engineBusy() ? "准备中" : "未加载", "");
-            talkHint.setText("先在上方加载模型。");
+        LinearLayout runtime = ui.card(page);
+        ui.eyebrow(runtime, "对话");
+        highPerformance = ui.toggle(runtime, "HTP 高性能档", "通话期间请求 burst 性能投票，更耗电", preferences.getBoolean("high_performance", true));
+        echoCancel = ui.toggle(runtime, "回声消除", "外放时减少模型听到自己的声音；戴耳机效果最好", preferences.getBoolean("echo_cancel", true));
+        textSampling = ui.toggle(runtime, "文本采样", "温度 0.7、top-k 25（Kyutai 默认）；关闭则贪心解码，模型容易一直沉默",
+                preferences.getBoolean("text_sampling", true));
+        highPerformance.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("high_performance", on).apply());
+        echoCancel.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("echo_cancel", on).apply());
+        textSampling.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("text_sampling", on).apply());
+
+        LinearLayout developer = ui.card(page);
+        TextView toggle = ui.eyebrow(developer, "高级 ▸");
+        toggle.setOnClickListener(v -> {
+            boolean show = advanced.getVisibility() != View.VISIBLE;
+            advanced.setVisibility(show ? View.VISIBLE : View.GONE);
+            toggle.setText(show ? "高级 ▾" : "高级 ▸");
+        });
+        advanced = ui.column(0);
+        advanced.setVisibility(View.GONE);
+        developer.addView(advanced);
+        ui.text(advanced, "模型仓库：App 默认从官方仓库 " + HubConfig.DEFAULT_REPO
+                + " 下载，一般不需要改。只有自己发布了模型（scripts/hf_publish.py）时才填自己的仓库。", 12.5f, Ui.MUTED, false);
+        repoField = ui.field(advanced, HubConfig.DEFAULT_REPO, hub.isDefaultRepo() ? "" : hub.repo);
+        codecOnly = ui.toggle(advanced, "仅编解码回环（调试）", "只跑 Mimi encoder → decoder，不跑语言模型", preferences.getBoolean("codec_only", false));
+        codecOnly.setOnCheckedChangeListener((b, on) -> {
+            preferences.edit().putBoolean("codec_only", on).apply();
+            if (session == null) releaseEngine("模式已切换，下次通话会重新加载");
+        });
+
+        ui.primary(page, "保存下载设置", this::saveHub);
+
+        LinearLayout about = ui.card(page);
+        ui.eyebrow(about, "关于");
+        String version;
+        try {
+            version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (PackageManager.NameNotFoundException error) {
+            version = "?";
         }
+        ui.text(about, "版本 " + version + "\n设备 SoC：" + (soc.isEmpty() ? "未知" : soc)
+                + "\n模型目录：" + store.root().getAbsolutePath(), 13, Ui.MUTED, false);
+        return page;
     }
 
     private void refreshSettings() {
@@ -860,25 +1068,25 @@ public final class MainActivity extends Activity {
         endpointField.setTag(index);
         if (index == 0) endpointField.setText(HubConfig.MIRROR);
         if (index == 1) endpointField.setText(HubConfig.HUGGING_FACE);
+        if (index == 2 && (hub.endpoint.equals(HubConfig.MIRROR) || hub.endpoint.equals(HubConfig.HUGGING_FACE))) endpointField.setText("");
         refreshSettings();
     }
 
     private void saveHub() {
-        HubConfig next = new HubConfig(endpointField.getText().toString(), repoField.getText().toString(), tokenField.getText().toString());
+        HubConfig next = new HubConfig(endpointField.getText().toString(), repoField.getText().toString());
         String problem = next.validate();
-        if (problem != null) { toastStatus(problem); return; }
-        if (downloadingVariant != null) { toastStatus("下载进行中，暂停后再修改仓库"); return; }
+        if (problem != null) { toast(problem); return; }
+        if (downloadingVariant != null) { toast("下载进行中，暂停后再修改"); return; }
         hub = next;
         hub.save(preferences);
         endpointField.setTag(null);
         hubStatus.setText("");
-        selectTab(1);
+        showScreen(Screen.MODELS);
         refreshCatalog();
     }
 
     // ---------------------------------------------------------------- files
 
-    private File sessionDir() { return new File(getFilesDir(), "sessions/latest"); }
     private File pickedFile() { return new File(getFilesDir(), "picked.wav"); }
 
     private boolean hasDemo() {
@@ -889,36 +1097,52 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void play(File file) {
-        if (file == null || !file.isFile()) return;
+    private void playSegment(File file, double startSeconds, double lengthSeconds) {
+        if (!file.isFile()) return;
         stopPlayer();
         try {
             player = new MediaPlayer();
             player.setDataSource(file.getAbsolutePath());
             player.setOnCompletionListener(done -> stopPlayer());
             player.prepare();
+            player.seekTo((int) (startSeconds * 1000));
             player.start();
+            main.postDelayed(stopPlayback, (long) (lengthSeconds * 1000));
         } catch (IOException error) {
             stopPlayer();
-            toastStatus("播放失败：" + error.getMessage());
+            toast("播放失败：" + error.getMessage());
         }
     }
 
     private void stopPlayer() {
+        main.removeCallbacks(stopPlayback);
         if (player != null) { player.release(); player = null; }
     }
 
-    private void exportSession() {
-        if (session != null || !hasRecording) return;
-        Ui.enable(exportButton, false);
+    private void confirmDelete(ConversationStore.Meta meta) {
+        if (session != null) return;
+        new AlertDialog.Builder(this)
+                .setTitle("删除这段对话？")
+                .setMessage(meta.title.isEmpty() ? "语音对话" : meta.title)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("删除", (dialog, which) -> {
+                    stopPlayer();
+                    conversations.delete(meta.id);
+                    if (current != null && current.id.equals(meta.id)) openConversation(null);
+                    if (drawerOpen) renderDrawer();
+                })
+                .show();
+    }
+
+    private void exportConversation(ConversationStore.Meta meta) {
         ioThread.execute(() -> {
             String message;
             try {
-                String prefix = "duplex-" + new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new java.util.Date());
+                String prefix = "duplex-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date(meta.createdMillis));
                 String[][] files = {{"input.wav", "audio/wav"}, {"output.wav", "audio/wav"}, {"transcript.txt", "text/plain"},
                                     {"tokens.csv", "text/csv"}, {"performance.csv", "text/csv"}};
                 for (String[] file : files) {
-                    File source = new File(sessionDir(), file[0]);
+                    File source = new File(conversations.dir(meta.id), file[0]);
                     if (source.isFile()) saveDownload(source, prefix + "-" + file[0], file[1]);
                 }
                 message = "已保存到 Download/DuplexVoice（" + prefix + "-*）";
@@ -926,7 +1150,7 @@ public final class MainActivity extends Activity {
                 message = "导出失败：" + error.getMessage();
             }
             final String status = message;
-            runOnUiThread(() -> { toastStatus(status); refreshAll(); });
+            runOnUiThread(() -> toast(status));
         });
     }
 
@@ -945,12 +1169,8 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void toastStatus(String message) {
-        android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show();
-    }
-
-    private static String timeNow() {
-        return new java.text.SimpleDateFormat("HH:mm", Locale.US).format(new java.util.Date());
+    private void toast(String message) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 
     @Override
