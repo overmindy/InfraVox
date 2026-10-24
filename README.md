@@ -1,6 +1,27 @@
 <p align="center"><img src="android/demo/branding/logo.svg" width="120" alt="InfraVox"></p>
 
-# InfraVox
+<h1 align="center">InfraVox</h1>
+
+<p align="center">
+  <b>简体中文</b> · <a href="README.en.md">English</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/overmindy/InfraVox/releases/latest"><img src="https://img.shields.io/github/v/release/overmindy/InfraVox?label=APK&logo=android&color=3DDC84" alt="Release"></a>
+  <a href="https://huggingface.co/ELAINAy/duplex-voice-models"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-duplex--voice--models-FFD21E" alt="Hugging Face"></a>
+  <a href="https://huggingface.co/openbmb/MiniCPM-o-4_5"><img src="https://img.shields.io/badge/Model-MiniCPM--o%204.5-6F7BF7" alt="MiniCPM-o 4.5"></a>
+  <img src="https://img.shields.io/badge/Snapdragon-SM8850%20%C2%B7%20Hexagon%20NPU-3253DC?logo=qualcomm&logoColor=white" alt="Snapdragon SM8850">
+  <img src="https://img.shields.io/badge/Android-10%2B%20arm64-3DDC84?logo=android&logoColor=white" alt="Android 10+">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-BSD--3--Clause-blue" alt="License"></a>
+</p>
+
+<p align="center">
+  <img src="docs/images/home.png" width="23%" alt="主页">
+  <img src="docs/images/call.png" width="23%" alt="通话中">
+  <img src="docs/images/models.png" width="23%" alt="模型管理">
+  <img src="docs/images/history.png" width="23%" alt="历史对话">
+</p>
+<p align="center"><sub>主页 · 通话中（MiniCPM-o 实时回答两个问题）· 模型管理 · 历史对话</sub></p>
 
 在手机上本地运行的**全双工语音对话** App：模型边听边说，你可以随时打断它，全程不联网。
 名字取自端侧底座（Infra）+ 语音（Vox），一个 App 承载多个全双工语音模型，全部跑在骁龙的 Hexagon NPU 上。
@@ -10,8 +31,6 @@ App 首次打开默认选中它。Moshi 作为实验性模型保留，目前慢�
 
 - **下载 App**：[GitHub Releases](https://github.com/overmindy/InfraVox/releases/latest)
 - **模型权重**：[ELAINAy/duplex-voice-models](https://huggingface.co/ELAINAy/duplex-voice-models)（App 内直接下载，默认走 hf-mirror.com）
-
-<!-- 演示视频：录好后放在这里 -->
 
 ## 功能
 
@@ -72,3 +91,4 @@ python scripts/hf_publish.py --repo ELAINAy/duplex-voice-models --variant <变�
 
 基于 [Qualcomm AI Hub Models](https://github.com/quic/ai-hub-models)（原 README 见 [QAIHM_README.md](QAIHM_README.md)），
 模型来自 [OpenBMB MiniCPM-o](https://github.com/OpenBMB/MiniCPM-o)（Apache-2.0）与 [Kyutai Moshi](https://github.com/kyutai-labs/moshi)（CC-BY-4.0）。
+本仓库代码沿用 BSD-3-Clause（见 [LICENSE](LICENSE)），模型权重遵循各自上游的许可证。
