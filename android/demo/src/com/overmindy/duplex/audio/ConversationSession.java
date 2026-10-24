@@ -68,12 +68,12 @@ public final class ConversationSession {
     }
 
     private static final int TAIL_QUIET = 25;   // 2 s of silence fed without new text ends the call
-    private static final int TAIL_MAX = 125;    // never feed more than 10 s of silence
+    private static final int TAIL_MAX = 375;    // never feed more than 30 s of silence (MiniCPM-o answers run long)
 
     private final DuplexEngine engine;
     private final Config config;
     private final Listener listener;
-    private final int frame, rate;
+    private final int frame, rate, outputRate;
     private final LinkedBlockingQueue<Captured> queue = new LinkedBlockingQueue<>();
     private final Stats stats = new Stats();
     private final TurnTracker turns = new TurnTracker();
@@ -87,6 +87,7 @@ public final class ConversationSession {
         this.listener = listener;
         frame = engine.frameSamples();
         rate = engine.sampleRate();
+        outputRate = engine.outputSampleRate();
     }
 
     public File inputWav() { return new File(config.directory, "input.wav"); }
@@ -185,7 +186,7 @@ public final class ConversationSession {
         try {
             engine.begin(config.highPerformance, config.textTemperature);
             input = new Wav.Writer(inputWav(), rate);
-            output = new Wav.Writer(outputWav(), rate);
+            output = new Wav.Writer(outputWav(), outputRate);
             tokens = new BufferedWriter(new OutputStreamWriter(
                     new FileOutputStream(new File(config.directory, "tokens.csv")), StandardCharsets.UTF_8));
             tokens.write("frame,text,codes\n");
@@ -255,18 +256,18 @@ public final class ConversationSession {
     }
 
     private AudioTrack openTrack() {
-        int minimum = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        int minimum = AudioTrack.getMinBufferSize(outputRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
         AudioTrack track = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-                .setAudioFormat(new AudioFormat.Builder().setSampleRate(rate)
+                .setAudioFormat(new AudioFormat.Builder().setSampleRate(outputRate)
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                .setBufferSizeInBytes(Math.max(minimum, rate * 2 * 2))
+                .setBufferSizeInBytes(Math.max(minimum, outputRate * 2 * 2))
                 .setTransferMode(AudioTrack.MODE_STREAM).build();
         // The default start threshold is the whole buffer; start playing after one frame instead.
-        if (Build.VERSION.SDK_INT >= 31) track.setStartThresholdInFrames(frame);
+        if (Build.VERSION.SDK_INT >= 31) track.setStartThresholdInFrames((int) ((long) frame * outputRate / rate));
         track.play();
         return track;
     }

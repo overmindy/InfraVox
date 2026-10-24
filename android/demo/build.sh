@@ -7,11 +7,16 @@ SDK=${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}
 NDK=${ANDROID_NDK_HOME:-}
 QNN_HEADERS=${QNN_INCLUDE:-}
 QNN_LIBS=${QNN_ANDROID_LIB_DIR:-}
-SAMPLE=${SAMPLE_WAV:-}  # Optional 24 kHz mono PCM16 WAV shipped as the "演示音频" input.
+SAMPLE=${SAMPLE_WAV:-}  # Optional mono PCM16 WAV shipped as the "演示音频" input.
 OUT=${OUT_DIR:-$SCRIPT_DIR/build}
+ORT=${ORT_DIR:-$SCRIPT_DIR/build/ort/aar}  # extracted com.microsoft.onnxruntime:onnxruntime-android AAR
 
 if [[ -z "$SDK" || -z "$NDK" || -z "$QNN_HEADERS" || -z "$QNN_LIBS" ]]; then
   echo 'Set ANDROID_SDK_ROOT, ANDROID_NDK_HOME, QNN_INCLUDE, QNN_ANDROID_LIB_DIR (SAMPLE_WAV optional).' >&2
+  exit 2
+fi
+if [[ ! -f "$ORT/jni/arm64-v8a/libonnxruntime.so" || ! -f "$ORT/headers/onnxruntime_cxx_api.h" ]]; then
+  echo "Missing ONNX Runtime at $ORT: unzip onnxruntime-android-1.20.0.aar from Maven Central there (or set ORT_DIR)." >&2
   exit 2
 fi
 if [[ "$(uname -s)" == Darwin ]]; then
@@ -36,6 +41,11 @@ mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/stage/lib/arm64-v8a" "$OUT/stage/assets
   -static-libstdc++ -Wl,--no-undefined -I "$QNN_HEADERS" \
   "$REPO_ROOT/android/mimi_qnn_runner.cpp" "$SCRIPT_DIR/moshi_jni.cpp" \
   -o "$OUT/stage/lib/arm64-v8a/libmoshi_qnn.so" -ldl
+"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -fPIC -shared \
+  -static-libstdc++ -Wl,--no-undefined -I "$QNN_HEADERS" -I "$ORT/headers" \
+  "$REPO_ROOT/android/minicpmo_runner.cpp" "$SCRIPT_DIR/minicpmo_jni.cpp" \
+  -o "$OUT/stage/lib/arm64-v8a/libminicpmo_qnn.so" -L "$ORT/jni/arm64-v8a" -lonnxruntime -ldl
+cp "$ORT/jni/arm64-v8a/libonnxruntime.so" "$OUT/stage/lib/arm64-v8a/libonnxruntime.so"
 
 for library in libQnnHtp.so libQnnSystem.so libQnnHtpV81.so \
                libQnnHtpV81Stub.so libQnnHtpV81Skel.so \

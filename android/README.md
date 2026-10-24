@@ -143,3 +143,73 @@ App 第一次加载时按 catalog 的 sha256 校验全部文件；之后文件�
   继续提速只能减少每帧读取的字节数。
 - 全 LPBQ 的 Temporal 在 part 0 误差最大；若要找回质量，可只把 part 0 的 value/MLP down 恢复为 W8，代价约每帧 6 ms。
 - 没有做 ASR 和长音频评测；超过 1000 帧窗口后的环绕没有在真实模型上验证。
+
+# MiniCPM-o 4.5 全双工语音
+
+OpenBMB [MiniCPM-o 4.5](https://huggingface.co/openbmb/MiniCPM-o-4_5) 的全双工语音部分（不含视觉），
+同一台手机、同一个 QAIRT。服务器上 `scripts/minicpmo_build_all.sh` 从 BF16 权重一路做到模型包，
+Mac 上 `scripts/minicpmo_deploy.sh` 推到手机并安装 App；路径在 `scripts/minicpmo_env.sh`。
+
+## 模型与数据流
+
+```text
+16 kHz PCM，1 s 一个单元（首个单元 1030 ms）
+  → 流式 log-mel（CPU，30 s 窗口，前后各 2 帧 CNN 上下文）
+  → audio_encoder：Whisper-medium 24 层 + 投影 + 5× 池化，KV 窗口 1450 帧 → 10 个 embedding
+  → LLM（Qwen3-8B，4 段 × 9 层）：<unit> + 10 个音频 embedding 一次 AR-16 预填充
+       ↓ 每单元最多 20 次 AR-1 解码：<|listen|> 就听；否则输出说话 token，直到 chunk_eos / turn_eos
+  → llm_head：logits（CPU 采样：温度 0.7 / top-k 100 / top-p 0.8 / 重复惩罚 1.05）+ TTS 语义向量
+  → tts：20 层 Llama，条件 = emb_text(token) + 语义向量，每单元 25 个 s3 码（CPU 采样，温度 0.8）
+  → token2wav（28 码窗口，步进 25）：
+       flow conformer（CPU / ONNX Runtime）→ DiT × 10 步 Euler（CFG 0.7）→ HiFT f0
+       → NSF 源 + STFT（CPU）→ HiFT 解码 → iSTFT（CPU）→ 24 kHz PCM
+```
+
+| 文件 | 作用 |
+| --- | --- |
+| `scripts/minicpmo_build_all.sh` | 一键构建：采集 → token2wav 资源 → LLM 分段边界 → 两张 GPU 并行 AIMET 校准 → QAIRT 编译 → 模型包 |
+| `scripts/minicpmo_capture.py` | 用模型自己的 TTS 合成 20 个中英文提问，跑官方双工流程，记录每个图的输入（校准数据 + 对齐基准） |
+| `scripts/minicpmo_llm.py` | LLM 的高通 LLM 布局（AR-1 / AR-16 共享权重和 KV 环）+ head；LPBQ W4 / A16 / 8-bit KV |
+| `scripts/minicpmo_audio.py` | 流式 Whisper 编码器图（W8） |
+| `scripts/minicpmo_tts.py` | TTS 的 AR-1 / AR-16 图（W8） |
+| `scripts/minicpmo_flow.py` | DiT 单步图、时间步调制预计算、NSF 源 / STFT / iSTFT、`Token2wavHost`（缓存规则与官方一致） |
+| `scripts/minicpmo_token2wav_prepare.py` | 官方 token2wav 侧（minicpmo 环境）：固定音色的提示缓存、conformer ONNX、HiFT 图、golden 数据 |
+| `scripts/minicpmo_token2wav.py` | DiT / HiFT 对齐与校准 |
+| `scripts/minicpmo_hift_check.py` | NSF 源、STFT、iSTFT 与官方 HiFT 对齐，并导出主机测试向量 |
+| `scripts/minicpmo_sim.py` | 手机宿主逻辑的 Python 版（浮点图），C++ 运行器照它移植 |
+| `scripts/minicpmo_bundle.py` | `assets.bin`：embedding 表、系统提示 embedding、BPE 字节表、token2wav 固定状态 |
+| `scripts/minicpmo_qairt_build.sh` | 转换 + 量化 + 编译；多个图进同一个 context 时开启权重共享 |
+| `android/minicpmo_runner.cpp` | 原生运行器；`android/qnn_runtime.h` 是与 Moshi 共用的 QNN 基础设施 |
+| `android/minicpmo_host_test.cpp` | 在电脑上校验 CPU 部分（流式 mel、NSF 源、STFT/iSTFT）与官方一致 |
+
+App 里 MiniCPM-o 引擎输入 16 kHz、每帧 80 ms（1280 样本，与 Moshi 的帧时间轴一致），运行器攒满 1 秒算一个单元，
+输出 24 kHz（听的时候返回 1 秒静音）。
+
+## 实时性能（SM8850，演示提问，31 秒通话）
+
+LLM 在主线程，TTS + token2wav 在工作线程晚一个单元跑（语音输出因此多 1 秒延迟），CPU 上的 flow conformer、
+NSF / STFT 与下一单元的 LLM 重叠；HTP 执行用一把锁串行（各 context 共用一块 spill-fill 缓冲）。
+
+| 项目 | 耗时 |
+|---|---|
+| 说话单元，主线程（mel + Whisper + LLM 解码） | 600–850 ms / 1 s |
+| 说话单元，工作线程（TTS 25 个码 + token2wav） | 约 435 ms |
+| 说话时 HTP 合计 | 约 940 ms / 1 s（余量很小） |
+| LLM AR-1 每 token（4 段 + head） | 约 105 ms，每单元约 4–5 个 token |
+| 加载 / 系统提示预填充 | 4.4 s / 1.1 s |
+
+head 用 W4 能省约 50 ms/s 的 HTP，但 top-1 与浮点一致率从 0.978 掉到 0.898，所以保留 W8。
+
+## 关键约束
+
+- **AR-1 与 AR-16 共享权重**：每段 LLM 和 TTS 的两个图放进同一个 context（`weight_sharing_enabled`），
+  同一份 KV 环同时绑定到两个图，所以两图必须用同一份编码（AR-1 直接复用 AR-16 的 encodings）。
+- 每单元的预填充只要一次 AR-16；不需要 logits 的 token（`</unit>`、`<|chunk_eos|>` 等）先挂起，合进下一次预填充。
+- 系统提示（文本 + 参考音色的 Whisper embedding）在服务器上按官方代码算好放进 `assets.bin`，`begin()` 时预填充。
+- 音色固定为 `assets/system_ref_audio.wav` 的前 6.76 s：token2wav 的提示缓存（DiT 每步每层的 K/V、conformer 缓存）
+  在服务器上算好。DiT 缓存规则照官方：最新帧在前，超过 提示 + 100 帧时保留最新的 338 帧和最早的 100 帧。
+- 量化工具链的坑：
+  - 手写的 LayerNorm 会被 QAIRT 当成 RMSNorm 并和后面的 modulate 乘法一起融合、回退成浮点；DiT 改用 `layer_norm` 算子。
+  - weight_norm 参数化会导出成运行时计算的卷积权重，HTP 不接受；导出前折叠进权重。
+  - AIMET 的 Conv + 激活融合组只给融合后的张量编码，QAIRT 不做这个融合；给 `qairt-quantizer` 一份校准输入列表补齐。
+- flow conformer 的相对位置编码随缓存长度变化，放在 CPU 上用 ONNX Runtime（动态形状）跑。

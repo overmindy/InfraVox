@@ -123,17 +123,20 @@ public final class ModelStore {
     }
 
     public ModelCatalog loadCatalog() throws Exception {
+        ModelCatalog bundled;
+        try (InputStream input = context.getAssets().open("catalog.json")) {
+            bundled = ModelCatalog.parse(readText(input));
+        }
         File cached = new File(context.getFilesDir(), "catalog.json");
         if (cached.isFile()) {
             try (InputStream input = new FileInputStream(cached)) {
-                return ModelCatalog.parse(readText(input));
+                ModelCatalog fetched = ModelCatalog.parse(readText(input));
+                if (fetched.revision >= bundled.revision) return fetched;
             } catch (Exception ignored) {
                 cached.delete();
             }
         }
-        try (InputStream input = context.getAssets().open("catalog.json")) {
-            return ModelCatalog.parse(readText(input));
-        }
+        return bundled;
     }
 
     public void saveCatalog(String text) throws IOException {

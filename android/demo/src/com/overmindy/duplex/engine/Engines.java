@@ -5,11 +5,12 @@ public final class Engines {
     private Engines() { }
 
     public static boolean supports(String engine) {
-        return "moshi".equals(engine);
+        return "moshi".equals(engine) || "minicpmo".equals(engine);
     }
 
     public static DuplexEngine create(String engine) {
         if ("moshi".equals(engine)) return new MoshiEngine();
+        if ("minicpmo".equals(engine)) return new MiniCpmoEngine();
         throw new IllegalArgumentException("此版本 App 不支持引擎：" + engine);
     }
 }

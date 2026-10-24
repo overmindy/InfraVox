@@ -80,9 +80,12 @@ public final class ModelCatalog {
     }
 
     public final List<Model> models;
+    /** Bumped on every catalog change, so a newer catalog bundled in the APK beats an older cached one. */
+    public final int revision;
 
-    private ModelCatalog(List<Model> models) {
+    private ModelCatalog(List<Model> models, int revision) {
         this.models = models;
+        this.revision = revision;
     }
 
     public static ModelCatalog parse(String text) throws JSONException {
@@ -91,7 +94,7 @@ public final class ModelCatalog {
         List<Model> list = new ArrayList<>();
         JSONArray array = json.getJSONArray("models");
         for (int i = 0; i < array.length(); i++) list.add(new Model(array.getJSONObject(i)));
-        return new ModelCatalog(Collections.unmodifiableList(list));
+        return new ModelCatalog(Collections.unmodifiableList(list), json.optInt("revision", 0));
     }
 
     public Variant variant(String id) {

@@ -26,7 +26,10 @@ public interface DuplexEngine {
         }
     }
 
+    /** Input (microphone) sample rate; frameSamples() is in this rate. */
     int sampleRate();
+    /** Rate of the PCM in returned frames, whose length may vary per step. */
+    default int outputSampleRate() { return sampleRate(); }
     int frameSamples();
     String describe();
 

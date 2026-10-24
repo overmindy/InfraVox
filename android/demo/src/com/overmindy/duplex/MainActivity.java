@@ -485,7 +485,7 @@ public final class MainActivity extends Activity {
         PopupMenu menu = new PopupMenu(this, sourceChip);
         menu.getMenu().add(0, 0, 0, "🎤 麦克风");
         if (hasDemo()) menu.getMenu().add(0, 1, 1, "♪ 演示音频");
-        menu.getMenu().add(0, 2, 2, "📄 选择 WAV 文件（24 kHz 单声道）");
+        menu.getMenu().add(0, 2, 2, "📄 选择 WAV 文件（单声道 PCM16）");
         menu.setOnMenuItemClickListener(item -> {
             if (item.getItemId() == 2) {
                 Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -517,8 +517,8 @@ public final class MainActivity extends Activity {
                 while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
                 output.close();
                 try (InputStream check = new FileInputStream(target)) {
-                    short[] samples = Wav.readMono16(check, 24_000);
-                    message = String.format(Locale.US, "已选择 WAV：%.1f 秒，会按实时速度送入模型", samples.length / 24_000.0);
+                    short[] samples = Wav.readMono16(check, 16_000);
+                    message = String.format(Locale.US, "已选择 WAV：%.1f 秒，会按实时速度送入模型", samples.length / 16_000.0);
                 }
             } catch (Exception error) {
                 target.delete();

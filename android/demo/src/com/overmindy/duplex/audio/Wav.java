@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 public final class Wav {
     private Wav() { }
 
+    /** Reads a mono PCM16 WAV of any rate, linearly resampled to `sampleRate`. */
     public static short[] readMono16(InputStream input, int sampleRate) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         byte[] buffer = new byte[65536];
@@ -21,25 +22,36 @@ public final class Wav {
         while ((count = input.read(buffer)) != -1) bytes.write(buffer, 0, count);
         ByteBuffer file = ByteBuffer.wrap(bytes.toByteArray()).order(ByteOrder.LITTLE_ENDIAN);
         if (file.limit() < 44 || !tag(file, 0, "RIFF") || !tag(file, 8, "WAVE")) throw new IOException("不是 RIFF/WAVE 文件");
-        boolean format = false;
+        int rate = 0;
         short[] samples = null;
         for (int cursor = 12; cursor + 8 <= file.limit(); ) {
             long length = file.getInt(cursor + 4) & 0xffffffffL;
             int start = cursor + 8;
             if (length > file.limit() - start) throw new IOException("WAV 数据块损坏");
             if (tag(file, cursor, "fmt ")) {
-                if (length < 16 || file.getShort(start) != 1 || file.getShort(start + 2) != 1
-                        || file.getInt(start + 4) != sampleRate || file.getShort(start + 14) != 16)
-                    throw new IOException("需要 " + sampleRate / 1000 + " kHz 单声道 PCM16 WAV");
-                format = true;
+                if (length < 16 || file.getShort(start) != 1 || file.getShort(start + 2) != 1 || file.getShort(start + 14) != 16)
+                    throw new IOException("需要单声道 PCM16 WAV");
+                rate = file.getInt(start + 4);
             } else if (tag(file, cursor, "data")) {
                 samples = new short[(int) (length / 2)];
                 for (int i = 0; i < samples.length; i++) samples[i] = file.getShort(start + 2 * i);
             }
             cursor = start + (int) length + (int) (length & 1);
         }
-        if (!format || samples == null || samples.length == 0) throw new IOException("WAV 缺少 fmt 或 data");
-        return samples;
+        if (rate <= 0 || samples == null || samples.length == 0) throw new IOException("WAV 缺少 fmt 或 data");
+        return rate == sampleRate ? samples : resample(samples, rate, sampleRate);
+    }
+
+    private static short[] resample(short[] samples, int from, int to) {
+        short[] out = new short[(int) ((long) samples.length * to / from)];
+        for (int i = 0; i < out.length; i++) {
+            double at = (double) i * from / to;
+            int lo = Math.min((int) at, samples.length - 1);
+            int hi = Math.min(lo + 1, samples.length - 1);
+            double frac = at - lo;
+            out[i] = (short) Math.round(samples[lo] * (1 - frac) + samples[hi] * frac);
+        }
+        return out;
     }
 
     private static boolean tag(ByteBuffer file, int offset, String name) {
