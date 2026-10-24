@@ -112,7 +112,7 @@
           ],
           "htp": "v81",
           "qairt": "2.45.0.260326",
-          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；实测每帧凉机约 100 ms（RTF 1.25）、发热后约 130 ms（RTF 1.65），慢于实时，对话中延迟会逐渐累积；长对话中第三个问题起容易重复。",
+          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；实测每帧凉机约 100 ms（RTF 1.25）、发热后约 130 ms（RTF 1.65），慢于实时，对话中延迟会逐渐累积；能回答开头一两个问题，约 45 秒后开始绕圈、不再回应。",
           "files": [
             {
               "path": "frontend_embeddings.bin",

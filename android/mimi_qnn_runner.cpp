@@ -3,15 +3,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -267,6 +270,7 @@ class MoshiLm {
     runtime_.groupSpillBytes = spill;
     for (const auto& name : names) graphs_[name] = std::make_unique<Graph>(runtime_, directory + "/dlc/" + name + ".bin", true);
     for (const auto& path : parts) temporal_.push_back(std::make_unique<TemporalPart>(runtime_, path, true));
+    readContentWords(directory + "/text_vocab.txt");
   }
 
   ~MoshiLm() {
@@ -286,6 +290,7 @@ class MoshiLm {
     position_ = 0;
     textTemperature_ = textTemperature;
     random_.seed(seed);
+    recentWords_.clear();
   }
 
   std::optional<std::array<int32_t, 9>> step(const std::array<int32_t, 8>& user) {
@@ -344,26 +349,64 @@ class MoshiLm {
   }
 
  private:
-  // Only "speak or stay silent" is sampled (pad versus everything else, temperature + top-k as Kyutai);
-  // the word itself is the best non-pad token, because the quantized head's tail holds junk like "<".
+  // SentencePiece pieces that start a word ("▁") with at least 4 ASCII letters: the only ones the
+  // repetition penalty touches, so suffixes ("s", "ve"), punctuation and short function words stay free.
+  void readContentWords(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("Missing Moshi text vocabulary: " + path);
+    contentWord_.assign(logits_.size(), false);
+    std::string piece;
+    for (size_t id = 0; id < contentWord_.size() && std::getline(file, piece); ++id) {
+      if (piece.compare(0, 3, "\xE2\x96\x81") != 0) continue;
+      size_t letters = 0;
+      for (size_t i = 3; i < piece.size(); ++i) letters += std::isalpha(static_cast<unsigned char>(piece[i])) ? 1 : 0;
+      contentWord_[id] = letters >= 4;
+    }
+  }
+
+  // Two draws. "Speak or stay silent" is pad versus the rest of the top-k (temperature + top-k as
+  // Kyutai), since the speaking mass is spread over many words. The word is then sampled among
+  // non-pad tokens with two guards for the quantized LM: min-p drops the head's junk (like "<"),
+  // and a penalty on content words said recently breaks the loops that always taking the best
+  // word fell into ("will help you develop your skills..." from ~35 s).
   int32_t sampleText() {
     constexpr int32_t kPad = 3;
-    constexpr size_t kTopK = 25;
-    const auto best = std::max_element(logits_.begin(), logits_.end());
-    if (textTemperature_ <= 0.0f) return static_cast<int32_t>(best - logits_.begin());
+    constexpr size_t kTopK = 25, kRecentWords = 64;
+    constexpr float kMinP = 0.05f, kRepeatPenalty = 1.0f;
+    if (textTemperature_ <= 0.0f)
+      return static_cast<int32_t>(std::max_element(logits_.begin(), logits_.end()) - logits_.begin());
+    auto byLogit = [&](int32_t a, int32_t b) { return logits_[a] > logits_[b]; };
     std::vector<int32_t> ids(logits_.size());
     for (size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<int32_t>(i);
-    std::partial_sort(ids.begin(), ids.begin() + kTopK, ids.end(),
-                      [&](int32_t a, int32_t b) { return logits_[a] > logits_[b]; });
+    std::partial_sort(ids.begin(), ids.begin() + kTopK, ids.end(), byLogit);
     double pad = 0, total = 0;
-    int32_t word = -1;
     for (size_t i = 0; i < kTopK; ++i) {
-      const double weight = std::exp((logits_[ids[i]] - *best) / textTemperature_);
+      const double weight = std::exp((logits_[ids[i]] - logits_[ids[0]]) / textTemperature_);
       total += weight;
       if (ids[i] == kPad) pad = weight;
-      else if (word < 0) word = ids[i];
     }
-    return std::uniform_real_distribution<double>(0, total)(random_) < pad ? kPad : word;
+    if (std::uniform_real_distribution<double>(0, total)(random_) < pad) return kPad;
+
+    std::vector<int32_t> said(recentWords_.begin(), recentWords_.end());
+    std::sort(said.begin(), said.end());
+    said.erase(std::unique(said.begin(), said.end()), said.end());
+    for (int32_t word : said)
+      if (contentWord_[word]) logits_[word] -= kRepeatPenalty;
+    logits_[kPad] = -std::numeric_limits<float>::infinity();
+    std::partial_sort(ids.begin(), ids.begin() + kTopK, ids.end(), byLogit);
+    std::vector<double> weights(kTopK);
+    total = 0;
+    for (size_t i = 0; i < kTopK; ++i) {
+      const double weight = std::exp((logits_[ids[i]] - logits_[ids[0]]) / textTemperature_);
+      weights[i] = weight < kMinP ? 0.0 : weight;
+      total += weights[i];
+    }
+    double pick = std::uniform_real_distribution<double>(0, total)(random_);
+    size_t chosen = 0;
+    while (chosen + 1 < kTopK && pick >= weights[chosen]) pick -= weights[chosen++];
+    recentWords_.push_back(ids[chosen]);
+    if (recentWords_.size() > kRecentWords) recentWords_.pop_front();
+    return ids[chosen];
   }
 
   // DepFormer depth-cache tensor names.
@@ -380,6 +423,8 @@ class MoshiLm {
   int32_t position_ = 0;
   float textTemperature_ = 0.0f;
   std::mt19937 random_;
+  std::deque<int32_t> recentWords_;
+  std::vector<bool> contentWord_;
 };
 
 // Frame-by-frame duplex session: the app feeds one 80 ms microphone frame per step and plays
