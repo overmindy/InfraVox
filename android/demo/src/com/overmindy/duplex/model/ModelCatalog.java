@@ -62,6 +62,7 @@ public final class ModelCatalog {
         public final String id, engine, name, publisher, summary, license, upstream;
         public final List<String> languages;
         public final List<Variant> variants;
+        public final boolean recommended;  // default pick for a fresh install, and tagged in the list
 
         Model(JSONObject json) throws JSONException {
             id = json.getString("id");
@@ -72,6 +73,7 @@ public final class ModelCatalog {
             license = json.optString("license", "");
             upstream = json.optString("upstream", "");
             languages = strings(json.optJSONArray("languages"));
+            recommended = json.optBoolean("recommended", false);
             List<Variant> list = new ArrayList<>();
             JSONArray array = json.getJSONArray("variants");
             for (int i = 0; i < array.length(); i++) list.add(new Variant(this, array.getJSONObject(i)));

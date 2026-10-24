@@ -763,13 +763,15 @@ public final class MainActivity extends Activity {
     private ModelCatalog.Variant selectedVariant() {
         ModelCatalog.Variant chosen = catalog.variant(preferences.getString("selected_variant", ""));
         if (chosen != null) return chosen;
-        ModelCatalog.Variant fallback = null;
+        ModelCatalog.Variant fallback = null, compatible = null;
         for (ModelCatalog.Model model : catalog.models)
             for (ModelCatalog.Variant variant : model.variants) {
                 if (fallback == null) fallback = variant;
-                if (variant.supports(soc) && Engines.supports(model.engine)) return variant;
+                if (!variant.supports(soc) || !Engines.supports(model.engine)) continue;
+                if (model.recommended) return variant;
+                if (compatible == null) compatible = variant;
             }
-        return fallback;
+        return compatible != null ? compatible : fallback;
     }
 
     private View buildModelsPage() {
@@ -798,6 +800,8 @@ public final class MainActivity extends Activity {
                     + (model.languages.isEmpty() ? "" : " · " + String.join("/", model.languages));
             ui.text(names, meta, 12, Ui.MUTED, false);
             head.addView(names, new LinearLayout.LayoutParams(0, -2, 1));
+            if (model.recommended)
+                ((LinearLayout.LayoutParams) ui.chip(head, "推荐", Ui.LIVE).getLayoutParams()).rightMargin = ui.dp(6);
             ui.chip(head, model.engine, Ui.ACCENT);
             card.addView(head);
             if (!model.summary.isEmpty()) ui.text(card, model.summary, 14, Ui.TEXT, false).setPadding(0, ui.dp(8), 0, 0);

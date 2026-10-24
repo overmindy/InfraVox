@@ -1,13 +1,102 @@
 {
   "schema": 1,
-  "revision": 2,
+  "revision": 3,
   "models": [
+    {
+      "id": "minicpmo-4.5",
+      "engine": "minicpmo",
+      "recommended": true,
+      "name": "MiniCPM-o 4.5",
+      "publisher": "OpenBMB",
+      "summary": "9B 全模态模型的全双工语音部分（中英文）：Whisper-medium 听、Qwen3-8B 每秒决定听或说、TTS + CosyVoice2 流式发声。",
+      "languages": [
+        "zh",
+        "en"
+      ],
+      "license": "Apache-2.0",
+      "upstream": "openbmb/MiniCPM-o-4_5",
+      "variants": [
+        {
+          "id": "minicpmo45-v1-sm8850",
+          "title": "LLM LPBQ W4 · Whisper / DiT / HiFT W8 · TTS CPU int8",
+          "path": "minicpmo/minicpmo45-v1-sm8850",
+          "socs": [
+            "SM8850"
+          ],
+          "htp": "v81",
+          "qairt": "2.45.0.260326",
+          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；1 秒一个单元，TTS 在 CPU 上；实测说话时 HTP 约 810 ms/s，能跟上实时，语音比文字晚约 2 秒（含 1 秒播放预留）。",
+          "files": [
+            {
+              "path": "assets.bin",
+              "size": 1733394180,
+              "sha256": "48e86df743f1b0b9d388c3de9ae57de1c5ad35587250be03699bc5b0d636a06e"
+            },
+            {
+              "path": "audio_encoder.bin",
+              "size": 338874368,
+              "sha256": "861ad7da7799a1af457692778bb10987d2554888a758ceb3ca0e7a3cec817a79"
+            },
+            {
+              "path": "dit.bin",
+              "size": 80216064,
+              "sha256": "b2c12369568a11e843db7a8fdbd5dfadd602fe8409e889fdd636a8396d028724"
+            },
+            {
+              "path": "flow_encoder.onnx",
+              "size": 185649479,
+              "sha256": "6cf1a240eb98dfd1122c79e4c1ebd368fca84ebecad74a07029d12251f33efe9"
+            },
+            {
+              "path": "hift_decode.bin",
+              "size": 24342528,
+              "sha256": "e01bba7007048dea84aac2aeafe7ed84a124cc83e7cc1bd230f43095660afe94"
+            },
+            {
+              "path": "hift_f0.bin",
+              "size": 3416064,
+              "sha256": "765d3f5c2af4887bd2693bc2476cabe5c72ce464d4724e21cb2808fda529e6fe"
+            },
+            {
+              "path": "llm_head.bin",
+              "size": 628146176,
+              "sha256": "24d13026032ed7bc41fdd3714e9d903086482d5a4a97fa6159fae9dd71d048a4"
+            },
+            {
+              "path": "llm_part_0.bin",
+              "size": 913174528,
+              "sha256": "7700e58c3cc3b11085f6607c0b5395ece88456426d71f56363fac31e73a121b6"
+            },
+            {
+              "path": "llm_part_1.bin",
+              "size": 913268736,
+              "sha256": "8dff714578d79c4cf0f534d26d98b20786d7db2ea8a5dcce3fdf07566e10ef60"
+            },
+            {
+              "path": "llm_part_2.bin",
+              "size": 913170432,
+              "sha256": "3c8933b81955b45b526868a22424e1a14914859e150cd25c9196f11256f9655b"
+            },
+            {
+              "path": "llm_part_3.bin",
+              "size": 913256448,
+              "sha256": "1f9b08be92659cadfcd53819989a9e5a283503de9c2ce4f2ca0b941e97e76bfa"
+            },
+            {
+              "path": "tts_cpu.bin",
+              "size": 194742088,
+              "sha256": "74969808183cc9f91b37d0eee28c617a817b302af3ff445b98cbdea0e4301676"
+            }
+          ]
+        }
+      ]
+    },
     {
       "id": "moshiko",
       "engine": "moshi",
       "name": "Moshi · Moshiko",
       "publisher": "Kyutai",
-      "summary": "7B 全双工语音对话模型（英文），Mimi 24 kHz 编解码，80 ms 一帧，边听边说。",
+      "summary": "7B 全双工语音对话模型（英文，实验性），Mimi 24 kHz 编解码，80 ms 一帧，边听边说。",
       "languages": [
         "en"
       ],
@@ -23,7 +112,7 @@
           ],
           "htp": "v81",
           "qairt": "2.45.0.260326",
-          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；实测 RTF≈2（每帧 125–140 ms 加调度开销），对话中延迟会逐渐累积。",
+          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；实测每帧凉机约 100 ms（RTF 1.25）、发热后约 130 ms（RTF 1.65），慢于实时，对话中延迟会逐渐累积；长对话中第三个问题起容易重复。",
           "files": [
             {
               "path": "frontend_embeddings.bin",
@@ -109,94 +198,6 @@
               "path": "text_vocab.txt",
               "size": 296134,
               "sha256": "3ffec0c8b77830b019735efe8844dff234a4fb24ae241cad3a8ca1475467eb6d"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "id": "minicpmo-4.5",
-      "engine": "minicpmo",
-      "name": "MiniCPM-o 4.5",
-      "publisher": "OpenBMB",
-      "summary": "9B 全模态模型的全双工语音部分（中英文）：Whisper-medium 听、Qwen3-8B 每秒决定听或说、TTS + CosyVoice2 流式发声。",
-      "languages": [
-        "zh",
-        "en"
-      ],
-      "license": "Apache-2.0",
-      "upstream": "openbmb/MiniCPM-o-4_5",
-      "variants": [
-        {
-          "id": "minicpmo45-v1-sm8850",
-          "title": "LLM LPBQ W4 · Whisper / DiT / HiFT W8 · TTS CPU int8",
-          "path": "minicpmo/minicpmo45-v1-sm8850",
-          "socs": [
-            "SM8850"
-          ],
-          "htp": "v81",
-          "qairt": "2.45.0.260326",
-          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；1 秒一个单元，TTS 在 CPU 上；实测说话时 HTP 约 810 ms/s，能跟上实时，语音比文字晚约 2 秒（含 1 秒播放预留）。",
-          "files": [
-            {
-              "path": "assets.bin",
-              "size": 1733394180,
-              "sha256": "48e86df743f1b0b9d388c3de9ae57de1c5ad35587250be03699bc5b0d636a06e"
-            },
-            {
-              "path": "audio_encoder.bin",
-              "size": 338874368,
-              "sha256": "861ad7da7799a1af457692778bb10987d2554888a758ceb3ca0e7a3cec817a79"
-            },
-            {
-              "path": "dit.bin",
-              "size": 80216064,
-              "sha256": "b2c12369568a11e843db7a8fdbd5dfadd602fe8409e889fdd636a8396d028724"
-            },
-            {
-              "path": "flow_encoder.onnx",
-              "size": 185649479,
-              "sha256": "6cf1a240eb98dfd1122c79e4c1ebd368fca84ebecad74a07029d12251f33efe9"
-            },
-            {
-              "path": "hift_decode.bin",
-              "size": 24342528,
-              "sha256": "e01bba7007048dea84aac2aeafe7ed84a124cc83e7cc1bd230f43095660afe94"
-            },
-            {
-              "path": "hift_f0.bin",
-              "size": 3416064,
-              "sha256": "765d3f5c2af4887bd2693bc2476cabe5c72ce464d4724e21cb2808fda529e6fe"
-            },
-            {
-              "path": "llm_head.bin",
-              "size": 628146176,
-              "sha256": "24d13026032ed7bc41fdd3714e9d903086482d5a4a97fa6159fae9dd71d048a4"
-            },
-            {
-              "path": "llm_part_0.bin",
-              "size": 913174528,
-              "sha256": "7700e58c3cc3b11085f6607c0b5395ece88456426d71f56363fac31e73a121b6"
-            },
-            {
-              "path": "llm_part_1.bin",
-              "size": 913268736,
-              "sha256": "8dff714578d79c4cf0f534d26d98b20786d7db2ea8a5dcce3fdf07566e10ef60"
-            },
-            {
-              "path": "llm_part_2.bin",
-              "size": 913170432,
-              "sha256": "3c8933b81955b45b526868a22424e1a14914859e150cd25c9196f11256f9655b"
-            },
-            {
-              "path": "llm_part_3.bin",
-              "size": 913256448,
-              "sha256": "1f9b08be92659cadfcd53819989a9e5a283503de9c2ce4f2ca0b941e97e76bfa"
-            },
-            {
-              "path": "tts_cpu.bin",
-              "size": 194742088,
-              "sha256": "74969808183cc9f91b37d0eee28c617a817b302af3ff445b98cbdea0e4301676"
             }
           ]
         }
