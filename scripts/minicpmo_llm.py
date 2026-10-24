@@ -211,12 +211,17 @@ def part_names(part: int) -> tuple[list[str], list[str]]:
 
 
 class HostRing:
-    """Host KV window in the graph layout. Position t lives in slot t % PAST (no wrap in calibration)."""
+    """Host KV window in the graph layout. Position t lives in slot t while it fits, then cycles over
+    the slots after `pinned` (no wrap in calibration)."""
 
     def __init__(self, device: torch.device) -> None:
         self.keys = [torch.zeros(KV_HEADS, 1, HEAD_DIM, PAST, device=device) for _ in range(LAYERS_PER_PART)]
         self.values = [torch.zeros(KV_HEADS, 1, PAST, HEAD_DIM, device=device) for _ in range(LAYERS_PER_PART)]
         self.device = device
+        self.pinned = 0  # positions kept once the ring is full (minicpmo_runner.cpp KvModel::pin)
+
+    def slot(self, position: int) -> int:
+        return position if position < self.pinned else self.pinned + (position - self.pinned) % (PAST - self.pinned)
 
     def inputs(self, position: int, count: int, n: int):
         """Mask, cos, sin and past for `count` real tokens at positions position.. padded to n rows."""
@@ -232,7 +237,7 @@ class HostRing:
 
     def write(self, position: int, count: int, outputs) -> None:
         for j in range(count):
-            slot = (position + j) % PAST
+            slot = self.slot(position + j)
             for i in range(LAYERS_PER_PART):
                 self.keys[i][..., slot] = outputs[2 * i][..., j]
                 self.values[i][:, :, slot] = outputs[2 * i + 1][:, :, j]

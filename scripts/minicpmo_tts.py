@@ -114,6 +114,10 @@ class HostRing:
         self.keys = [torch.zeros(HEADS, 1, HEAD_DIM, PAST, device=device) for _ in range(LAYERS)]
         self.values = [torch.zeros(HEADS, 1, PAST, HEAD_DIM, device=device) for _ in range(LAYERS)]
         self.device = device
+        self.pinned = 0  # positions kept once the ring is full (minicpmo_runner.cpp KvModel::pin)
+
+    def slot(self, position: int) -> int:
+        return position if position < self.pinned else self.pinned + (position - self.pinned) % (PAST - self.pinned)
 
     def inputs(self, position: int, count: int, n: int):
         mask = torch.full((1, 1, n, PAST + n), MASK_MIN, device=self.device)
@@ -126,7 +130,7 @@ class HostRing:
 
     def write(self, position: int, count: int, outputs) -> None:
         for j in range(count):
-            slot = (position + j) % PAST
+            slot = self.slot(position + j)
             for i in range(LAYERS):
                 self.keys[i][..., slot] = outputs[2 * i][..., j]
                 self.values[i][:, :, slot] = outputs[2 * i + 1][:, :, j]

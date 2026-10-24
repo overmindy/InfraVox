@@ -41,7 +41,8 @@ mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/stage/lib/arm64-v8a" "$OUT/stage/assets
   -static-libstdc++ -Wl,--no-undefined -I "$QNN_HEADERS" \
   "$REPO_ROOT/android/mimi_qnn_runner.cpp" "$SCRIPT_DIR/moshi_jni.cpp" \
   -o "$OUT/stage/lib/arm64-v8a/libmoshi_qnn.so" -ldl
-"$CXX" -std=c++17 -O2 -Wall -Wextra -Werror -fPIC -shared \
+# dotprod: the CPU TTS uses sdot (every SM8850 core has it).
+"$CXX" -std=c++17 -O2 -march=armv8.2-a+dotprod -Wall -Wextra -Werror -fPIC -shared \
   -static-libstdc++ -Wl,--no-undefined -I "$QNN_HEADERS" -I "$ORT/headers" \
   "$REPO_ROOT/android/minicpmo_runner.cpp" "$SCRIPT_DIR/minicpmo_jni.cpp" \
   -o "$OUT/stage/lib/arm64-v8a/libminicpmo_qnn.so" -L "$ORT/jni/arm64-v8a" -lonnxruntime -ldl

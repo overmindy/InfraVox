@@ -5,7 +5,7 @@
 """Host-side assets of the MiniCPM-o phone bundle, as one tensor container OUT/assets.bin.
 
 Format (little endian): "MCPOTEN1", uint32 count, then per tensor: uint16 name length, name,
-uint8 dtype (0 f32, 1 f16, 2 i32, 3 u8), uint8 rank, uint32 dims[rank], uint64 offset, uint64 bytes;
+uint8 dtype (0 f32, 1 f16, 2 i32, 3 u8, 4 i8), uint8 rank, uint32 dims[rank], uint64 offset, uint64 bytes;
 data blocks follow, each 64-byte aligned (the phone mmaps the file).
 
 Tensors: LLM and TTS embedding tables, Whisper positions and mel filters, the system prompt
@@ -28,7 +28,7 @@ import minicpmo_audio as audio
 from minicpmo_flow import timesteps
 from minicpmo_llm import Weights
 
-DTYPES = {np.float32: 0, np.float16: 1, np.int32: 2, np.uint8: 3}
+DTYPES = {np.float32: 0, np.float16: 1, np.int32: 2, np.uint8: 3, np.int8: 4}
 UNIT_TOKEN = 151683
 
 

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "revision": 1,
+  "revision": 2,
   "models": [
     {
       "id": "moshiko",
@@ -129,14 +129,14 @@
       "variants": [
         {
           "id": "minicpmo45-v1-sm8850",
-          "title": "LLM LPBQ W4 · TTS / Whisper / DiT / HiFT W8",
+          "title": "LLM LPBQ W4 · Whisper / DiT / HiFT W8 · TTS CPU int8",
           "path": "minicpmo/minicpmo45-v1-sm8850",
           "socs": [
             "SM8850"
           ],
           "htp": "v81",
           "qairt": "2.45.0.260326",
-          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；1 秒一个单元；实测说话时每单元主线程 600–850 ms、HTP 约 940 ms，能跟上实时，语音比文字晚 1 秒。",
+          "notes": "QNN HTP context 绑定 SoC 与 QAIRT 版本；1 秒一个单元，TTS 在 CPU 上；实测说话时 HTP 约 810 ms/s，能跟上实时，语音比文字晚约 2 秒（含 1 秒播放预留）。",
           "files": [
             {
               "path": "assets.bin",
@@ -194,9 +194,9 @@
               "sha256": "1f9b08be92659cadfcd53819989a9e5a283503de9c2ce4f2ca0b941e97e76bfa"
             },
             {
-              "path": "tts.bin",
-              "size": 206761984,
-              "sha256": "985c10ce3c86d8244dd5b9a1676fd3375fbfc3cc55e3e6bcbc8c7c92f01f30ff"
+              "path": "tts_cpu.bin",
+              "size": 194742088,
+              "sha256": "74969808183cc9f91b37d0eee28c617a817b302af3ff445b98cbdea0e4301676"
             }
           ]
         }

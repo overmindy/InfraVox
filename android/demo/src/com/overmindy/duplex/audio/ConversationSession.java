@@ -7,6 +7,7 @@ import android.media.AudioTrack;
 import android.media.MediaRecorder;
 import android.media.audiofx.AcousticEchoCanceler;
 import android.os.Build;
+import android.util.Log;
 
 import com.overmindy.duplex.engine.DuplexEngine;
 import com.overmindy.duplex.history.Turn;
@@ -180,6 +181,7 @@ public final class ConversationSession {
     private void run() {
         Throwable failure = null;
         AudioTrack track = null;
+        long played = 0;  // samples written to the track, silence padding included
         Wav.Writer input = null, output = null;
         Writer tokens = null;
         StringBuilder transcript = new StringBuilder();
@@ -191,6 +193,7 @@ public final class ConversationSession {
                     new FileOutputStream(new File(config.directory, "tokens.csv")), StandardCharsets.UTF_8));
             tokens.write("frame,text,codes\n");
             track = openTrack();
+            final long reserve = (long) engine.playbackReserveMs() * outputRate / 1000;
             final double frameMs = 1000.0 * frame / rate;
             int tail = 0, lastText = -TAIL_QUIET;
             while (!aborted) {
@@ -213,7 +216,16 @@ public final class ConversationSession {
                 String text = "";
                 if (result != null) {
                     stats.emitted++;
+                    // Build the reserve with silence while the model is quiet (or once the player ran dry),
+                    // never inside speech, so late bursts during an answer drain it instead of stalling.
+                    long queued = played - (track.getPlaybackHeadPosition() & 0xffffffffL);
+                    if (queued < reserve && (queued <= 0 || silent(result.pcm))) {
+                        short[] pad = new short[(int) (reserve - Math.max(queued, 0))];
+                        writeFully(track, pad);
+                        played += pad.length;
+                    }
                     writeFully(track, result.pcm);
+                    played += result.pcm.length;
                     output.write(result.pcm);
                     stats.outputLevel = level(result.pcm);
                     tokens.write(stats.emitted + "," + csv(result.text) + "," + join(result.codes) + "\n");
@@ -238,7 +250,7 @@ public final class ConversationSession {
                 try { if (closeable != null) closeable.close(); } catch (IOException ignored) { }
             }
             writeText(new File(config.directory, "transcript.txt"), transcript.toString().trim());
-            if (track != null) finishTrack(track, output == null ? 0 : output.samples(), aborted);
+            if (track != null) finishTrack(track, played, aborted);
             stats.backlog = queue.size();
             queue.clear();
             listener.onFinished(failure, stats.copy(), turns.snapshot());
@@ -264,7 +276,7 @@ public final class ConversationSession {
                 .setAudioFormat(new AudioFormat.Builder().setSampleRate(outputRate)
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                .setBufferSizeInBytes(Math.max(minimum, outputRate * 2 * 2))
+                .setBufferSizeInBytes(Math.max(minimum, (int) ((long) outputRate * 2 * (3000 + engine.playbackReserveMs()) / 1000)))
                 .setTransferMode(AudioTrack.MODE_STREAM).build();
         // The default start threshold is the whole buffer; start playing after one frame instead.
         if (Build.VERSION.SDK_INT >= 31) track.setStartThresholdInFrames((int) ((long) frame * outputRate / rate));
@@ -287,8 +299,14 @@ public final class ConversationSession {
                 && System.currentTimeMillis() < deadline) {
             try { Thread.sleep(20); } catch (InterruptedException error) { break; }
         }
+        Log.i("InfraVox", "playback: " + samples + " samples, " + track.getUnderrunCount() + " underruns");
         try { track.stop(); } catch (IllegalStateException ignored) { }
         track.release();
+    }
+
+    private static boolean silent(short[] pcm) {
+        for (short sample : pcm) if (sample != 0) return false;
+        return true;
     }
 
     private static double decibels(short[] pcm) {

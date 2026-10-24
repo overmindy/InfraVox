@@ -171,7 +171,8 @@ Mac 上 `scripts/minicpmo_deploy.sh` 推到手机并安装 App；路径在 `scri
 | `scripts/minicpmo_capture.py` | 用模型自己的 TTS 合成 20 个中英文提问，跑官方双工流程，记录每个图的输入（校准数据 + 对齐基准） |
 | `scripts/minicpmo_llm.py` | LLM 的高通 LLM 布局（AR-1 / AR-16 共享权重和 KV 环）+ head；LPBQ W4 / A16 / 8-bit KV |
 | `scripts/minicpmo_audio.py` | 流式 Whisper 编码器图（W8） |
-| `scripts/minicpmo_tts.py` | TTS 的 AR-1 / AR-16 图（W8） |
+| `scripts/minicpmo_tts.py` | TTS 的 AR-1 / AR-16 HTP 图（W8）与 Llama 参考；一键构建已改用 CPU TTS，不再编译它 |
+| `scripts/minicpmo_tts_cpu.py` | 手机 CPU 上的 TTS：int8 权重（`tts_cpu.bin`）、同一套算术的参考实现、与浮点 TTS 的对比、主机测试向量 |
 | `scripts/minicpmo_flow.py` | DiT 单步图、时间步调制预计算、NSF 源 / STFT / iSTFT、`Token2wavHost`（缓存规则与官方一致） |
 | `scripts/minicpmo_token2wav_prepare.py` | 官方 token2wav 侧（minicpmo 环境）：固定音色的提示缓存、conformer ONNX、HiFT 图、golden 数据 |
 | `scripts/minicpmo_token2wav.py` | DiT / HiFT 对齐与校准 |
@@ -185,20 +186,28 @@ Mac 上 `scripts/minicpmo_deploy.sh` 推到手机并安装 App；路径在 `scri
 App 里 MiniCPM-o 引擎输入 16 kHz、每帧 80 ms（1280 样本，与 Moshi 的帧时间轴一致），运行器攒满 1 秒算一个单元，
 输出 24 kHz（听的时候返回 1 秒静音）。
 
-## 实时性能（SM8850，演示提问，31 秒通话）
+## 实时性能（SM8850，6 个提问的 4 分钟通话）
 
 LLM 在主线程，TTS + token2wav 在工作线程晚一个单元跑（语音输出因此多 1 秒延迟），CPU 上的 flow conformer、
 NSF / STFT 与下一单元的 LLM 重叠；HTP 执行用一把锁串行（各 context 共用一块 spill-fill 缓冲）。
+TTS 在 CPU 上跑（`scripts/minicpmo_tts_cpu.py`：int8 权重按行缩放、输入按 64 一组量化成 int8 用 sdot，
+与浮点 TTS 的 logits 中位相对误差 0.7%、top-1 一致 96%），不再占 HTP。
 
 | 项目 | 耗时 |
 |---|---|
-| 说话单元，主线程（mel + Whisper + LLM 解码） | 600–850 ms / 1 s |
-| 说话单元，工作线程（TTS 25 个码 + token2wav） | 约 435 ms |
-| 说话时 HTP 合计 | 约 940 ms / 1 s（余量很小） |
-| LLM AR-1 每 token（4 段 + head） | 约 105 ms，每单元约 4–5 个 token |
-| 加载 / 系统提示预填充 | 4.4 s / 1.1 s |
+| 说话单元，主线程（mel + Whisper + LLM 解码） | 多为 500–900 ms / 1 s，一单元解 6–8 个 token 时到 1.0–1.1 s |
+| 说话单元，工作线程（CPU TTS 25 个码 + token2wav） | 约 230 + 390 ms |
+| 说话时 HTP 合计 | 约 810 ms / 1 s（TTS 在 HTP 上时约 920 ms） |
+| LLM AR-1 每 token（4 段 + head） | 约 115 ms（CPU TTS 同时占内存带宽），每单元约 4–5 个 token |
+| 加载 / 系统提示预填充 | 4.4 s / 1.3 s |
 
+播放端为 MiniCPM-o 保持 1 s 预留（模型安静时用静音补，说话中不插静音），4 分钟测试 0 次 underrun。
 head 用 W4 能省约 50 ms/s 的 HTP，但 top-1 与浮点一致率从 0.978 掉到 0.898，所以保留 W8。
+
+## 长对话
+
+LLM 和 TTS 的 KV 环各 2032 个位置。满了以后保留系统提示（TTS 保留本轮第一个 chunk），其余位置循环覆盖最旧的
+单元；键保留绝对 RoPE 位置（Qwen3 训练到 40960，约 40 分钟）。不这样做时约 2 分钟后系统提示被覆盖，模型不再说话。
 
 ## 关键约束
 

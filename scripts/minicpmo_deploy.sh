@@ -46,9 +46,12 @@ while read -r sum file; do
   remote cat "$REMOTE/$file" | adb exec-in "cat > $M/$file"
 done < "$TMP/SHA256SUMS"
 adb push "$TMP/SHA256SUMS" "$M/SHA256SUMS" > /dev/null
+for file in $(adb shell ls "$M"); do  # files of an older bundle layout (e.g. tts.bin)
+  [ "$file" = SHA256SUMS ] || grep -q "  $file\$" "$TMP/SHA256SUMS" || { echo "remove $file"; adb shell rm -f "$M/$file"; }
+done
 adb shell "chmod 755 $M 2>/dev/null; chmod 644 $M/* 2>/dev/null; cd $M && sha256sum -c SHA256SUMS"  # chmod fails once the app owns the dir
 
 echo "== app"
-remote cat "$MCPO_ROOT/capture/questions/s00.wav" > "$TMP/demo.wav"
+if [ -n "${MCPO_DEMO_WAV:-}" ]; then cp "$MCPO_DEMO_WAV" "$TMP/demo.wav"; else remote cat "$MCPO_ROOT/capture/questions/s00.wav" > "$TMP/demo.wav"; fi
 SAMPLE_WAV=$TMP/demo.wav OUT_DIR=$TMP/apk bash "$R/android/demo/build.sh"
 adb install -r "$TMP/apk/infravox.apk"

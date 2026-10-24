@@ -36,7 +36,8 @@ echo "== calibration (AIMET), two GPU queues"
 {
   step "$W/token2wav/hift_decode/hift_decode.encodings" token2wav aimet "${GPUS[0]}" "$S/minicpmo_token2wav.py" --work-dir "$W"
   step "$W/audio_encoder/audio_encoder.encodings" audio_encoder aimet "${GPUS[0]}" "$S/minicpmo_audio.py" "${COMMON[@]}"
-  step "$W/tts_ar16/tts_ar16.encodings" tts aimet "${GPUS[0]}" "$S/minicpmo_tts.py" "${COMMON[@]}"
+  step "$W/tts_cpu/tts_cpu.bin" tts_cpu aimet "${GPUS[0]}" "$S/minicpmo_tts_cpu.py" --model-dir "$MCPO_HF" \
+    --capture-dir "$MCPO_CAPTURE" --output "$W/tts_cpu/tts_cpu.bin" --host-test-dir "$W/hosttest"
   for p in 1 3; do
     step "$W/llm_part_${p}_ar16/llm_part_${p}_ar16.encodings" "llm_part_$p" aimet "${GPUS[0]}" "$S/minicpmo_llm.py" part --part $p "${COMMON[@]}"
   done
@@ -60,7 +61,6 @@ pids=()
 for p in 0 1 2 3; do build "llm_part_$p" "llm_part_${p}_ar1" "llm_part_${p}_ar16" & pids+=($!); done
 build llm_head llm_head & pids+=($!)
 build audio_encoder audio_encoder & pids+=($!)
-build tts tts_ar1 tts_ar16 & pids+=($!)
 build dit dit & pids+=($!)
 build hift_f0 hift_f0 & pids+=($!)
 build hift_decode hift_decode & pids+=($!)
@@ -69,10 +69,11 @@ await "${pids[@]}"
 B=$MCPO_ROOT/bundle/$MCPO_BUNDLE
 echo "== bundle $B"
 mkdir -p "$B"
-for name in llm_part_0 llm_part_1 llm_part_2 llm_part_3 llm_head audio_encoder tts dit hift_f0 hift_decode; do
+for name in llm_part_0 llm_part_1 llm_part_2 llm_part_3 llm_head audio_encoder dit hift_f0 hift_decode; do
   ln -f "$W/contexts/$name.bin" "$B/"
 done
-ln -f "$W/token2wav/flow_encoder.onnx" "$B/"
+rm -f "$B/tts.bin"  # bundles before the TTS moved to the CPU
+ln -f "$W/token2wav/flow_encoder.onnx" "$W/tts_cpu/tts_cpu.bin" "$B/"
 [ -f "$B/assets.bin" ] || aimet "${GPUS[0]}" "$S/minicpmo_bundle.py" "${COMMON[@]}" --output "$B/assets.bin" > "$W/logs/bundle.log" 2>&1
 (cd "$B" && sha256sum assets.bin flow_encoder.onnx ./*.bin | sed 's#  \./#  #' | sort -k2 -u > SHA256SUMS)
 cat "$B/SHA256SUMS"

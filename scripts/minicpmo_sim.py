@@ -111,7 +111,7 @@ class Graphs:
 
 
 class LLMState:
-    """Host KV rings of the four parts. New tokens go to slot position % PAST."""
+    """Host KV rings of the four parts; past the capacity the oldest units are evicted, not the prompt."""
 
     def __init__(self, g: Graphs) -> None:
         self.g = g
@@ -218,6 +218,7 @@ class TTSState:
     def generate(self, condition: np.ndarray, min_tokens: int, max_tokens: int = 26) -> list[int]:
         """MiniCPMTTS.generate_chunk: temperature 0.8, repetition penalty 1.05 over this chunk's last 16."""
         tokens: list[int] = []
+        turn_start = self.position == 0
         logits = self.step(condition)
         for t in range(max_tokens):
             if t > 0:
@@ -236,6 +237,8 @@ class TTSState:
             if t == max_tokens - 1:
                 break
             tokens.append(code)
+        if turn_start:
+            self.ring.pinned = self.position  # the turn's first chunk anchors answers past the ring
         return tokens
 
 
@@ -255,6 +258,8 @@ class Duplex:
         self.audio_buffer = np.zeros(0, np.float32)
         self.mels: list[np.ndarray] = []
         self.llm.feed(system_embeds, need_logits=False)
+        for ring in self.llm.rings:
+            ring.pinned = len(system_embeds)  # evict the oldest units, never the system prompt
 
     def embed(self, token: int) -> np.ndarray:
         return self.g.embed[token].float().numpy()[None]

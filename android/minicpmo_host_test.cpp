@@ -1,5 +1,6 @@
 // Host-side checks of minicpmo_runner.cpp's CPU math against vectors from the server scripts
-// (scripts/minicpmo_hift_check.py and a captured duplex session's Whisper input). Builds and
+// (scripts/minicpmo_hift_check.py, scripts/minicpmo_tts_cpu.py with its tts_cpu.bin, and a
+// captured duplex session's Whisper input). Builds and
 // runs on a desktop; no QNN device or ONNX Runtime library is needed.
 //   clang++ -std=c++17 -O2 -I <qnn include> -I <ort headers> android/minicpmo_host_test.cpp -o host_test
 //   ./host_test <dir with audio.f32 mel.f32 mel_filters.f32 f0.f32 ... wave.f32>
@@ -80,5 +81,31 @@ int main(int argc, char** argv) {
   const auto wave = load(dir + "/wave.f32");
   const auto samples = istft16(head.data(), frames, frames);
   ok &= report("istft", maxAbs(samples.data(), wave.data(), wave.size()), 1e-4);
+
+  // CPU TTS: teacher-forced steps against scripts/minicpmo_tts_cpu.py (tts_cpu.bin from the server).
+  const auto embeds = load(dir + "/tts_embeds.f32");
+  const auto expected = load(dir + "/tts_logits.f32");
+  CpuTts tts(dir + "/tts_cpu.bin");
+  tts.awake(true);
+  double ttsFirst = 0, ttsWorst = 0;
+  const size_t steps = embeds.size() / kTtsDim;
+  const auto start = Clock::now();
+  for (size_t s = 0; s < steps; ++s) {
+    const auto logits = tts.step(embeds.data() + s * kTtsDim);
+    double error = 0, norm = 0;
+    for (size_t c = 0; c < static_cast<size_t>(kCodes); ++c) {
+      const double reference = expected[s * kCodes + c];
+      error += (logits[c] - reference) * (logits[c] - reference);
+      norm += reference * reference;
+    }
+    if (s == 0) ttsFirst = std::sqrt(error / norm);
+    ttsWorst = std::max(ttsWorst, std::sqrt(error / norm));
+  }
+  tts.awake(false);
+  std::cout << "cpu tts: " << elapsedMs(start) / steps << " ms per step on this host\n";
+  // Same arithmetic, so step 0 matches exactly; later steps drift by int8 rounding ties that flip
+  // differently in float, which the KV cache carries forward (noise of the quantization's size).
+  ok &= report("cpu tts step 0 (relative)", ttsFirst, 1e-5);
+  ok &= report("cpu tts all steps (relative)", ttsWorst, 2e-2);
   return ok ? 0 : 1;
 }

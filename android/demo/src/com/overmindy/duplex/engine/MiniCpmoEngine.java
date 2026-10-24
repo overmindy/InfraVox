@@ -21,6 +21,8 @@ public final class MiniCpmoEngine implements DuplexEngine {
 
     @Override public int sampleRate() { return 16_000; }
     @Override public int outputSampleRate() { return 24_000; }
+    // Each 1 s unit's audio lands 150-950 ms after the unit, depending on how much it decoded.
+    @Override public int playbackReserveMs() { return 1000; }
     @Override public int frameSamples() { return FRAME_SAMPLES; }
     @Override public String describe() { return "MiniCPM-o 4.5 双工"; }
 

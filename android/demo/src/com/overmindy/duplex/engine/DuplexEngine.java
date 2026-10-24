@@ -30,6 +30,8 @@ public interface DuplexEngine {
     int sampleRate();
     /** Rate of the PCM in returned frames, whose length may vary per step. */
     default int outputSampleRate() { return sampleRate(); }
+    /** Audio kept queued in the player ahead of playback, for engines whose output arrives in bursts. */
+    default int playbackReserveMs() { return 0; }
     int frameSamples();
     String describe();
 

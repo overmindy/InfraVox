@@ -1,9 +1,15 @@
 // On-device MiniCPM-o 4.5 full-duplex speech runner: QNN HTP context binaries for every network
 // except the flow conformer, which runs on the CPU through ONNX Runtime (its relative positions
-// depend on the cache length). The host logic mirrors scripts/minicpmo_sim.py, itself a port of
+// depend on the cache length), and the TTS, which runs on the CPU (int8) to leave the HTP to the
+// LLM and the vocoder. The host logic mirrors scripts/minicpmo_sim.py, itself a port of
 // MiniCPMODuplex.streaming_prefill / streaming_generate and stepaudio2 Token2wav.stream.
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <exception>
@@ -85,6 +91,7 @@ class Assets {
   const uint16_t* f16(const std::string& name) const { return reinterpret_cast<const uint16_t*>(get(name, 1).data); }
   const int32_t* i32(const std::string& name) const { return reinterpret_cast<const int32_t*>(get(name, 2).data); }
   const uint8_t* u8(const std::string& name) const { return get(name, 3).data; }
+  const int8_t* i8(const std::string& name) const { return reinterpret_cast<const int8_t*>(get(name, 4).data); }
 
  private:
   MappedFile file_;
@@ -163,6 +170,17 @@ class KvModel {
 
   void reset() {
     for (auto& ring : rings_) std::memset(ring.storage->data(), ring.zero, ring.storage->bytes());
+    pinned_ = 0;
+  }
+
+  // Keeps positions 0..count-1 (system prompt / first TTS chunk) once the ring is full: later
+  // positions cycle over the remaining slots, so the oldest units are evicted instead of the prompt.
+  // Keys keep their absolute RoPE positions, as with an unbounded cache.
+  void pin(size_t count) { pinned_ = std::min(count, past_ / 2); }
+
+  size_t slot(int64_t position) const {
+    const auto p = static_cast<size_t>(position);
+    return p < pinned_ ? p : pinned_ + (p - pinned_) % (past_ - pinned_);
   }
 
   // Runs `count` (1..16) rows at positions position.. and returns the output rows.
@@ -195,7 +213,7 @@ class KvModel {
       const bool isKey = r % 2 == 0;
       const uint8_t* out = graph.output(cacheName(layers_[r / 2], isKey, false)).data();
       for (size_t j = 0; j < count; ++j)
-        writeKv(rings_[r].storage->data(), out, heads_, headDim_, past_, n, j, (position + j) % past_, isKey);
+        writeKv(rings_[r].storage->data(), out, heads_, headDim_, past_, n, j, slot(position + static_cast<int64_t>(j)), isKey);
     }
     const size_t outWidth = tensorDimensions(graph.output(output_).tensor)[2];
     std::vector<float> all(n * outWidth);
@@ -211,7 +229,7 @@ class KvModel {
   std::string input_, output_;
   double ropeTheta_;
   std::vector<int> layers_;
-  size_t heads_ = 0, headDim_ = 0, past_ = 0, width_ = 0;
+  size_t heads_ = 0, headDim_ = 0, past_ = 0, width_ = 0, pinned_ = 0;
 };
 
 // Whisper log-mel exactly as MiniCPM-o's StreamingMelProcessorExact: 1 s units (the first one
@@ -425,17 +443,276 @@ class Sampler {
   std::vector<int32_t> generated_;
 };
 
+// Fork-join over [0, count) for the CPU TTS: workers spin while a chunk is being generated
+// (~80 short parallel sections per step) and sleep in between.
+class Pool {
+ public:
+  explicit Pool(size_t workers) {
+    for (size_t i = 0; i < workers; ++i) threads_.emplace_back([this, i] { work(i + 1); });
+  }
+
+  ~Pool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    wake_.notify_all();
+    for (auto& thread : threads_) thread.join();
+  }
+
+  // While awake, workers poll for jobs instead of sleeping on the condition variable.
+  void awake(bool on) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      awake_ = on;
+    }
+    wake_.notify_all();
+  }
+
+  void run(size_t count, const std::function<void(size_t, size_t)>& job) {
+    job_ = &job;
+    count_ = count;
+    pending_.store(threads_.size(), std::memory_order_relaxed);
+    epoch_.fetch_add(1, std::memory_order_release);
+    if (!awake_) {
+      { std::lock_guard<std::mutex> lock(mutex_); }  // a worker between its check and its wait would miss the notify
+      wake_.notify_all();
+    }
+    slice(0, job);
+    while (pending_.load(std::memory_order_acquire) != 0) relax();
+  }
+
+ private:
+  static void relax() {
+#if defined(__aarch64__)
+    asm volatile("yield");
+#endif
+  }
+
+  void slice(size_t index, const std::function<void(size_t, size_t)>& job) {
+    const size_t parts = threads_.size() + 1;
+    const size_t begin = count_ * index / parts, end = count_ * (index + 1) / parts;
+    if (begin < end) job(begin, end);
+  }
+
+  void work(size_t index) {
+    uint64_t seen = 0;
+    while (true) {
+      uint64_t epoch = epoch_.load(std::memory_order_acquire);
+      if (epoch == seen) {
+        if (awake_) { relax(); continue; }
+        std::unique_lock<std::mutex> lock(mutex_);
+        wake_.wait(lock, [&] { return stop_ || awake_ || epoch_.load(std::memory_order_acquire) != seen; });
+        if (stop_) return;
+        continue;
+      }
+      seen = epoch;
+      slice(index, *job_);
+      pending_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+  }
+
+  std::vector<std::thread> threads_;
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::atomic<uint64_t> epoch_{0};
+  std::atomic<size_t> pending_{0};
+  const std::function<void(size_t, size_t)>* job_ = nullptr;
+  size_t count_ = 0;
+  std::atomic<bool> awake_{false};
+  bool stop_ = false;
+};
+
+// int8 weights (one scale per output row) times a vector quantized per group of 64: int32 dot
+// products per group, then both scales. Same arithmetic as scripts/minicpmo_tts_cpu.py.
+constexpr size_t kGroup = 64;
+
+struct QuantVector {
+  std::vector<int8_t> q;
+  std::vector<float> scale;
+  void set(const float* x, size_t n) {
+    q.resize(n);
+    scale.resize(n / kGroup);
+    for (size_t g = 0; g < n / kGroup; ++g) {
+      float top = 0.0f;
+      for (size_t i = 0; i < kGroup; ++i) top = std::max(top, std::fabs(x[g * kGroup + i]));
+      const float s = std::max(top, 1e-12f) / 127.0f;
+      scale[g] = s;
+      for (size_t i = 0; i < kGroup; ++i)
+        q[g * kGroup + i] = static_cast<int8_t>(std::clamp(std::nearbyint(x[g * kGroup + i] / s), -127.0f, 127.0f));
+    }
+  }
+};
+
+inline int32_t dot64(const int8_t* a, const int8_t* b) {
+#if defined(__ARM_FEATURE_DOTPROD)
+  int32x4_t acc = vdupq_n_s32(0);
+  for (size_t i = 0; i < kGroup; i += 16) acc = vdotq_s32(acc, vld1q_s8(a + i), vld1q_s8(b + i));
+  return vaddvq_s32(acc);
+#else
+  int32_t sum = 0;
+  for (size_t i = 0; i < kGroup; ++i) sum += static_cast<int32_t>(a[i]) * b[i];
+  return sum;
+#endif
+}
+
+void gemvRows(const int8_t* weight, const float* rowScale, const QuantVector& x, size_t in, size_t begin, size_t end, float* y) {
+  const size_t groups = in / kGroup;
+  for (size_t o = begin; o < end; ++o) {
+    const int8_t* row = weight + o * in;
+    float sum = 0.0f;
+    for (size_t g = 0; g < groups; ++g) sum += static_cast<float>(dot64(row + g * kGroup, x.q.data() + g * kGroup)) * x.scale[g];
+    y[o] = sum * rowScale[o];
+  }
+}
+
+// MiniCPM-o's 20-layer TTS Llama on the CPU (scripts/minicpmo_tts_cpu.py), with a float KV ring
+// of 2032 positions that keeps the turn's first chunk once full, as KvModel::pin.
+class CpuTts {
+ public:
+  static constexpr size_t kLayers = 20, kHeads = 12, kHeadDim = 64, kFfn = 3072, kPast = 2032;
+
+  explicit CpuTts(const std::string& path)
+      : weights_(path), pool_(3), keys_(kLayers * kHeads * kPast * kHeadDim), values_(keys_.size()) {
+    for (size_t i = 0; i < kLayers; ++i) {
+      const std::string p = "tts_" + std::to_string(i) + "_";
+      layers_.push_back({weights_.i8(p + "qkv"), weights_.f32(p + "qkv_scale"), weights_.i8(p + "o"), weights_.f32(p + "o_scale"),
+                         weights_.i8(p + "gate_up"), weights_.f32(p + "gate_up_scale"), weights_.i8(p + "down"),
+                         weights_.f32(p + "down_scale"), weights_.f32(p + "norm1"), weights_.f32(p + "norm2")});
+    }
+    norm_ = weights_.f32("tts_norm");
+    head_ = weights_.i8("tts_head");
+    headScale_ = weights_.f32("tts_head_scale");
+    for (size_t k = 0; k < kHeadDim / 2; ++k) inverseFrequency_[k] = 1.0 / std::pow(1e4, 2.0 * k / kHeadDim);
+  }
+
+  void reset() { position_ = 0; pinned_ = 0; }
+  void pin() { pinned_ = std::min<size_t>(position_, kPast / 2); }
+  int64_t position() const { return position_; }
+  void awake(bool on) { pool_.awake(on); }
+
+  // One position; returns the code logits [6562].
+  std::vector<float> step(const float* embed) {
+    std::vector<float> x(embed, embed + kTtsDim), normed(kTtsDim), qkv(3 * kTtsDim), attended(kTtsDim);
+    std::vector<float> delta(kTtsDim), gateUp(2 * kFfn), hidden(kFfn);
+    const size_t slot = slotOf(static_cast<size_t>(position_));
+    const size_t filled = std::min<size_t>(static_cast<size_t>(position_) + 1, kPast);
+    std::array<float, kHeadDim / 2> cos, sin;
+    for (size_t k = 0; k < kHeadDim / 2; ++k) {
+      const double angle = static_cast<double>(position_) * inverseFrequency_[k];
+      cos[k] = static_cast<float>(std::cos(angle));
+      sin[k] = static_cast<float>(std::sin(angle));
+    }
+    for (size_t i = 0; i < kLayers; ++i) {
+      const Layer& l = layers_[i];
+      rmsNorm(x.data(), l.norm1, normed.data());
+      linear(l.qkv, l.qkvScale, normed.data(), kTtsDim, 3 * kTtsDim, qkv.data());
+      float* keys = keys_.data() + i * kHeads * kPast * kHeadDim;
+      float* values = values_.data() + i * kHeads * kPast * kHeadDim;
+      pool_.run(kHeads, [&](size_t begin, size_t end) {
+        std::vector<float> scores(filled);
+        for (size_t h = begin; h < end; ++h) {
+          float* q = qkv.data() + h * kHeadDim;
+          float* k = qkv.data() + kTtsDim + h * kHeadDim;
+          rope(q, cos, sin);
+          rope(k, cos, sin);
+          std::copy(k, k + kHeadDim, keys + (h * kPast + slot) * kHeadDim);
+          std::copy(qkv.data() + 2 * kTtsDim + h * kHeadDim, qkv.data() + 2 * kTtsDim + (h + 1) * kHeadDim,
+                    values + (h * kPast + slot) * kHeadDim);
+          float top = -INFINITY;
+          for (size_t p = 0; p < filled; ++p) {
+            const float* key = keys + (h * kPast + p) * kHeadDim;
+            float s = 0.0f;
+            for (size_t d = 0; d < kHeadDim; ++d) s += q[d] * key[d];
+            scores[p] = s;
+            top = std::max(top, s);
+          }
+          float total = 0.0f;
+          for (size_t p = 0; p < filled; ++p) { scores[p] = std::exp(scores[p] - top); total += scores[p]; }
+          float* out = attended.data() + h * kHeadDim;
+          std::fill(out, out + kHeadDim, 0.0f);
+          for (size_t p = 0; p < filled; ++p) {
+            const float weight = scores[p] / total;
+            const float* value = values + (h * kPast + p) * kHeadDim;
+            for (size_t d = 0; d < kHeadDim; ++d) out[d] += weight * value[d];
+          }
+        }
+      });
+      linear(l.o, l.oScale, attended.data(), kTtsDim, kTtsDim, delta.data());
+      for (size_t d = 0; d < kTtsDim; ++d) x[d] += delta[d];
+      rmsNorm(x.data(), l.norm2, normed.data());
+      linear(l.gateUp, l.gateUpScale, normed.data(), kTtsDim, 2 * kFfn, gateUp.data());
+      for (size_t f = 0; f < kFfn; ++f) {
+        const float gate = gateUp[f];
+        hidden[f] = gate / (1.0f + std::exp(-gate)) * gateUp[kFfn + f];
+      }
+      linear(l.down, l.downScale, hidden.data(), kFfn, kTtsDim, delta.data());
+      for (size_t d = 0; d < kTtsDim; ++d) x[d] += delta[d];
+    }
+    rmsNorm(x.data(), norm_, normed.data());
+    std::vector<float> logits(kCodes);
+    linear(head_, headScale_, normed.data(), kTtsDim, kCodes, logits.data());
+    ++position_;
+    return logits;
+  }
+
+ private:
+  struct Layer {
+    const int8_t* qkv; const float* qkvScale; const int8_t* o; const float* oScale;
+    const int8_t* gateUp; const float* gateUpScale; const int8_t* down; const float* downScale;
+    const float* norm1; const float* norm2;
+  };
+
+  size_t slotOf(size_t position) const {
+    return position < pinned_ ? position : pinned_ + (position - pinned_) % (kPast - pinned_);
+  }
+
+  static void rmsNorm(const float* x, const float* weight, float* out) {
+    double sum = 0;
+    for (size_t d = 0; d < kTtsDim; ++d) sum += static_cast<double>(x[d]) * x[d];
+    const float inverse = static_cast<float>(1.0 / std::sqrt(sum / kTtsDim + 1e-6));
+    for (size_t d = 0; d < kTtsDim; ++d) out[d] = x[d] * inverse * weight[d];
+  }
+
+  static void rope(float* x, const std::array<float, kHeadDim / 2>& cos, const std::array<float, kHeadDim / 2>& sin) {
+    for (size_t k = 0; k < kHeadDim / 2; ++k) {
+      const float a = x[k], b = x[k + kHeadDim / 2];
+      x[k] = a * cos[k] - b * sin[k];
+      x[k + kHeadDim / 2] = a * sin[k] + b * cos[k];
+    }
+  }
+
+  void linear(const int8_t* weight, const float* scale, const float* x, size_t in, size_t out, float* y) {
+    input_.set(x, in);
+    pool_.run(out, [&](size_t begin, size_t end) { gemvRows(weight, scale, input_, in, begin, end, y); });
+  }
+
+  Assets weights_;
+  Pool pool_;
+  std::vector<Layer> layers_;
+  const float* norm_ = nullptr;
+  const int8_t* head_ = nullptr;
+  const float* headScale_ = nullptr;
+  std::array<double, kHeadDim / 2> inverseFrequency_{};
+  std::vector<float> keys_, values_;  // [layer][head][slot][64]
+  QuantVector input_;
+  int64_t position_ = 0;
+  size_t pinned_ = 0;
+};
+
 // The 25-code TTS chunks of MiniCPMTTS.generate_chunk: temperature 0.8, repetition penalty 1.05
 // over this chunk's last 16 codes, EOS 6561 blocked below min_tokens, the 26th code dropped.
 class Tts {
  public:
-  Tts(Runtime& runtime, const std::string& path, const uint16_t* embCode)
-      : model_(runtime, path, "tts", "embeds", "logits", 1e4), embCode_(embCode) {}
+  Tts(const std::string& weightsPath, const uint16_t* embCode) : model_(weightsPath), embCode_(embCode) {}
 
-  void reset() { model_.reset(); position_ = 0; }
+  void reset() { model_.reset(); }
   void seed(uint64_t seed) { random_.seed(seed); }
 
   std::vector<int32_t> generate(const std::vector<float>& condition, size_t rows, int minTokens) {
+    const bool turnStart = model_.position() == 0;
+    model_.awake(true);
+    struct Sleep { CpuTts& m; ~Sleep() { m.awake(false); } } sleep{model_};
     std::vector<int32_t> codes;
     std::vector<float> logits = feed(condition.data(), rows);
     constexpr int kMax = 26;
@@ -465,24 +742,19 @@ class Tts {
       if (code == kTtsEos || t == kMax - 1) break;
       codes.push_back(code);
     }
+    if (turnStart) model_.pin();  // the turn's first chunk anchors answers past the ring
     return codes;
   }
 
  private:
   std::vector<float> feed(const float* rows, size_t count) {
     std::vector<float> last;
-    for (size_t start = 0; start < count; start += kArN) {
-      const size_t n = std::min<size_t>(kArN, count - start);
-      auto out = model_.run(position_, rows + start * kTtsDim, n);
-      position_ += static_cast<int64_t>(n);
-      last.assign(out.end() - kCodes, out.end());
-    }
+    for (size_t r = 0; r < count; ++r) last = model_.step(rows + r * kTtsDim);
     return last;
   }
 
-  KvModel model_;
+  CpuTts model_;
   const uint16_t* embCode_;
-  int64_t position_ = 0;
   std::mt19937_64 random_;
 };
 
@@ -906,7 +1178,7 @@ class Session {
  public:
   Session(const std::string& libraryDir, const std::string& dir) : runtime_(libraryDir), assets_(dir + "/assets.bin") {
     uint64_t spill = 0;
-    for (const char* name : {"llm_head", "audio_encoder", "tts", "dit", "hift_f0", "hift_decode", "llm_part_0", "llm_part_1",
+    for (const char* name : {"llm_head", "audio_encoder", "dit", "hift_f0", "hift_decode", "llm_part_0", "llm_part_1",
                              "llm_part_2", "llm_part_3"})
       spill = std::max(spill, runtime_.spillFillBytes(dir + "/" + name + ".bin"));
     runtime_.groupSpillBytes = spill;
@@ -915,7 +1187,7 @@ class Session {
     for (int p = 0; p < 4; ++p)
       parts_.push_back(std::make_unique<KvModel>(runtime_, dir + "/llm_part_" + std::to_string(p) + ".bin",
                                                  "llm_part_" + std::to_string(p), "hidden", "hidden_out", 1e6));
-    tts_ = std::make_unique<Tts>(runtime_, dir + "/tts.bin", assets_.f16("tts_emb_code"));
+    tts_ = std::make_unique<Tts>(dir + "/tts_cpu.bin", assets_.f16("tts_emb_code"));
     token2wav_ = std::make_unique<Token2wav>(runtime_, dir, assets_);
     token2wav_->timing_ = [this](const char* name, double ms) { runtime_.timing(name, "execute", ms); };
     mel_ = std::make_unique<StreamingMel>(assets_.f32("mel_filters"));
@@ -961,6 +1233,7 @@ class Session {
     rowF16(assets_.f16("system_embeds"), 0, rows.size(), rows.data());
     pending_ = rows;
     flush();
+    for (auto& part : parts_) part->pin(static_cast<size_t>(position_));
     runtime_.timing("system_prompt", "total", elapsedMs(started_));
   }
 
