@@ -11,7 +11,7 @@
 | --- | --- |
 | 模型包 | 15 个 context + CPU embedding 表 + 文本词表，约 4.7 GB；App 从 Hugging Face（或镜像）下载到 `/sdcard/Android/data/com.overmindy.mimicodecdemo/files/models/<variant id>` |
 | 38 帧输入（3.04 s） | 暖运行 5.7–6.0 s（RTF 约 2），首段 PCM 约 0.31 s |
-| 每帧耗时 | 约 125–140 ms：Temporal 85–100、DepFormer 15–20、Mimi 13–14、head 3、frontend（CPU）0.03 |
+| 每帧耗时 | 凉机约 100 ms（RTF 1.25）：Temporal 65、DepFormer 13、Mimi 13、head 2.4；连续跑几分钟发热后约 130 ms（RTF 1.65，Temporal 85） |
 | Temporal 质量（8 段 held-out，1558 帧，对 BF16，teacher-forced） | 全 LPBQ W4：文本 top-1 97.95%，音频 cb0 94.4%，8 路全对 85.1% |
 | DepFormer W8 质量（同上） | 串联 8 路全对 92.4%（FP32 上限 94.0%） |
 
@@ -34,6 +34,7 @@
 ```
 
 第一帧只用于预热，所以 N 个输入帧输出 N−1 帧。
+Mimi 不放到工作线程：所有图共用 HTP 执行锁，HTP 每帧几乎没有空闲；凉机对比异步 100.4 ms、同步 99.3 ms，没有收益。
 
 | 文件 | 作用 |
 | --- | --- |
@@ -48,6 +49,7 @@
 | `scripts/hf_publish.py` | 把一个模型变体上传到 HF 模型仓库的 main 分支，并更新 `catalog.json` |
 | `android/mimi_qnn_runner.cpp` | 原生运行器：加载 context、burst 性能投票、共享内存 KV、Temporal、Mimi、DepFormer；按帧 `begin/step/end` |
 | `android/moshi_lm_scheduler.h` | Moshi `LMGen` 的 17 路延迟环 |
+| `android/moshi_cli.cpp`、`scripts/moshi_phone_cli.sh` | 手机上的命令行会话：把一段 24 kHz WAV 尽快逐帧跑完，写出回复、每步耗时、token 和各图耗时 |
 | `android/models/catalog.json` | 所有模型和变体（文件、大小、sha256）的唯一来源，App 内置一份并可从仓库刷新 |
 | `android/demo/` | Android App（Java UI、JNI、`build.sh`） |
 
@@ -130,6 +132,7 @@ App 第一次加载时按 catalog 的 sha256 校验全部文件；之后文件�
   每层 `past_key_{l}_in` [32,1,128,999]、`past_value_{l}_in` [32,1,999,128]；输出 `hidden_out` 和每层新的一帧 K/V。
   I/O 为定点，运行器按 context 里的 scale/offset 转换（`real = scale × (q + offset)`）。
 - KV ring 由宿主持有，放在注册过的 rpcmem 里；空槽必须填 0.0 的量化值（零点），不能填字节 0。
+  满 999 帧后固定第 0–3 帧，其余 995 个槽循环覆盖最旧的帧；键保留绝对 RoPE 位置。
 - 校准样本必须包含第 0–3 帧：第 0 帧是全初始 token 的 attention sink。
 - LPBQ 只能用 Conv：LPBQ 的 FullyConnected 会让 context 生成器段错误（Temporal 和 Mimi decoder 因此用 1×1 Conv）。
 - DepFormer attention 不能用 −inf mask：每个 codebook 的步号是常量，直接切掉后面的槽位；
@@ -140,10 +143,13 @@ App 第一次加载时按 catalog 的 sha256 校验全部文件；之后文件�
 
 ## 已知限制
 
-- 实时率约 2。Temporal 受权重读取带宽限制（有效带宽 31–32 GB/s，与高通官方 Qwen3-4B W4 context 相当），
+- 实时率凉机 1.25、发热后 1.65。Temporal 受权重读取带宽限制（有效带宽 31–32 GB/s，与高通官方 Qwen3-4B W4 context 相当），
   继续提速只能减少每帧读取的字节数。
 - 全 LPBQ 的 Temporal 在 part 0 误差最大；若要找回质量，可只把 part 0 的 value/MLP down 恢复为 W8，代价约每帧 6 ms。
-- 没有做 ASR 和长音频评测；超过 1000 帧窗口后的环绕没有在真实模型上验证。
+- 没有做 ASR 评测。长对话（`scripts/moshi_phone_cli.sh`，10 个英文提问间隔 22 s）：前两个问题答得好，
+  第三个问题（约 52 s，环绕之前）起陷入重复（"will help you develop your skills…"），之后沉默；
+  未固定 sink 的旧环在约 150 s 后输出成串的 "j"。固定 sink 之后的版本只跑到 130 s，没有覆盖到这一段。
+  重复出现在环绕之前，所以不是 KV 环的问题，更可能来自文本解码（只采样说/不说，说话时取最高分的词）或量化。
 
 # MiniCPM-o 4.5 全双工语音
 

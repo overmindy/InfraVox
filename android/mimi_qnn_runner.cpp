@@ -57,6 +57,8 @@ class TemporalPart {
  public:
   static constexpr size_t kHeads = 32, kHeadDim = 128, kDim = 4096;
   static constexpr float kMaskMin = -50.0f;
+  // Frames 0-3 (frame 0 is the all-initial-token attention sink) keep their slots once the ring wraps.
+  static constexpr int32_t kSinkFrames = 4;
 
   TemporalPart(Runtime& runtime, const std::string& path, bool grouped = false)
       : runtime_(runtime), rings_(), graph_(runtime, path, grouped) {
@@ -104,8 +106,9 @@ class TemporalPart {
     quantizeTo(hidden_, hidden, kDim, graph_.input("hidden").data());
     std::vector<float> mask(past_ + 1, kMaskMin);
     mask[past_] = 0.0f;
-    for (int32_t back = 1; back <= std::min<int32_t>(position, static_cast<int32_t>(past_)); ++back)
-      mask[(position - back) % past_] = 0.0f;
+    for (int32_t frame = 0; frame < std::min(position, kSinkFrames); ++frame) mask[frame] = 0.0f;
+    for (int32_t back = 1; back <= std::min<int32_t>(position, static_cast<int32_t>(past_) - kSinkFrames); ++back)
+      mask[slotOf(position - back)] = 0.0f;
     quantizeTo(mask_, mask.data(), mask.size(), graph_.input("attention_mask").data());
     float cos[kHeadDim / 2], sin[kHeadDim / 2];
     for (size_t i = 0; i < kHeadDim / 2; ++i) {
@@ -117,7 +120,7 @@ class TemporalPart {
     quantizeTo(sin_, sin, kHeadDim / 2, graph_.input("position_sin").data());
     graph_.execute();
     dequantizeFrom(hiddenOut_, graph_.output("hidden_out").data(), kDim, out);
-    const size_t slot = position % past_;
+    const size_t slot = slotOf(position);
     for (size_t r = 0; r < rings_.size(); ++r) {
       const bool key = r % 2 == 0;
       writeSlot(rings_[r], graph_.output(cacheName(layers_[r / 2], key, false)).data(), slot, key);
@@ -125,6 +128,12 @@ class TemporalPart {
   }
 
  private:
+  // Keys keep their absolute RoPE positions, so evicting the oldest non-sink frame needs no rewrite.
+  size_t slotOf(int32_t position) const {
+    const int32_t past = static_cast<int32_t>(past_);
+    return position < past ? position : kSinkFrames + (position - kSinkFrames) % (past - kSinkFrames);
+  }
+
   static std::string cacheName(int layer, bool key, bool input) {
     return std::string(key ? "past_key_" : "past_value_") + std::to_string(layer) + (input ? "_in" : "_out");
   }
@@ -375,6 +384,8 @@ class MoshiLm {
 
 // Frame-by-frame duplex session: the app feeds one 80 ms microphone frame per step and plays
 // whatever comes back. All calls for one session come from a single thread.
+// Mimi stays on this thread: on a worker it only waits on the shared HTP execute lock, and a
+// cool-phone A/B gave 100.4 ms per frame against 99.3 ms here.
 class Session {
  public:
   Session(const std::string& libraryDir, const std::string& modelDirectory, bool codecOnly)
