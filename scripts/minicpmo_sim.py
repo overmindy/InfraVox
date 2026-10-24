@@ -332,6 +332,11 @@ class Duplex:
                 pieces.append(self.t2w.stream(self.t2w_buffer[: T2W_CHUNK + T2W_LOOKAHEAD]))
                 self.t2w_buffer = self.t2w_buffer[T2W_CHUNK:]
         if last and self.t2w_buffer:
+            # The final window yields 2 mel frames per token: past 25 tokens it would overflow the DiT
+            # chunk and HiFT, so the head goes out first as a lookahead window.
+            if len(self.t2w_buffer) > T2W_CHUNK:
+                pieces.append(self.t2w.stream(self.t2w_buffer))
+                self.t2w_buffer = self.t2w_buffer[-T2W_LOOKAHEAD:]
             pieces.append(self.t2w.stream(self.t2w_buffer, last_chunk=True))
             self.t2w_buffer = []
         wave = np.concatenate(pieces) if pieces else np.zeros(0, np.float32)

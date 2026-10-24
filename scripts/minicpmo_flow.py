@@ -314,7 +314,9 @@ class Token2wavHost:
     def vocode(self, mel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         frames = mel.shape[1]
         padded = np.zeros((1, MEL, HIFT_FRAMES), np.float32)
-        padded[0, :, : min(frames, HIFT_FRAMES)] = mel[:, :HIFT_FRAMES]
+        if frames > HIFT_FRAMES:
+            raise ValueError(f"HiFT chunk of {frames} mel frames exceeds the graph's {HIFT_FRAMES}")
+        padded[0, :, :frames] = mel
         f0 = self.f0(padded)[0, :frames]
         src = source(f0, self.noise, (self.c["source_weight"], self.c["source_bias"]))
         src[: len(self.source_cache)] = self.source_cache

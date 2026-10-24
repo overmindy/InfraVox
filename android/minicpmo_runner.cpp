@@ -1154,6 +1154,12 @@ class Session {
       }
     }
     if (last && !codeBuffer_.empty()) {
+      // The final window yields 2 mel frames per token: past 25 tokens it would overflow the DiT chunk (50)
+      // and HiFT (58 frames), so the head goes out first as a lookahead window.
+      if (codeBuffer_.size() > 25) {
+        emit(codeBuffer_.size(), false);
+        codeBuffer_.erase(codeBuffer_.begin(), codeBuffer_.end() - 3);
+      }
       emit(codeBuffer_.size(), true);
       codeBuffer_.clear();
     }
