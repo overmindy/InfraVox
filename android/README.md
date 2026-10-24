@@ -1,7 +1,8 @@
-# Moshi 在 Snapdragon 手机上的部署
+# InfraVox 开发文档
 
 目标设备：HONOR BKQ-AN20，SM8850（HTP v81），Android 16，QAIRT 2.45.0.260326。
-从 Kyutai 原始 BF16 权重到手机上运行，只需要两条命令：服务器上 `scripts/moshi_build_all.sh`，Mac 上 `scripts/moshi_deploy.sh`。
+每个模型从官方 BF16 权重到手机上运行都只需要两条命令：服务器上 `scripts/<模型>_build_all.sh`，Mac 上 `scripts/<模型>_deploy.sh`。
+下面先是 Moshi，MiniCPM-o 4.5 在后半部分。
 旧的实验代码可在 git tag `moshi-pre-cleanup` 中找回。
 
 ## 现状（模型包 `lm-v4-lpbq4`）
@@ -63,7 +64,7 @@ InfraVox 是承载多个全双工语音模型的端侧底座（Infra）加语音
 - **对话**：一通语音通话就是一段对话（模型不跨通话保留上下文）。麦克风（或按实时速度送入的演示音频 / WAV）
   每 80 ms 一帧进入队列，推理线程逐帧 `step`，每产生一帧输出就立即播放。通话按麦克风能量和模型文本停顿
   自动切成聊天气泡（`history/TurnTracker`），每个气泡可回放对应片段；顶部状态条实时显示延迟、每帧耗时、RTF 和积压帧。
-  停止收音后会继续送入静音直到模型说完（最多 10 秒），再点一次立即结束。对话保存在 `files/conversations/<id>/`，可导出。
+  停止收音后会继续送入静音直到模型说完（最多 30 秒），再点一次立即结束。对话保存在 `files/conversations/<id>/`，可导出。
 - **文本解码**：音频 token 是图内 argmax。量化后的 LM 在纯贪心文本解码下说完开场白就一直选“沉默”（BF16 贪心会回应），
   而完整的 top-k 采样又会选到 `<` 之类的低概率垃圾词。所以只对“说话还是沉默”（pad 与非 pad）按温度 0.7、top-k 25 采样，
   说话时取最高分的非 pad 词。设置里可关回纯贪心。

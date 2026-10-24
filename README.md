@@ -1,88 +1,71 @@
-# Moshi on Snapdragon
+<p align="center"><img src="android/demo/branding/logo.svg" width="120" alt="InfraVox"></p>
 
-把 Kyutai 的 [Moshi](https://github.com/kyutai-labs/moshi)（7B 全双工语音大模型）从 BF16 权重量化、编译，
-跑在骁龙 8 Elite Gen 5 手机的 Hexagon NPU 上，并配套一个 Android 演示 App。
+# InfraVox
 
-量化方案、C++ 运行时、性能分析和构建部署流水线均由个人独立完成。
+在手机上本地运行的**全双工语音对话** App：模型边听边说，你可以随时打断它，全程不联网。
+名字取自端侧底座（Infra）+ 语音（Vox），一个 App 承载多个全双工语音模型，全部跑在骁龙的 Hexagon NPU 上。
 
-| 指标（HONOR BKQ-AN20 / SM8850，38 帧 ≈ 3 s 语音） | 起点 | 现在 |
+- **下载 App**：[GitHub Releases](https://github.com/overmindy/InfraVox/releases/latest)
+- **模型权重**：[ELAINAy/duplex-voice-models](https://huggingface.co/ELAINAy/duplex-voice-models)（App 内直接下载，默认走 hf-mirror.com）
+
+<!-- 演示视频：录好后放在这里 -->
+
+## 功能
+
+- **全双工通话**：麦克风每 80 ms 一帧送入模型，模型一边听一边生成语音并立即播放，可以随时插话打断。
+- **多个模型**：Moshi（英文）和 MiniCPM-o 4.5（中英文），在模型页切换。
+- **聊天式界面**：每通电话按说话轮次切成气泡，可回放每一段；历史对话保存在本地，可导出音频和文本。
+- **模型管理**：从 Hugging Face 或镜像下载，断点续传、逐文件 SHA-256 校验，自动标出与本机芯片兼容的版本。
+- **实时状态**：通话中显示延迟、每帧耗时、实时率和积压帧。
+
+## 支持的模型与性能
+
+测试设备：HONOR BKQ-AN20（Snapdragon SM8850，HTP v81），QAIRT 2.45。
+
+| | Moshi · Moshiko | MiniCPM-o 4.5 |
 | --- | --- | --- |
-| 端到端单帧延迟 | ~983 ms | **125–160 ms** |
-| 实时率 RTF（计算时间 / 音频时长） | 12.6 | **≈ 2.0** |
-| 首段音频输出 | 1.33 s | **0.31–0.38 s** |
-| 文本 token 与 BF16 一致率（teacher-forced，1558 帧 held-out） | — | **97.95%** |
+| 来源 | [Kyutai](https://github.com/kyutai-labs/moshi)，7B | [OpenBMB](https://huggingface.co/openbmb/MiniCPM-o-4_5)，Qwen3-8B 语音部分 |
+| 语言 | 英文 | 中文、英文 |
+| 量化 | Temporal LPBQ W4A16，DepFormer / Mimi W8 | LLM LPBQ W4A16，Whisper / DiT / HiFT W8，TTS 在 CPU 上 int8 |
+| 模型包 | 4.7 GB | 6.4 GB |
+| 速度 | 每 80 ms 帧约 125–160 ms（RTF ≈ 2） | 每 1 s 语音约 0.5–0.9 s，**跑得过实时** |
+| 首段语音 | 约 0.3 s | 文字即时出现，语音比文字晚约 2 s |
+| 质量 | 文本 token 与 BF16 一致率 97.95% | 4 分钟、6 个问题的连续对话全部完整回答，播放 0 次卡顿 |
 
-## 做了什么
+MiniCPM-o 的 LLM 解码、Whisper 和声码器在 NPU 上，TTS 在 CPU 上与 NPU 并行；长对话里会丢弃最早的内容、保留系统提示，
+可以一直聊下去。Moshi 受 NPU 权重读取带宽限制，长对话中延迟会逐渐累积。
 
-**低比特量化**
-- Temporal Transformer（32 层）按高通官方 LLM 布局导出为 4 段，每段 8 层：
-  投影改为按头拆分的 1×1 Conv，交错 RoPE 通过置换 q/k 行变成半分布局，KV 由宿主持有。
-- 用 AIMET-ONNX 做 **LPBQ W4A16**（int4 分块权重、int16 激活、8-bit 绑定 KV）。
-  DepFormer 用 W8A16，Mimi 编码器 W8、解码器 LPBQ W4。
-- 用 LibriSpeech 搭建校准集和留出集（说话人不重叠），**以 token 一致率而不是张量误差作为验收门槛**。
-- 排查出的问题：
-  - 校准漏掉第 0 帧（attention sink）时，隐状态误差约 270%。
-  - DepFormer 的 −inf mask 会撑爆 16-bit 激活范围，改为直接切掉后面的槽位。
-  - QAIRT 转换器会错误融合 RMSNorm，加了一层保护。
+## 使用
 
-**推理运行时（C++ / QNN HTP）**
-- 15 个 context 常驻，投票启用 HTP burst 性能模式。
-- 64 个 KV 环形缓冲放在注册过的 rpcmem 共享内存里，每步只写新一帧的 K/V；空槽填量化零点，不填字节 0。
-- 重置 KV 时用 memset 代替逐元素拷贝，首段音频输出 1.33 s → 0.38 s。
-- 17 张 embedding 表求和挪到 CPU，NPU 上这一步从 9 ms 降到 0.03 ms。
-- O3 + 8 MB VTCM 编译：8 层 W4 段从 92–101 ms 降到 28 ms（前提是图名等于 context 名，否则这些编译选项会被静默忽略）。
+1. 安装 Release 里的 APK（Android 10+，arm64）。模型是绑定芯片的 QNN context，目前只支持 **Snapdragon SM8850**。
+2. 打开侧边栏的“模型管理”，下载一个模型，设为当前。
+3. 回到主页点“通话”直接说话；外放时建议开启回声消除或戴耳机。也可以用内置演示音频或自己的 WAV 文件测试。
 
-**性能分析**
-- 每帧约 125–140 ms：Temporal 85–100，DepFormer 15–20，Mimi 13–14，head 3。
-- Temporal 受权重读取带宽限制：有效带宽 31–33 GB/s，与高通官方 Qwen3-4B W4 context 在同一台手机上的实测相当。
-  要继续提速，只能减少每帧读取的权重字节数。
-
-## 优化过程
-
-| 阶段 | 38 帧暖运行 | 主要改动 |
-| --- | --- | --- |
-| 基线 | 37.36 s | 16 个 2 层分片，FP32 I/O |
-| 常驻 + 共享内存 | 21.42 s | context 常驻，HTP burst，KV 绑定 rpcmem |
-| 官方 LLM 布局 | 9.04 s | 4 段 LPBQ W4 Temporal，单步 Temporal 489 → 131 ms |
-| KV 重置 + O3 | 7.0–7.3 s | memset 重置 KV，其余图用 O3 重编译 |
-| DepFormer W8 | 6.12 s（App，36 帧） | DepFormer 36 → 15–20 ms/帧，加载 7.0 → 3.4 s |
-| Temporal 全 W4 | 5.7–6.0 s | 权重 1.10 → 0.86 GB/段 |
-
-每一步的测量和取舍都记录在对应 commit 的说明里。
-
-## 快速开始
+## 仓库
 
 ```sh
-# 服务器（GPU）：从 Kyutai BF16 权重生成手机模型包
+# 服务器（GPU）：从官方 BF16 权重量化、编译出手机模型包
 bash scripts/moshi_build_all.sh
+bash scripts/minicpmo_build_all.sh
 
-# Mac：把模型包推到手机，构建并安装 App
+# Mac：把模型包推到连着的手机，构建并安装 App（开发用）
 bash scripts/moshi_deploy.sh
+bash scripts/minicpmo_deploy.sh
+
+# 发布一个模型变体到 Hugging Face，并更新 catalog
+python scripts/hf_publish.py --repo ELAINAy/duplex-voice-models --variant <变体 id> --bundle-dir <模型包目录>
 ```
-
-环境要求、目录结构、图的 I/O 约定和已知坑，见 [android/README.md](android/README.md)。
-
-## 代码结构
 
 | 路径 | 内容 |
 | --- | --- |
-| `scripts/moshi_build_all.sh` | 一键构建：校准数据采集 → 各子图导出与量化 → 编译 → 模型包 |
-| `scripts/moshi_temporal.py` | Temporal 段的 LLM 布局导出与 AIMET 校准 |
-| `scripts/moshi_head_depformer.py` | head 和 8 个 DepFormer codebook 的导出与校准 |
-| `scripts/moshi_mimi.py` | Mimi 流式编解码器导出 |
-| `scripts/moshi_qairt_build.sh` | 单个图的转换、量化、编译 |
-| `android/mimi_qnn_runner.cpp` | 原生运行时 |
-| `android/moshi_lm_scheduler.h` | Moshi 17 路延迟调度 |
-| `android/demo/` | Android App（Java UI + JNI） |
-| `src/qai_hub_models/models/templates/moshi/` | 显式 KV / 流式状态的 Moshi 与 Mimi 模型定义 |
+| `android/demo/` | App（Java UI + JNI，`build.sh` 直接出 APK） |
+| `android/minicpmo_runner.cpp`、`android/mimi_qnn_runner.cpp` | 两个模型的 C++ 运行时；`android/qnn_runtime.h` 是共用的 QNN 层 |
+| `android/models/catalog.json` | 所有模型和文件的清单，App 内置并可从仓库刷新 |
+| `scripts/moshi_*`、`scripts/minicpmo_*` | 量化、校准、编译、部署脚本 |
 
-## 已知限制
-
-- RTF ≈ 2，还没有达到实时。
-- context 和这台手机、这个 QNN runtime 绑定，换芯片或 runtime 需要重新编译。
-- 没有做 ASR 和长音频评测；超过 1000 帧窗口后的 KV 环绕没有在真实模型上验证。
+环境要求、每个图的输入输出约定、量化细节和踩过的坑见 [android/README.md](android/README.md)。
 
 ## 致谢
 
-基于 [Qualcomm AI Hub Models](https://github.com/quic/ai-hub-models) fork（原 README 见 [QAIHM_README.md](QAIHM_README.md)），
-模型来自 [Kyutai Moshi](https://github.com/kyutai-labs/moshi)。
+基于 [Qualcomm AI Hub Models](https://github.com/quic/ai-hub-models)（原 README 见 [QAIHM_README.md](QAIHM_README.md)），
+模型来自 [Kyutai Moshi](https://github.com/kyutai-labs/moshi)（CC-BY-4.0）与 [OpenBMB MiniCPM-o](https://github.com/OpenBMB/MiniCPM-o)（Apache-2.0）。
