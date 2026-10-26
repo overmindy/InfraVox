@@ -229,6 +229,7 @@ InfraVox 是承载多个全双工语音模型的端侧底座（Infra）加语音
 Java 代码按层拆分（`android/demo/src/com/overmindy/duplex/`）：`engine/`（`DuplexEngine` 接口与 MiniCPM-o、Moshi 实现）、
 `model/`（catalog、本地存储、下载器）、`audio/`（流式会话、WAV）、`history/`（对话存储、气泡切分）、`ui/`。
 **接入新模型**：实现 `DuplexEngine`，在 `Engines` 里按 catalog 的 `engine` 字段注册，再在 `catalog.json` 加一个 model/variant。
+从上游权重到 App 的完整步骤见 skill `.claude/skills/add-duplex-model/SKILL.md`（Claude Code 里用 `/add-duplex-model`，其他 agent 直接读这个文件）。
 应用包名保持 `com.overmindy.mimicodecdemo`，以便覆盖安装后保留数据；旧版 ADB 放入的 `models/lm-v4-lpbq4` 会自动迁移。
 
 ## 发布到 Hugging Face
@@ -242,3 +243,16 @@ python scripts/hf_publish.py --repo <用户名>/duplex-voice-models \
 ```
 
 脚本会校验并更新 `android/models/catalog.json`（记得提交），可中断后重跑续传。
+
+## 发布 App 更新
+
+App 启动时（每天最多一次，设置里可关）和“设置 → 关于 → 检查更新”读取模型仓库的 `app/latest.json`：
+先走当前下载源（默认 hf-mirror.com），失败再试另一个 HF 地址，最后用 GitHub Releases API。
+APK 按同样顺序下载（断点续传、SHA-256 校验），再交给系统的 PackageInstaller 安装；签名必须与已安装的一致。
+先改 `AndroidManifest.xml` 的 `versionCode` / `versionName`，构建 APK，然后：
+
+```sh
+python scripts/app_publish.py --apk <infravox.apk> --notes "这一版的变化" --github
+```
+
+脚本上传 `app/infravox-<版本>.apk`，最后才写 `app/latest.json`；`--github` 同时用 `gh` 建 `v<版本>` 的 Release。

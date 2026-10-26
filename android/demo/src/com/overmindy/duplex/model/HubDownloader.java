@@ -23,10 +23,14 @@ public final class HubDownloader {
     public void cancel() { cancelled = true; }
 
     public static String fetchText(HubConfig hub, String path) throws IOException {
-        HttpURLConnection connection = open(hub.resolve(path), 0);
+        return fetchUrl(hub.resolve(path), path);
+    }
+
+    public static String fetchUrl(String url, String label) throws IOException {
+        HttpURLConnection connection = open(url, 0);
         try {
             int code = connection.getResponseCode();
-            if (code != 200) throw httpError(code, path);
+            if (code != 200) throw httpError(code, label);
             try (InputStream input = connection.getInputStream()) {
                 return ModelStore.readText(input);
             }
@@ -49,7 +53,8 @@ public final class HubDownloader {
                 if (hash.equals(entry.sha256)) { done += entry.size; continue; }
                 target.delete();
             }
-            downloadFile(hub, variant.path + "/" + entry.path, entry, target, base, meter);
+            String repoPath = variant.path + "/" + entry.path;
+            downloadFile(hub.resolve(repoPath), repoPath, entry.path, entry.size, entry.sha256, target, base, meter);
             done += entry.size;
         }
         store.writeChecksums(variant);
@@ -57,18 +62,26 @@ public final class HubDownloader {
         meter.report(total, "完成", false);
     }
 
-    private void downloadFile(HubConfig hub, String repoPath, ModelCatalog.FileEntry entry, File target, long base,
+    /** One file from a plain URL (an app update), resumable; an empty sha256 skips the hash check. */
+    public void download(String url, String name, long size, String sha256, File target, Progress progress) throws Exception {
+        cancelled = false;
+        Meter meter = new Meter(progress, size);
+        downloadFile(url, name, name, size, sha256, target, 0, meter);
+        meter.report(size, "完成", false);
+    }
+
+    private void downloadFile(String url, String label, String name, long size, String sha256, File target, long base,
                               Meter meter) throws Exception {
         File partial = new File(target.getPath() + ".part");
         File parent = target.getParentFile();
         if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new IOException("无法创建目录：" + parent);
-        if (partial.length() > entry.size) partial.delete();
+        if (partial.length() > size) partial.delete();
 
         for (int attempt = 0; ; attempt++) {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
             long offset = hashExisting(partial, digest);
             try {
-                if (offset < entry.size) fetchInto(hub, repoPath, entry, partial, offset, digest, base, meter);
+                if (offset < size) fetchInto(url, label, name, size, partial, offset, digest, base, meter);
                 break;
             } catch (IOException error) {
                 if (cancelled || attempt >= 4) throw error;
@@ -76,23 +89,23 @@ public final class HubDownloader {
             }
         }
         if (cancelled) throw new InterruptedException("已暂停");
-        if (partial.length() != entry.size) throw new IOException("下载不完整：" + entry.path);
-        String hash = ModelStore.sha256(partial, read -> { });
-        if (!hash.equals(entry.sha256)) {
+        if (partial.length() != size) throw new IOException("下载不完整：" + name);
+        if (!sha256.isEmpty() && !ModelStore.sha256(partial, read -> { }).equals(sha256)) {
             partial.delete();
-            throw new IOException("SHA256 不匹配，已删除重下：" + entry.path);
+            throw new IOException("SHA256 不匹配，已删除重下：" + name);
         }
-        if (!partial.renameTo(target)) throw new IOException("无法保存：" + entry.path);
+        if (target.exists() && !target.delete()) throw new IOException("无法覆盖：" + name);
+        if (!partial.renameTo(target)) throw new IOException("无法保存：" + name);
     }
 
-    private void fetchInto(HubConfig hub, String repoPath, ModelCatalog.FileEntry entry, File partial, long offset,
+    private void fetchInto(String url, String label, String name, long size, File partial, long offset,
                            MessageDigest digest, long base, Meter meter) throws IOException, InterruptedException {
-        HttpURLConnection connection = open(hub.resolve(repoPath), offset);
+        HttpURLConnection connection = open(url, offset);
         try {
             int code = connection.getResponseCode();
             boolean append = code == 206;
-            if (code == 416 && offset == entry.size) return;
-            if (code != 200 && code != 206) throw httpError(code, repoPath);
+            if (code == 416 && offset == size) return;
+            if (code != 200 && code != 206) throw httpError(code, label);
             if (!append && offset > 0) {
                 digest.reset();
                 offset = 0;
@@ -106,8 +119,8 @@ public final class HubDownloader {
                     if (cancelled) throw new InterruptedException("已暂停");
                     output.write(buffer, 0, count);
                     written += count;
-                    if (written > entry.size) throw new IOException("服务器返回的数据比预期大：" + entry.path);
-                    meter.report(base + written, entry.path, true);
+                    if (written > size) throw new IOException("服务器返回的数据比预期大：" + name);
+                    meter.report(base + written, name, true);
                 }
             }
         } finally {

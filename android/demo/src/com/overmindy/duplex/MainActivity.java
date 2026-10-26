@@ -4,9 +4,14 @@ import android.Manifest;
 import android.animation.ValueAnimator;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.media.MediaPlayer;
@@ -17,6 +22,7 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.view.Gravity;
@@ -46,6 +52,7 @@ import com.overmindy.duplex.model.ModelCatalog;
 import com.overmindy.duplex.model.ModelStore;
 import com.overmindy.duplex.ui.TalkButton;
 import com.overmindy.duplex.ui.Ui;
+import com.overmindy.duplex.update.AppUpdate;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -120,7 +127,19 @@ public final class MainActivity extends Activity {
     private EditText endpointField, repoField;
     private final TextView[] endpointChoices = new TextView[3];
     private LinearLayout advanced;
-    private Switch highPerformance, echoCancel, codecOnly, textSampling;
+    private Switch highPerformance, echoCancel, codecOnly, textSampling, autoUpdate;
+
+    private final ExecutorService updateThread = Executors.newSingleThreadExecutor();
+    private AppUpdate.Release release;
+    private HubDownloader updateDownloader;
+    private File updateFile;
+    private boolean updateChecking;
+    private TextView updateStatus;
+    private ProgressBar updateProgress;
+    private Button updateButton;
+    private final BroadcastReceiver installReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) { onInstallStatus(intent); }
+    };
 
     private static final class VariantViews {
         TextView status;
@@ -149,6 +168,11 @@ public final class MainActivity extends Activity {
         renderModels();
         showScreen(Screen.CHAT);
         refreshAll();
+        IntentFilter installFilter = new IntentFilter(AppUpdate.ACTION_INSTALL_STATUS);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(installReceiver, installFilter, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(installReceiver, installFilter);
+        refreshUpdate("");
+        maybeCheckUpdate();
     }
 
     // ---------------------------------------------------------------- shell, drawer, navigation
@@ -1079,7 +1103,163 @@ public final class MainActivity extends Activity {
         }
         ui.text(about, "版本 " + version + "\n设备 SoC：" + (soc.isEmpty() ? "未知" : soc)
                 + "\n模型目录：" + store.root().getAbsolutePath(), 13, Ui.MUTED, false);
+        autoUpdate = ui.toggle(about, "启动时检查更新", "每天最多一次，先走当前下载源，失败再试 Hugging Face 和 GitHub",
+                preferences.getBoolean("auto_update", true));
+        autoUpdate.setOnCheckedChangeListener((b, on) -> preferences.edit().putBoolean("auto_update", on).apply());
+        updateStatus = ui.text(about, "", 13, Ui.TEXT, false);
+        updateProgress = ui.progress(about);
+        updateProgress.setVisibility(View.GONE);
+        LinearLayout updateRow = ui.buttonRow(about);
+        updateButton = ui.primary(updateRow, "检查更新", this::onUpdateButton);
+        ui.gap(updateRow);
+        ui.secondary(updateRow, "发布页", () -> openUrl(AppUpdate.RELEASES_PAGE));
         return page;
+    }
+
+    // ---------------------------------------------------------------- app updates
+
+    private int versionCode() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+        } catch (PackageManager.NameNotFoundException error) {
+            return 0;
+        }
+    }
+
+    private String versionName() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (PackageManager.NameNotFoundException error) {
+            return "0";
+        }
+    }
+
+    private void maybeCheckUpdate() {
+        long last = preferences.getLong("update_checked_at", 0);
+        if (preferences.getBoolean("auto_update", true) && System.currentTimeMillis() - last > 20 * 3600_000L) checkUpdate(true);
+    }
+
+    private void onUpdateButton() {
+        if (updateFile != null) installUpdate(updateFile);
+        else if (updateDownloader != null) updateDownloader.cancel();
+        else if (release != null && release.newerThan(versionCode(), versionName())) downloadUpdate();
+        else checkUpdate(false);
+    }
+
+    private void checkUpdate(boolean silent) {
+        if (updateChecking || updateDownloader != null) return;
+        updateChecking = true;
+        refreshUpdate("正在检查更新…");
+        final String endpoint = hub.endpoint;
+        updateThread.execute(() -> {
+            AppUpdate.Release found = null;
+            String error = null;
+            try {
+                found = AppUpdate.check(endpoint);
+                preferences.edit().putLong("update_checked_at", System.currentTimeMillis()).apply();
+            } catch (Exception failure) {
+                error = failure.getMessage();
+            }
+            final AppUpdate.Release result = found;
+            final String message = error;
+            runOnUiThread(() -> {
+                updateChecking = false;
+                release = result;
+                if (result == null) { refreshUpdate(silent ? "" : "检查失败：" + message); return; }
+                boolean newer = result.newerThan(versionCode(), versionName());
+                refreshUpdate(newer ? "发现新版本 " + result.versionName + "（" + Ui.bytes(result.size) + "，来自 " + result.source + "）"
+                                    : "已是最新版本（" + versionName() + "）");
+                if (newer && (silent || screen != Screen.SETTINGS)) offerUpdate(result);
+            });
+        });
+    }
+
+    private void offerUpdate(AppUpdate.Release found) {
+        String notes = found.notes.trim();
+        if (notes.length() > 600) notes = notes.substring(0, 600) + "…";
+        new AlertDialog.Builder(this)
+                .setTitle("InfraVox " + found.versionName + " 可用")
+                .setMessage("当前版本 " + versionName() + "，安装包 " + Ui.bytes(found.size) + "。" + (notes.isEmpty() ? "" : "\n\n" + notes))
+                .setNegativeButton("稍后", null)
+                .setNeutralButton("发布页", (dialog, which) -> openUrl(AppUpdate.RELEASES_PAGE))
+                .setPositiveButton("下载并安装", (dialog, which) -> { showScreen(Screen.SETTINGS); downloadUpdate(); })
+                .show();
+    }
+
+    private void downloadUpdate() {
+        if (release == null || updateDownloader != null) return;
+        final AppUpdate.Release target = release;
+        final HubDownloader active = new HubDownloader();
+        updateDownloader = active;
+        File dir = new File(getExternalFilesDir(null) != null ? getExternalFilesDir(null) : getFilesDir(), "updates");
+        refreshUpdate("正在下载 " + target.fileName() + "…");
+        updateThread.execute(() -> {
+            File apk = null;
+            String error = null;
+            try {
+                apk = AppUpdate.download(target, dir, active, (done, total, file, speed) -> runOnUiThread(() -> {
+                    updateProgress.setProgress((int) (1000 * done / Math.max(1, total)));
+                    updateStatus.setText(String.format(Locale.US, "下载 %s / %s%s", Ui.bytes(done), Ui.bytes(total),
+                            speed > 0 ? String.format(Locale.US, " · %s/s", Ui.bytes((long) speed)) : ""));
+                }));
+            } catch (InterruptedException | java.io.InterruptedIOException paused) {
+                error = "已暂停，再点一次继续下载";
+            } catch (Exception failure) {
+                error = "下载失败：" + failure.getMessage();
+            }
+            final File done = apk;
+            final String message = error;
+            runOnUiThread(() -> {
+                updateDownloader = null;
+                updateFile = done;
+                refreshUpdate(done != null ? "已下载 " + target.versionName + "，点“安装”完成更新" : message);
+                if (done != null) installUpdate(done);
+            });
+        });
+    }
+
+    private void installUpdate(File apk) {
+        if (Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+            toast("请允许 InfraVox 安装应用，返回后再点“安装”");
+            startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+            return;
+        }
+        if (session != null) { toast("通话结束后再安装更新"); return; }
+        try {
+            AppUpdate.install(this, apk);
+            refreshUpdate("正在安装 " + apk.getName() + "…");
+        } catch (IOException error) {
+            refreshUpdate("安装失败：" + error.getMessage());
+        }
+    }
+
+    private void onInstallStatus(Intent intent) {
+        int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+            if (confirm != null) startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        } else if (status != PackageInstaller.STATUS_SUCCESS) {
+            String detail = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+            refreshUpdate("安装未完成" + (detail == null ? "" : "：" + detail)
+                    + (status == PackageInstaller.STATUS_FAILURE_CONFLICT ? "（签名与已安装版本不一致）" : ""));
+        }
+    }
+
+    private void refreshUpdate(String status) {
+        updateStatus.setText(status);
+        updateStatus.setVisibility(status.isEmpty() ? View.GONE : View.VISIBLE);
+        updateProgress.setVisibility(updateDownloader != null ? View.VISIBLE : View.GONE);
+        boolean newer = release != null && release.newerThan(versionCode(), versionName());
+        updateButton.setText(updateFile != null ? "安装" : updateDownloader != null ? "暂停" : newer ? "下载更新" : "检查更新");
+        Ui.enable(updateButton, !updateChecking);
+    }
+
+    private void openUrl(String url) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (ActivityNotFoundException error) {
+            toast("没有可以打开链接的浏览器：" + url);
+        }
     }
 
     private void refreshSettings() {
@@ -1203,6 +1383,9 @@ public final class MainActivity extends Activity {
     protected void onDestroy() {
         if (session != null) session.abort();
         if (downloader != null) downloader.cancel();
+        if (updateDownloader != null) updateDownloader.cancel();
+        unregisterReceiver(installReceiver);
+        updateThread.shutdown();
         stopPlayer();
         final DuplexEngine old = engine;
         engine = null;
