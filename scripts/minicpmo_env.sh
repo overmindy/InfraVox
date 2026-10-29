@@ -9,8 +9,14 @@
 : "${MCPO_CAPTURE:=$MCPO_ROOT/capture}"
 : "${MCPO_WORK:=$MCPO_ROOT/work}"
 : "${MCPO_BUNDLE:=v1}"
+: "${MCPO_TARGET:=sm8975}"                                      # contexts are bound to one SoC
+case $MCPO_TARGET in
+  sm8850) : "${MCPO_SOC_MODEL:=87}" "${MCPO_DSP_ARCH:=v81}" ;;
+  sm8975) : "${MCPO_SOC_MODEL:=103}" "${MCPO_DSP_ARCH:=v85}" ;;
+  *) : "${MCPO_SOC_MODEL:?set for target $MCPO_TARGET}" "${MCPO_DSP_ARCH:?set for target $MCPO_TARGET}" ;;
+esac
 : "${MCPO_GPUS:=0 5}"
-: "${QAIRT_SDK_ROOT:=/data2/yejialei/sdk/qairt/2.45.0.260326}"
+: "${QAIRT_SDK_ROOT:=/data2/yejialei/sdk/qairt/2.51.40.260930}"  # first QAIRT with HTP v85; v1 SM8850 was 2.45.0.260326
 : "${QAIRT_NUMPY_DIR:=/data2/yejialei/moshi/python-deps-numpy126}"  # the QAIRT 2.45 converter needs NumPy 1.26
 : "${PY:=/home/user/workdir-wenhao/my_conda_pkgs/qairt/bin/python}"   # torch, onnx, this repo (editable)
 : "${AIMET_PY:=/data2/yejialei/envs/aimet228/bin/python}"             # adds aimet-onnx 2.28, onnxruntime-gpu

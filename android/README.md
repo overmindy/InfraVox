@@ -1,6 +1,7 @@
 # InfraVox 开发文档
 
-目标设备：HONOR BKQ-AN20，SM8850（HTP v81），Android 16，QAIRT 2.45.0.260326。
+目标设备：OPPO PYB110，SM8975（Snapdragon 8 Elite Gen 6 Pro，HTP v85），Android 17，QAIRT 2.51.40.260930。
+旧版本：HONOR BKQ-AN20，SM8850（HTP v81），QAIRT 2.45.0.260326（模型包 `minicpmo45-v1-sm8850`、`moshiko-lm-v4-lpbq4-sm8850`）。
 每个模型从官方 BF16 权重到手机上运行都只需要两条命令：服务器上 `scripts/<模型>_build_all.sh`，Mac 上 `scripts/<模型>_deploy.sh`。
 下面先是推荐使用的 MiniCPM-o 4.5，然后是实验性的 Moshi，最后是两者共用的 App 和发布流程。
 Moshi 旧的实验代码可在 git tag `moshi-pre-cleanup` 中找回。
@@ -10,6 +11,21 @@ Moshi 旧的实验代码可在 git tag `moshi-pre-cleanup` 中找回。
 OpenBMB [MiniCPM-o 4.5](https://huggingface.co/openbmb/MiniCPM-o-4_5) 的全双工语音部分（不含视觉），
 同一台手机、同一个 QAIRT。服务器上 `scripts/minicpmo_build_all.sh` 从 BF16 权重一路做到模型包，
 Mac 上 `scripts/minicpmo_deploy.sh` 推到手机并安装 App；路径在 `scripts/minicpmo_env.sh`。
+
+context 绑定 SoC：`MCPO_TARGET`（默认 `sm8975`；`sm8850` 也已登记 soc_model / dsp_arch）选目标，输出到
+`work/contexts-<target>` 和 `bundle/<MCPO_BUNDLE>-<target>`，对应 catalog 变体 `minicpmo45-<bundle>-<target>`。
+AIMET 编码和 DLC 与 SoC 无关，换目标只重新跑 `qnn-context-binary-generator`（几分钟）。
+App 里的 QNN 运行库必须与编译 context 的 QAIRT 同版本：deploy 从 `android/demo/build/qairt/<版本>/` 取
+`include/`（SDK 的 `include/QNN`）和 `lib/`（`aarch64-android` 的库加 `hexagon-v8x/unsigned` 的 skel，平铺）。
+
+**Android 17（SM8975 等带 NPU 调度器的机型）**：系统的 NPU 调度器会拒绝没拿到授权的 App 提交 FastRPC 任务
+（logcat 里 `RPC NPU scheduler enforcement enabled` 后跟 `remote work start failed: 3`，QNN `deviceCreate` 报 14001）。
+App 因此 targetSdk 37、在 manifest 声明 `android.hardware.npu`，并在加载模型前用 `engine/NpuGate.java`
+通过反射向 `android.npumanager.NpuManager` 申请（`adb shell cmd npu info` 能看到 App 的优先级即为成功）。
+targetSdk 37 会强制 edge-to-edge，`MainActivity` 按系统栏 inset 留边。
+ADB 部署建的模型目录属于 shell，App 以 other 身份访问，所以 deploy 把目录设为 777、文件 644。
+
+SM8975 实测（OPPO PYB110，演示提问 19 秒通话）：加载 5.6 秒，平均每 80 ms 帧 31 ms（RTF 0.39），播放 2 次 underrun。
 
 ## 模型与数据流
 
@@ -239,7 +255,7 @@ Java 代码按层拆分（`android/demo/src/com/overmindy/duplex/`）：`engine/
 
 ```sh
 python scripts/hf_publish.py --repo <用户名>/duplex-voice-models \
-  --variant minicpmo45-v1-sm8850 --bundle-dir <本地模型包目录>
+  --variant minicpmo45-v1-sm8975 --bundle-dir <本地模型包目录>
 ```
 
 脚本会校验并更新 `android/models/catalog.json`（记得提交），可中断后重跑续传。

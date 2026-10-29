@@ -16,6 +16,7 @@ public final class MiniCpmoEngine implements DuplexEngine {
     private static final int[] NO_CODES = new int[0];
 
     private long handle;
+    private NpuGate npu;
     private final ByteArrayOutputStream textBytes = new ByteArrayOutputStream();
     private int emittedBytes;
 
@@ -29,7 +30,13 @@ public final class MiniCpmoEngine implements DuplexEngine {
     @Override
     public void load(Context context, File modelDir, Options options) throws Exception {
         release();
-        handle = MiniCpmoNative.nativeCreate(context.getApplicationInfo().nativeLibraryDir, modelDir.getAbsolutePath());
+        npu = NpuGate.acquire(context, 1);
+        try {
+            handle = MiniCpmoNative.nativeCreate(context.getApplicationInfo().nativeLibraryDir, modelDir.getAbsolutePath());
+        } catch (Exception e) {
+            throw new Exception(e.getMessage() + "（NPU：" + npu.status + "）", e);
+        }
+        npu.notifyLoaded();
     }
 
     @Override
@@ -57,6 +64,8 @@ public final class MiniCpmoEngine implements DuplexEngine {
     public void release() {
         if (handle != 0) MiniCpmoNative.nativeRelease(handle);
         handle = 0;
+        if (npu != null) npu.notifyUnloaded();
+        npu = null;
     }
 
     // Byte-level BPE pieces can split a UTF-8 character across units; only whole characters are returned.

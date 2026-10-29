@@ -31,8 +31,9 @@ if [[ -z "${JAVA_HOME:-}" || ! -x "$JAVA_HOME/bin/javac" ]]; then
   echo 'Set JAVA_HOME to a JDK installation.' >&2
   exit 2
 fi
-BUILD_TOOLS="$SDK/build-tools/35.0.0"
-PLATFORM="$SDK/platforms/android-34/android.jar"
+BUILD_TOOLS="$SDK/build-tools/${ANDROID_BUILD_TOOLS:-36.0.0}"
+PLATFORM="$SDK/platforms/${ANDROID_PLATFORM:-android-37.0}/android.jar"
+TARGET_SDK=${TARGET_SDK:-37}  # Android 17's NPU manager only grants NPU access to apps targeting 37 (see NpuGate)
 CXX="$NDK/toolchains/llvm/prebuilt/$HOST/bin/aarch64-linux-android29-clang++"
 rm -rf "$OUT/classes" "$OUT/dex" "$OUT/stage"
 mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/stage/lib/arm64-v8a" "$OUT/stage/assets"
@@ -48,10 +49,13 @@ mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/stage/lib/arm64-v8a" "$OUT/stage/assets
   -o "$OUT/stage/lib/arm64-v8a/libminicpmo_qnn.so" -L "$ORT/jni/arm64-v8a" -lonnxruntime -ldl
 cp "$ORT/jni/arm64-v8a/libonnxruntime.so" "$OUT/stage/lib/arm64-v8a/libonnxruntime.so"
 
-for library in libQnnHtp.so libQnnSystem.so libQnnHtpV81.so \
-               libQnnHtpV81Stub.so libQnnHtpV81Skel.so \
-               libQnnHtpPrepare.so libQnnModelDlc.so; do
+for library in libQnnHtp.so libQnnSystem.so libQnnHtpPrepare.so libQnnModelDlc.so; do
   cp "$QNN_LIBS/$library" "$OUT/stage/lib/arm64-v8a/$library"
+done
+for arch in V81 V85; do  # one set per HTP generation the catalog has variants for
+  for library in libQnnHtp$arch.so libQnnHtp${arch}Stub.so libQnnHtp${arch}Skel.so; do
+    if [[ -f "$QNN_LIBS/$library" ]]; then cp "$QNN_LIBS/$library" "$OUT/stage/lib/arm64-v8a/$library"; fi
+  done
 done
 cp "$REPO_ROOT/android/models/catalog.json" "$OUT/stage/assets/catalog.json"
 if [[ -n "$SAMPLE" ]]; then cp "$SAMPLE" "$OUT/stage/assets/demo.wav"; fi
@@ -64,7 +68,7 @@ find "$OUT/classes" -name '*.class' > "$OUT/classes.txt"
 
 "$BUILD_TOOLS/aapt2" compile --dir "$SCRIPT_DIR/res" -o "$OUT/resources.zip"
 "$BUILD_TOOLS/aapt2" link --manifest "$SCRIPT_DIR/AndroidManifest.xml" \
-  -I "$PLATFORM" --min-sdk-version 29 --target-sdk-version 34 \
+  -I "$PLATFORM" --min-sdk-version 29 --target-sdk-version "$TARGET_SDK" \
   -o "$OUT/unsigned.apk" "$OUT/resources.zip"
 cp "$OUT/dex/classes.dex" "$OUT/stage/classes.dex"
 (cd "$OUT/stage" && zip -q -0 -r "$OUT/unsigned.apk" classes.dex lib assets)

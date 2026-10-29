@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "revision": 3,
+  "revision": 4,
   "models": [
     {
       "id": "minicpmo-4.5",
@@ -81,6 +81,79 @@
               "path": "llm_part_3.bin",
               "size": 913256448,
               "sha256": "1f9b08be92659cadfcd53819989a9e5a283503de9c2ce4f2ca0b941e97e76bfa"
+            },
+            {
+              "path": "tts_cpu.bin",
+              "size": 194742088,
+              "sha256": "74969808183cc9f91b37d0eee28c617a817b302af3ff445b98cbdea0e4301676"
+            }
+          ]
+        },
+        {
+          "id": "minicpmo45-v1-sm8975",
+          "title": "LLM LPBQ W4 · Whisper / DiT / HiFT W8 · TTS CPU int8",
+          "path": "minicpmo/minicpmo45-v1-sm8975",
+          "socs": [
+            "SM8975"
+          ],
+          "htp": "v85",
+          "qairt": "2.51.40.260930",
+          "notes": "与 SM8850 版同一套量化，用 QAIRT 2.51 为 SM8975（HTP v85）重新编译 context；Android 17 上需要带 NPU Manager 授权的新版 App。实测加载 5.6 秒，19 秒演示通话平均每 80 ms 帧 31 ms（RTF 0.39）。",
+          "files": [
+            {
+              "path": "assets.bin",
+              "size": 1733394180,
+              "sha256": "48e86df743f1b0b9d388c3de9ae57de1c5ad35587250be03699bc5b0d636a06e"
+            },
+            {
+              "path": "audio_encoder.bin",
+              "size": 335949824,
+              "sha256": "aaa57d663146e9b335b1a63508131caafd7a0fb86bf8eb405a89305977c51b9f"
+            },
+            {
+              "path": "dit.bin",
+              "size": 78688256,
+              "sha256": "d8e3c9c1347ee419712f10a65e49bdc87113b30d3cc0dec5d61c2d61ba9cebd6"
+            },
+            {
+              "path": "flow_encoder.onnx",
+              "size": 185649479,
+              "sha256": "6cf1a240eb98dfd1122c79e4c1ebd368fca84ebecad74a07029d12251f33efe9"
+            },
+            {
+              "path": "hift_decode.bin",
+              "size": 21569536,
+              "sha256": "c6837f86960ce01a1f151a8bf4723fd3a95c91c43ce7e7a7f237c8a12c2bb022"
+            },
+            {
+              "path": "hift_f0.bin",
+              "size": 3399680,
+              "sha256": "1fd234aae7cee68c1c4e3db8f9460f61b2d695f04dcb2a8478ba37a30a26f33a"
+            },
+            {
+              "path": "llm_head.bin",
+              "size": 626921472,
+              "sha256": "77588d705df56cb525f329149a1a97ac5c96a635b6338fb93c492f1461939328"
+            },
+            {
+              "path": "llm_part_0.bin",
+              "size": 926277632,
+              "sha256": "f4c34f35b6c7ab50dab27132486d90033f267915f4b2675c26d4593f69f026a0"
+            },
+            {
+              "path": "llm_part_1.bin",
+              "size": 926265344,
+              "sha256": "cb0642be52cfe18736d66807dc01c210acfba202988caf2b3fea1389c35652a6"
+            },
+            {
+              "path": "llm_part_2.bin",
+              "size": 926277632,
+              "sha256": "851d83fdd0c206176677ade08189b01bdfb4436525a04ebcbf010ab228156d28"
+            },
+            {
+              "path": "llm_part_3.bin",
+              "size": 926281728,
+              "sha256": "3eeb48f998a50f6de769bb4933977383aadf2f491d76bc3cb554aeb6e556c927"
             },
             {
               "path": "tts_cpu.bin",

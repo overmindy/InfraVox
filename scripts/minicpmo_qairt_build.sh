@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
-# Convert + quantize graphs and compile them into one SM8850 (HTP v81) context OUT.bin.
+# Convert + quantize graphs and compile them into one context OUT.bin for $MCPO_SOC_MODEL / $MCPO_DSP_ARCH.
 # Usage: minicpmo_qairt_build.sh OUT GRAPH [GRAPH...]
 #   Each GRAPH reads $MCPO_WORK/GRAPH/onnx/model.onnx and $MCPO_WORK/GRAPH/GRAPH.encodings.
 #   Several graphs (AR-1 + AR-16 of one LLM part) share their weights inside the context.
@@ -37,7 +37,7 @@ HTP=$(dirname "$OUT")/htp_$(basename "$OUT" .bin)
 mkdir -p "$HTP"
 GRAPHS=$(printf '"%s",' "$@"); GRAPHS=${GRAPHS%,}
 SHARE=false; [ $# -gt 1 ] && SHARE=true
-echo "{\"graphs\": [{\"graph_names\": [$GRAPHS], \"O\": 3, \"vtcm_mb\": 8}], \"devices\": [{\"soc_model\": 87, \"dsp_arch\": \"v81\"}], \"context\": {\"weight_sharing_enabled\": $SHARE}}" \
+echo "{\"graphs\": [{\"graph_names\": [$GRAPHS], \"O\": 3, \"vtcm_mb\": 8}], \"devices\": [{\"soc_model\": $MCPO_SOC_MODEL, \"dsp_arch\": \"$MCPO_DSP_ARCH\"}], \"context\": {\"weight_sharing_enabled\": $SHARE}}" \
   > "$HTP/backend.json"
 echo "{\"backend_extensions\": {\"shared_library_path\": \"$LIB/libQnnHtpNetRunExtensions.so\", \"config_file_path\": \"$HTP/backend.json\"}}" \
   > "$HTP/config.json"

@@ -3,15 +3,17 @@
 # Copyright (c) 2025 Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
-# One-click server build: openbmb/MiniCPM-o-4_5 BF16 -> SM8850 contexts in $MCPO_WORK/contexts.
+# One-click server build: openbmb/MiniCPM-o-4_5 BF16 -> $MCPO_TARGET contexts in $MCPO_WORK/contexts-$MCPO_TARGET.
+# Calibration and DLCs do not depend on the SoC, so building another target only recompiles the contexts.
 # Paths come from minicpmo_env.sh. Every finished step is skipped, so a failed run resumes where it stopped.
 # Calibration runs as two queues, one per GPU in $MCPO_GPUS; QAIRT compilation runs on the CPU in parallel.
 set -euo pipefail
 S=$(cd "$(dirname "$0")" && pwd)
 source "$S/minicpmo_env.sh"
 W=$MCPO_WORK
+C=$W/contexts-$MCPO_TARGET
 read -ra GPUS <<< "$MCPO_GPUS"
-mkdir -p "$W/tmp" "$W/logs" "$W/contexts"
+mkdir -p "$W/tmp" "$W/logs" "$C"
 export TMPDIR=$W/tmp  # AIMET writes multi-GB model copies to TMPDIR.
 COMMON=(--model-dir "$MCPO_HF" --capture-dir "$MCPO_CAPTURE" --work-dir "$W")
 
@@ -56,7 +58,7 @@ echo "== QAIRT: convert, quantize, compile contexts"
 ln -sfn "$W/token2wav/dit" "$W/dit"
 ln -sfn "$W/token2wav/hift_f0" "$W/hift_f0"
 ln -sfn "$W/token2wav/hift_decode" "$W/hift_decode"
-build() { local out=$1; shift; [ -f "$W/contexts/$out.bin" ] || "$S/minicpmo_qairt_build.sh" "$W/contexts/$out.bin" "$@" > "$W/logs/$out.build.log" 2>&1; }
+build() { local out=$1; shift; [ -f "$C/$out.bin" ] || "$S/minicpmo_qairt_build.sh" "$C/$out.bin" "$@" > "$W/logs/$out.$MCPO_TARGET.build.log" 2>&1; }
 pids=()
 for p in 0 1 2 3; do build "llm_part_$p" "llm_part_${p}_ar1" "llm_part_${p}_ar16" & pids+=($!); done
 build llm_head llm_head & pids+=($!)
@@ -66,11 +68,11 @@ build hift_f0 hift_f0 & pids+=($!)
 build hift_decode hift_decode & pids+=($!)
 await "${pids[@]}"
 
-B=$MCPO_ROOT/bundle/$MCPO_BUNDLE
+B=$MCPO_ROOT/bundle/$MCPO_BUNDLE-$MCPO_TARGET
 echo "== bundle $B"
 mkdir -p "$B"
 for name in llm_part_0 llm_part_1 llm_part_2 llm_part_3 llm_head audio_encoder dit hift_f0 hift_decode; do
-  ln -f "$W/contexts/$name.bin" "$B/"
+  ln -f "$C/$name.bin" "$B/"
 done
 rm -f "$B/tts.bin"  # bundles before the TTS moved to the CPU
 ln -f "$W/token2wav/flow_encoder.onnx" "$W/tts_cpu/tts_cpu.bin" "$B/"

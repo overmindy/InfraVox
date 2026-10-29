@@ -18,6 +18,7 @@ public final class MoshiEngine implements DuplexEngine {
     private long handle;
     private boolean codecOnly;
     private String[] vocabulary;
+    private NpuGate npu;
     private final ByteArrayOutputStream textBytes = new ByteArrayOutputStream();
     private int emittedBytes;
 
@@ -30,8 +31,10 @@ public final class MoshiEngine implements DuplexEngine {
         release();
         codecOnly = options.codecOnly;
         vocabulary = codecOnly ? null : readVocabulary(new File(modelDir, "text_vocab.txt"));
+        npu = NpuGate.acquire(context, 2);
         handle = MoshiNative.nativeCreate(context.getApplicationInfo().nativeLibraryDir,
                 modelDir.getAbsolutePath(), codecOnly);
+        npu.notifyLoaded();
     }
 
     @Override
@@ -60,6 +63,8 @@ public final class MoshiEngine implements DuplexEngine {
     public void release() {
         if (handle != 0) MoshiNative.nativeRelease(handle);
         handle = 0;
+        if (npu != null) npu.notifyUnloaded();
+        npu = null;
     }
 
     // SentencePiece: ids 0-3 are <unk>/<s>/</s>/<pad>, "<0xHH>" pieces are raw bytes, "▁" is a space.

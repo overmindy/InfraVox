@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <!-- Android 17: required for NPU access; engine/NpuGate does the NpuManager handshake. -->
+    <uses-feature android:name="android.hardware.npu" android:required="false" />
     <application android:label="@string/app_name"
                  android:icon="@mipmap/ic_launcher"
                  android:roundIcon="@mipmap/ic_launcher"

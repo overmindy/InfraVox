@@ -14,6 +14,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
@@ -27,6 +28,7 @@ import android.text.InputType;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
@@ -164,7 +166,14 @@ public final class MainActivity extends Activity {
         }
         getWindow().setStatusBarColor(Ui.BACKGROUND);
         getWindow().setNavigationBarColor(Ui.BACKGROUND);
-        setContentView(buildShell());
+        View shell = buildShell();
+        // Targeting API 35+ draws edge to edge on Android 15+; keep the content clear of the system bars and keyboard.
+        if (Build.VERSION.SDK_INT >= 35) shell.setOnApplyWindowInsetsListener((view, insets) -> {
+            Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.ime());
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            return WindowInsets.CONSUMED;
+        });
+        setContentView(shell);
         renderModels();
         showScreen(Screen.CHAT);
         refreshAll();

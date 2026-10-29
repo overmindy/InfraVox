@@ -123,7 +123,8 @@ Use one wrapper script modelled on `scripts/minicpmo_qairt_build.sh`:
 Then a one-click `scripts/<model>_build_all.sh` that skips finished steps (so a failed run resumes) and ends
 with a bundle directory plus `SHA256SUMS`.
 
-Context binaries are bound to the target SoC (InfraVox ships for SM8850 / HTP v81) and the QAIRT version the
+Context binaries are bound to the target SoC (InfraVox targets SM8975 / HTP v85 with QAIRT 2.51; see
+`MCPO_TARGET` in `scripts/minicpmo_env.sh` for the soc_model / dsp_arch table) and the QAIRT version the
 app bundles. Do not try to prepare DLCs on the phone instead: an 8B LLM part with AR-1 + AR-N weight sharing
 finalizes on the device but cannot be serialized there (QNN status 5007).
 
@@ -185,6 +186,7 @@ question got an answer.
 | 16-bit activation range blown | `-inf` attention masks | use a large finite negative or slice the cache instead |
 | Model always stays silent with greedy decoding | quantization shifts the listen/speak logit | sample (temperature ~0.7, top-k / min-p) instead of argmax |
 | `contextCreateFromBinary` fails on another phone | contexts are bound to SoC + QAIRT version | only the target SoC is supported; other SoCs need their own context build |
+| `deviceCreate` 14001 after `remote work start failed: 3` (Android 17) | the NPU scheduler only serves apps granted by `NpuManager` | call `engine/NpuGate.java` before loading; targetSdk 37 + `uses-feature android.hardware.npu` |
 
 ## Report back
 
