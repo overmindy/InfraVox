@@ -40,6 +40,7 @@ experimental model; it is currently slower than real time.
 
 - **Full-duplex calls**: microphone audio streams into the model, which speaks back while it listens and plays its reply right away; you can cut in at any time.
 - **Several models**: MiniCPM-o 4.5 (Chinese / English, recommended) and Moshi (English, experimental), switched on the models page.
+- **Photos**: with MiniCPM-o (the v2 bundle for SM8975) you can send a photo from the gallery or the camera before or during a call, and the model talks about it; the photo shows in the conversation.
 - **Chat-style UI**: each call is split into speech-turn bubbles you can replay; conversations are stored on the device and can be exported as audio and text.
 - **Model manager**: downloads from Hugging Face or a mirror with resume and per-file SHA-256 checks, and marks the variants that fit your chip.
 - **Live status**: latency, per-step time, real-time factor and backlog during a call.
