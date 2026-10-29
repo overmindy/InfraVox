@@ -13,7 +13,10 @@ import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.ImageDecoder;
 import android.graphics.Insets;
 import android.media.MediaPlayer;
 import android.net.Uri;
@@ -64,6 +67,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -75,7 +79,11 @@ import java.util.concurrent.Executors;
 public final class MainActivity extends Activity {
     private static final int PICK_AUDIO = 1;
     private static final int REQUEST_MICROPHONE = 2;
+    private static final int PICK_IMAGE = 3;
+    private static final int TAKE_PHOTO = 4;
     private static final double FRAME_SECONDS = 0.08;
+    // Photos are decoded at most this large; the model resizes them to ~448x448 anyway.
+    private static final int MAX_IMAGE_SIDE = 1344;
 
     private enum EngineState { NONE, VERIFYING, LOADING, READY, ERROR }
     private enum Source { MICROPHONE, DEMO, FILE }
@@ -107,6 +115,9 @@ public final class MainActivity extends Activity {
     private Source source = Source.MICROPHONE;
     private MediaPlayer player;
     private final Runnable stopPlayback = this::stopPlayer;
+    private Uri cameraUri;
+    private Bitmap pendingImage;  // picked outside a call: sent when the next call starts
+    private final Map<String, Bitmap> thumbnails = new HashMap<>();
 
     private HubDownloader downloader;
     private String downloadingVariant;
@@ -118,7 +129,7 @@ public final class MainActivity extends Activity {
     private View chatPage, modelsPage, settingsPage, bottomBar, scrim;
     private LinearLayout drawer, drawerList, chatList;
     private ScrollView chatScroll;
-    private TextView navButton, actionButton, title, subtitle, statusLine, sourceChip, callStats;
+    private TextView navButton, actionButton, title, subtitle, statusLine, sourceChip, imageChip, callStats;
     private TalkButton talk;
     private boolean drawerOpen;
 
@@ -379,9 +390,18 @@ public final class MainActivity extends Activity {
         talk = new TalkButton(this, 96);
         talk.setOnClickListener(v -> onTalk());
         bar.addView(talk, new LinearLayout.LayoutParams(ui.dp(110), -2));
-        callStats = ui.text(null, "", 12, Ui.MUTED, false);
+        LinearLayout right = ui.row();
+        right.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        callStats = ui.text(right, "", 12, Ui.MUTED, false);
         callStats.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        bar.addView(callStats, new LinearLayout.LayoutParams(0, -2, 1));
+        imageChip = ui.chip(null, "📷 图片", Ui.TEXT);
+        imageChip.setTextSize(13);
+        imageChip.setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(8));
+        imageChip.setOnClickListener(v -> chooseImageMenu());
+        LinearLayout.LayoutParams imageParams = new LinearLayout.LayoutParams(-2, -2);
+        imageParams.leftMargin = ui.dp(6);
+        right.addView(imageChip, imageParams);
+        bar.addView(right, new LinearLayout.LayoutParams(0, -2, 1));
         return bar;
     }
 
@@ -399,10 +419,18 @@ public final class MainActivity extends Activity {
         chatList.removeAllViews();
         if (turns.isEmpty() && session == null) {
             renderEmptyState();
+            if (pendingImage != null) renderImage(pendingImage, "通话开始时发给模型 · 点击移除", this::removePendingImage);
             return;
         }
         boolean live = session != null;
-        for (Turn turn : turns) renderBubble(turn, live);
+        File[] pictures = pictures();
+        int next = 0;
+        for (Turn turn : turns) {
+            while (next < pictures.length && frameOf(pictures[next]) <= turn.startFrame) renderPicture(pictures[next++]);
+            renderBubble(turn, live);
+        }
+        while (next < pictures.length) renderPicture(pictures[next++]);
+        if (!live && pendingImage != null) renderImage(pendingImage, "下一通对话开始时发给模型 · 点击移除", this::removePendingImage);
         if (live && turns.isEmpty()) {
             TextView waiting = ui.text(chatList, "正在聆听…直接说话，模型会边听边说。", 14, Ui.MUTED, false);
             waiting.setGravity(Gravity.CENTER);
@@ -497,6 +525,137 @@ public final class MainActivity extends Activity {
         chatList.addView(row, params);
     }
 
+    // Photos of the open conversation, image_<input frame>.jpg, in the order the model saw them.
+    private File[] pictures() {
+        if (current == null) return new File[0];
+        File[] files = conversations.dir(current.id).listFiles((dir, name) -> name.startsWith("image_") && name.endsWith(".jpg"));
+        if (files == null) return new File[0];
+        Arrays.sort(files, (a, b) -> Integer.compare(frameOf(a), frameOf(b)));
+        return files;
+    }
+
+    private static int frameOf(File picture) {
+        String name = picture.getName();
+        try {
+            return Integer.parseInt(name.substring("image_".length(), name.length() - ".jpg".length()));
+        } catch (NumberFormatException error) {
+            return 0;
+        }
+    }
+
+    private void renderPicture(File file) {
+        Bitmap bitmap = thumbnails.get(file.getPath());
+        if (bitmap == null) {
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = 2;
+            bitmap = BitmapFactory.decodeFile(file.getPath(), options);
+            if (bitmap == null) return;
+            thumbnails.put(file.getPath(), bitmap);
+        }
+        renderImage(bitmap, null, null);
+    }
+
+    private void renderImage(Bitmap bitmap, String caption, Runnable onClick) {
+        LinearLayout bubble = ui.column(0);
+        bubble.setPadding(ui.dp(4), ui.dp(4), ui.dp(4), ui.dp(4));
+        bubble.setBackground(Ui.rounded(Color.rgb(37, 49, 92), ui.dp(18)));
+        ImageView view = new ImageView(this);
+        view.setImageBitmap(bitmap);
+        view.setAdjustViewBounds(true);
+        view.setMaxWidth(ui.dp(220));
+        view.setMaxHeight(ui.dp(280));
+        view.setClipToOutline(true);
+        view.setBackground(Ui.rounded(Color.BLACK, ui.dp(15)));
+        bubble.addView(view, new LinearLayout.LayoutParams(-2, -2));
+        if (caption != null) {
+            TextView label = ui.text(bubble, caption, 12, Ui.MUTED, false);
+            label.setPadding(ui.dp(8), ui.dp(4), ui.dp(8), ui.dp(4));
+        }
+        if (onClick != null) bubble.setOnClickListener(v -> onClick.run());
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
+        params.gravity = Gravity.END;
+        params.topMargin = ui.dp(10);
+        params.leftMargin = ui.dp(64);
+        chatList.addView(bubble, params);
+    }
+
+    private void removePendingImage() {
+        pendingImage = null;
+        renderChat();
+    }
+
+    private void chooseImageMenu() {
+        PopupMenu menu = new PopupMenu(this, imageChip);
+        menu.getMenu().add(0, 0, 0, "🖼️ 从相册选择");
+        menu.getMenu().add(0, 1, 1, "📷 拍照");
+        menu.setOnMenuItemClickListener(item -> {
+            try {
+                if (item.getItemId() == 0) {
+                    Intent intent = Build.VERSION.SDK_INT >= 33
+                            ? new Intent(MediaStore.ACTION_PICK_IMAGES)
+                            : new Intent(Intent.ACTION_GET_CONTENT).addCategory(Intent.CATEGORY_OPENABLE).setType("image/*");
+                    startActivityForResult(intent, PICK_IMAGE);
+                } else {
+                    // The camera app writes the full-size photo into a new Pictures/InfraVox entry.
+                    ContentValues values = new ContentValues();
+                    values.put(MediaStore.Images.Media.DISPLAY_NAME,
+                            "infravox-" + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date()) + ".jpg");
+                    values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+                    values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/InfraVox");
+                    cameraUri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                    if (cameraUri == null) throw new IOException("无法创建照片文件");
+                    Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE).putExtra(MediaStore.EXTRA_OUTPUT, cameraUri)
+                            .addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                    startActivityForResult(intent, TAKE_PHOTO);
+                }
+            } catch (ActivityNotFoundException | IOException error) {
+                toast(item.getItemId() == 0 ? "没有可用的相册应用" : "没有可用的相机应用：" + error.getMessage());
+            }
+            return true;
+        });
+        menu.show();
+    }
+
+    private void onImagePicked(Uri uri) {
+        final ConversationSession live = session;
+        final DuplexEngine target = engine;
+        final File dir = live != null && current != null ? conversations.dir(current.id) : null;
+        final int frame = liveStats == null ? 0 : liveStats.processed;
+        if (live != null && (target == null || !target.supportsImages())) {
+            toast("当前模型包不含视觉模块，无法看图");
+            return;
+        }
+        ioThread.execute(() -> {
+            try {
+                Bitmap bitmap = ImageDecoder.decodeBitmap(ImageDecoder.createSource(getContentResolver(), uri), (decoder, info, source) -> {
+                    decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
+                    int width = info.getSize().getWidth(), height = info.getSize().getHeight();
+                    double scale = Math.min(1.0, (double) MAX_IMAGE_SIDE / Math.max(width, height));
+                    if (scale < 1) decoder.setTargetSize((int) Math.round(width * scale), (int) Math.round(height * scale));
+                });
+                if (dir == null) {
+                    runOnUiThread(() -> {
+                        pendingImage = bitmap;
+                        renderChat();
+                        toast("图片会在通话开始时发给模型");
+                    });
+                    return;
+                }
+                saveJpeg(bitmap, new File(dir, "image_" + frame + ".jpg"));
+                runOnUiThread(this::renderChat);
+                target.attachImage(bitmap);
+            } catch (Throwable error) {
+                runOnUiThread(() -> toast("发送图片失败：" + error.getMessage()));
+            }
+        });
+    }
+
+    private static void saveJpeg(Bitmap bitmap, File file) throws IOException {
+        try (OutputStream output = new FileOutputStream(file)) {
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)) throw new IOException("无法保存图片");
+        }
+    }
+
     private ImageView avatar() {
         ImageView view = new ImageView(this);
         view.setImageResource(getResources().getIdentifier("avatar_elaina", "drawable", getPackageName()));
@@ -537,6 +696,17 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == TAKE_PHOTO && cameraUri != null) {
+            Uri photo = cameraUri;
+            cameraUri = null;
+            if (result == RESULT_OK) onImagePicked(photo);
+            else getContentResolver().delete(photo, null, null);  // the empty entry made for the camera app
+            return;
+        }
+        if (request == PICK_IMAGE) {
+            if (result == RESULT_OK && data != null && data.getData() != null) onImagePicked(data.getData());
+            return;
+        }
         if (request != PICK_AUDIO || result != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         ioThread.execute(() -> {
@@ -627,6 +797,25 @@ public final class MainActivity extends Activity {
             }
         });
         session.start(engineThread);
+        if (pendingImage != null) {
+            final Bitmap image = pendingImage;
+            final DuplexEngine target = engine;
+            final File file = new File(config.directory, "image_0.jpg");
+            pendingImage = null;
+            if (!target.supportsImages()) {
+                toast("当前模型包不含视觉模块，图片没有发给模型");
+            } else {
+                ioThread.execute(() -> {
+                    try {
+                        saveJpeg(image, file);
+                        runOnUiThread(this::renderChat);
+                        target.attachImage(image);
+                    } catch (Throwable error) {
+                        runOnUiThread(() -> toast("发送图片失败：" + error.getMessage()));
+                    }
+                });
+            }
+        }
         renderChat();
         refreshAll();
     }
@@ -779,6 +968,9 @@ public final class MainActivity extends Activity {
     private void refreshTalk() {
         sourceChip.setText(source == Source.MICROPHONE ? "🎤 麦克风" : source == Source.DEMO ? "♪ 演示音频" : "📄 WAV");
         Ui.enable(sourceChip, session == null);
+        ModelCatalog.Variant selected = selectedVariant();
+        imageChip.setVisibility(selected != null && Engines.takesImages(selected.model.engine) ? View.VISIBLE : View.GONE);
+        Ui.enable(imageChip, session == null || !session.isDraining());
         if (session != null) {
             if (session.isDraining()) talk.set(TalkButton.Mode.BUSY, "处理中", "");
             else talk.set(TalkButton.Mode.LIVE, "结束", "");
@@ -1360,6 +1552,8 @@ public final class MainActivity extends Activity {
                     File source = new File(conversations.dir(meta.id), file[0]);
                     if (source.isFile()) saveDownload(source, prefix + "-" + file[0], file[1]);
                 }
+                File[] images = conversations.dir(meta.id).listFiles((dir, name) -> name.startsWith("image_") && name.endsWith(".jpg"));
+                if (images != null) for (File image : images) saveDownload(image, prefix + "-" + image.getName(), "image/jpeg");
                 message = "已保存到 Download/InfraVox（" + prefix + "-*）";
             } catch (Exception error) {
                 message = "导出失败：" + error.getMessage();

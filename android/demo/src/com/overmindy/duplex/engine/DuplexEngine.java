@@ -1,6 +1,7 @@
 package com.overmindy.duplex.engine;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 
 import java.io.File;
 
@@ -44,6 +45,15 @@ public interface DuplexEngine {
     Frame step(short[] input);
 
     void end(File performanceCsv);
+
+    /** Whether attachImage() works for the loaded model. */
+    default boolean supportsImages() { return false; }
+
+    /**
+     * Shows the model a photo: it is fed with the next step that completes a unit, or with the first
+     * one after the next begin(). Unlike the other calls this may run on any thread, during a call.
+     */
+    default void attachImage(Bitmap image) { throw new UnsupportedOperationException("此模型不支持图片"); }
 
     void release();
 }

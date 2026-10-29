@@ -1,6 +1,6 @@
 // Host-side checks of minicpmo_runner.cpp's CPU math against vectors from the server scripts
-// (scripts/minicpmo_hift_check.py, scripts/minicpmo_tts_cpu.py with its tts_cpu.bin, and a
-// captured duplex session's Whisper input). Builds and
+// (scripts/minicpmo_hift_check.py, scripts/minicpmo_tts_cpu.py with its tts_cpu.bin, a captured
+// duplex session's Whisper input, and minicpmo_vision_reference.py hosttest in DIR/vision). Builds and
 // runs on a desktop; no QNN device or ONNX Runtime library is needed.
 //   clang++ -std=c++17 -O2 -I <qnn include> -I <ort headers> android/minicpmo_host_test.cpp -o host_test
 //   ./host_test <dir with audio.f32 mel.f32 mel_filters.f32 f0.f32 ... wave.f32>
@@ -12,14 +12,17 @@
 
 namespace {
 
-std::vector<float> load(const std::string& path) {
+template <typename T>
+std::vector<T> loadAs(const std::string& path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file) throw std::runtime_error("Cannot read " + path);
-  std::vector<float> data(static_cast<size_t>(file.tellg()) / sizeof(float));
+  std::vector<T> data(static_cast<size_t>(file.tellg()) / sizeof(T));
   file.seekg(0);
-  file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(float)));
+  file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(T)));
   return data;
 }
+
+std::vector<float> load(const std::string& path) { return loadAs<float>(path); }
 
 double maxAbs(const float* a, const float* b, size_t n) {
   double worst = 0;
@@ -107,5 +110,44 @@ int main(int argc, char** argv) {
   // differently in float, which the KV cache carries forward (noise of the quantization's size).
   ok &= report("cpu tts step 0 (relative)", ttsFirst, 1e-5);
   ok &= report("cpu tts all steps (relative)", ttsWorst, 2e-2);
+
+  // Image preparation against the official MiniCPMVImageProcessor and NaViT / resampler positions
+  // (scripts/minicpmo_vision_reference.py hosttest into DIR/vision, vision_assets.bin next to them).
+  if (std::ifstream(dir + "/vision/0_dims.i32").good()) {
+    const Assets vision(dir + "/vision/vision_assets.bin");
+    constexpr size_t kSlots = 1056, kPatch = VisionInputs::kPatch;
+    for (int i = 0; std::ifstream(dir + "/vision/" + std::to_string(i) + "_dims.i32").good(); ++i) {
+      const std::string prefix = dir + "/vision/" + std::to_string(i) + "_";
+      const auto dims = loadAs<int32_t>(prefix + "dims.i32");
+      const auto rgb = loadAs<uint8_t>(prefix + "rgb.u8");
+      const VisionInputs in(rgb.data(), dims[0], dims[1], kSlots, vision.i32("vision_buckets"), vision.f16("vision_positions"));
+      const size_t count = in.rows * in.cols;
+      const std::string name = "image " + std::to_string(i) + " ";
+      ok &= report((name + "grid (rows + cols mismatch)").c_str(), std::fabs(double(in.rows) - dims[3]) + std::fabs(double(in.cols) - dims[2]), 0);
+      if (in.rows != static_cast<size_t>(dims[3]) || in.cols != static_cast<size_t>(dims[2])) continue;
+      // pixel_values [3, 14, count * 14]: pixel (c, ky, kx) of patch p at [c, ky, p * 14 + kx]. The resize
+      // reproduces Pillow's fixed-point arithmetic, so the pixels match exactly.
+      const auto pixels = load(prefix + "pixels.f32");
+      double worst = 0;
+      for (size_t c = 0; c < 3; ++c)
+        for (size_t ky = 0; ky < kPatch; ++ky)
+          for (size_t p = 0; p < count; ++p)
+            for (size_t kx = 0; kx < kPatch; ++kx) {
+              const float ours = in.patches[((c * kPatch + ky) * kPatch + kx) * kSlots + p];
+              worst = std::max(worst, double(std::fabs(ours - pixels[(c * kPatch + ky) * count * kPatch + p * kPatch + kx])));
+            }
+      ok &= report((name + "pixels").c_str(), worst, 1e-6);
+      const auto ids = loadAs<int32_t>(prefix + "ids.i32");
+      size_t wrong = 0;
+      for (size_t p = 0; p < count; ++p) wrong += in.positionId(vision.i32("vision_buckets"), p) != static_cast<size_t>(ids[p]);
+      ok &= report((name + "position ids (wrong count)").c_str(), double(wrong), 0);
+      const auto keys = load(prefix + "keys.f32");
+      worst = 0;
+      for (size_t p = 0; p < count; ++p)
+        for (size_t k = 0; k < static_cast<size_t>(kDim); ++k)
+          worst = std::max(worst, double(std::fabs(in.keys[k * kSlots + p] - keys[p * kDim + k])));
+      ok &= report((name + "resampler positions").c_str(), worst, 1e-2);  // the official table is bf16
+    }
+  }
   return ok ? 0 : 1;
 }

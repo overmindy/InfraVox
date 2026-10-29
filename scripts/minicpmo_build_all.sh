@@ -26,6 +26,11 @@ echo "== capture: BF16 duplex sessions on synthesized questions"
 [ -f "$MCPO_CAPTURE/manifest.json" ] || CUDA_VISIBLE_DEVICES=${GPUS[0]} "$MCPO_PY" "$S/minicpmo_capture.py" \
   --model-dir "$MCPO_HF" --output-dir "$MCPO_CAPTURE" --ref-wav "$MCPO_REF_WAV" > "$W/logs/capture.log" 2>&1
 
+echo "== vision: COCO photos and their official float32 embeddings"
+"$MCPO_PY" "$S/minicpmo_vision_reference.py" download --images "$MCPO_IMAGES" --qa-dir "$MCPO_ROOT/images_qa" > "$W/logs/vision_download.log" 2>&1
+step "$MCPO_VISION_REF/embeds.done" vision_reference env CUDA_VISIBLE_DEVICES=${GPUS[0]} "$MCPO_PY" "$S/minicpmo_vision_reference.py" \
+  embeds --model-dir "$MCPO_HF" --images "$MCPO_IMAGES" --out "$MCPO_VISION_REF"
+
 echo "== official token2wav assets, LLM part boundaries"
 step "$W/token2wav/golden.npz" token2wav_prepare env CUDA_VISIBLE_DEVICES=${GPUS[0]} "$MCPO_PY" "$S/minicpmo_token2wav_prepare.py" \
   "${COMMON[@]}" --ref-wav "$MCPO_REF_WAV" &
@@ -44,6 +49,8 @@ echo "== calibration (AIMET), two GPU queues"
     step "$W/llm_part_${p}_ar16/llm_part_${p}_ar16.encodings" "llm_part_$p" aimet "${GPUS[0]}" "$S/minicpmo_llm.py" part --part $p "${COMMON[@]}"
   done
   step "$W/llm_head/llm_head.encodings" llm_head aimet "${GPUS[0]}" "$S/minicpmo_llm.py" head "${COMMON[@]}"
+  step "$W/vision/vision_assets.bin" vision aimet "${GPUS[0]}" "$S/minicpmo_vision.py" --model-dir "$MCPO_HF" \
+    --reference-dir "$MCPO_VISION_REF/embeds" --work-dir "$W"
 } &
 q1=$!
 {
@@ -66,16 +73,17 @@ build audio_encoder audio_encoder & pids+=($!)
 build dit dit & pids+=($!)
 build hift_f0 hift_f0 & pids+=($!)
 build hift_decode hift_decode & pids+=($!)
+build vision vision & pids+=($!)
 await "${pids[@]}"
 
 B=$MCPO_ROOT/bundle/$MCPO_BUNDLE-$MCPO_TARGET
 echo "== bundle $B"
 mkdir -p "$B"
-for name in llm_part_0 llm_part_1 llm_part_2 llm_part_3 llm_head audio_encoder dit hift_f0 hift_decode; do
+for name in llm_part_0 llm_part_1 llm_part_2 llm_part_3 llm_head audio_encoder dit hift_f0 hift_decode vision; do
   ln -f "$C/$name.bin" "$B/"
 done
 rm -f "$B/tts.bin"  # bundles before the TTS moved to the CPU
-ln -f "$W/token2wav/flow_encoder.onnx" "$W/tts_cpu/tts_cpu.bin" "$B/"
+ln -f "$W/token2wav/flow_encoder.onnx" "$W/tts_cpu/tts_cpu.bin" "$W/vision/vision_assets.bin" "$B/"
 [ -f "$B/assets.bin" ] || aimet "${GPUS[0]}" "$S/minicpmo_bundle.py" "${COMMON[@]}" --output "$B/assets.bin" > "$W/logs/bundle.log" 2>&1
-(cd "$B" && sha256sum assets.bin flow_encoder.onnx ./*.bin | sed 's#  \./#  #' | sort -k2 -u > SHA256SUMS)
+(cd "$B" && sha256sum assets.bin flow_encoder.onnx ./*.bin | sed 's#  \./#  #' | sort -k2 -u > SHA256SUMS)  # *.bin covers vision_assets.bin
 cat "$B/SHA256SUMS"

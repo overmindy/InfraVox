@@ -8,7 +8,9 @@
 : "${MCPO_REF_WAV:=$MCPO_ROOT/ref_voice.wav}"                   # assistant voice: first 6.76 s of assets/system_ref_audio.wav
 : "${MCPO_CAPTURE:=$MCPO_ROOT/capture}"
 : "${MCPO_WORK:=$MCPO_ROOT/work}"
-: "${MCPO_BUNDLE:=v1}"
+: "${MCPO_BUNDLE:=v2}"                                          # v2 = v1 + vision (vision.bin, vision_assets.bin)
+: "${MCPO_IMAGES:=$MCPO_ROOT/images}"                           # vision calibration photos (COCO val2017 + any others)
+: "${MCPO_VISION_REF:=$MCPO_ROOT/vision_ref}"                   # official vision embeddings, Q&A photos and answers
 : "${MCPO_TARGET:=sm8975}"                                      # contexts are bound to one SoC
 case $MCPO_TARGET in
   sm8850) : "${MCPO_SOC_MODEL:=87}" "${MCPO_DSP_ARCH:=v81}" ;;

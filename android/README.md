@@ -8,7 +8,7 @@ Moshi 旧的实验代码可在 git tag `moshi-pre-cleanup` 中找回。
 
 # MiniCPM-o 4.5 全双工语音（推荐）
 
-OpenBMB [MiniCPM-o 4.5](https://huggingface.co/openbmb/MiniCPM-o-4_5) 的全双工语音部分（不含视觉），
+OpenBMB [MiniCPM-o 4.5](https://huggingface.co/openbmb/MiniCPM-o-4_5) 的全双工语音部分，模型包 v2 起加上看图（见下文“图像”），
 同一台手机、同一个 QAIRT。服务器上 `scripts/minicpmo_build_all.sh` 从 BF16 权重一路做到模型包，
 Mac 上 `scripts/minicpmo_deploy.sh` 推到手机并安装 App；路径在 `scripts/minicpmo_env.sh`。
 
@@ -55,6 +55,8 @@ SM8975 实测（OPPO PYB110，演示提问 19 秒通话）：加载 5.6 秒，�
 | `scripts/minicpmo_token2wav.py` | DiT / HiFT 对齐与校准 |
 | `scripts/minicpmo_hift_check.py` | NSF 源、STFT、iSTFT 与官方 HiFT 对齐，并导出主机测试向量 |
 | `scripts/minicpmo_sim.py` | 手机宿主逻辑的 Python 版（浮点图），C++ 运行器照它移植 |
+| `scripts/minicpmo_vision_reference.py` | 官方视觉路径（minicpmo 环境）：下载 COCO 照片、官方 float32 / BF16 图像 embedding、主机测试向量、带图的 BF16 双工问答 |
+| `scripts/minicpmo_vision.py` | SigLIP + resampler 固定形状图：与官方对齐、ONNX、AIMET W8A16（真实照片校准）、`vision_assets.bin` |
 | `scripts/minicpmo_bundle.py` | `assets.bin`：embedding 表、系统提示 embedding、BPE 字节表、token2wav 固定状态 |
 | `scripts/minicpmo_qairt_build.sh` | 转换 + 量化 + 编译；多个图进同一个 context 时开启权重共享 |
 | `android/minicpmo_runner.cpp` | 原生运行器；`android/qnn_runtime.h` 是与 Moshi 共用的 QNN 基础设施 |
@@ -80,6 +82,40 @@ TTS 在 CPU 上跑（`scripts/minicpmo_tts_cpu.py`：int8 权重按行缩放、�
 
 播放端为 MiniCPM-o 保持 1 s 预留（模型安静时用静音补，说话中不插静音），4 分钟测试 0 次 underrun。
 head 用 W4 能省约 50 ms/s 的 HTP，但 top-1 与浮点一致率从 0.978 掉到 0.898，所以保留 W8。
+
+## 图像
+
+用户在通话前或通话中选一张照片（相册或拍照），模型从下一个单元起就能看到并谈论它。做法与官方
+`MiniCPMODuplex.streaming_prefill(frame_list=[图], max_slice_nums=1)` 一致：双工模式只送一张源图、不切片，
+该单元的预填充变为 `<unit><image>[64 个图像 embedding]</image>[10 个音频 embedding]`。每张图只送一次
+（官方视频模式每秒送一帧，照片没必要，也省 KV 环：一张图占 66 个位置）。
+
+```text
+RGB（App 解码，长边不超过 1344，按 EXIF 转正）
+  → CPU：宽高比超过 4:1 时居中裁切 → 按官方 find_best_resize 缩放到约 448×448 面积（PIL 双三次，定点算法逐位一致）
+       → 14×14 patch、(x/255−0.5)/0.5 → NaViT 位置（70×70 表按 bucketize 取行）→ resampler 的 2D sin-cos 键位置
+  → vision 图（HTP）：SigLIP-400M 27 层 + resampler（64 个查询交叉注意）→ 64 × 4096
+  → 下一单元：<unit> 之后插入 <image> 64 行 </image>，再接音频
+```
+
+| `vision` 图 | 形状 | 主机填写 |
+| --- | --- | --- |
+| `patches` | [1, 588, 1, 1056] | 每个 patch 的像素，(通道, 行, 列) 顺序；1056 个槽位覆盖 4:1 以内的宽高比，多余槽位填 0 |
+| `positions` | [1, 1152, 1, 1056] | `vision_assets.bin` 的位置表（4900×1152，f16）按 `vision_buckets` 取行 |
+| `attention_mask` | [1, 1, 1, 1056] | 真实 patch 为 0，填充为 −50（SigLIP 自注意和 resampler 交叉注意共用） |
+| `resampler_pos` | [1, 4096, 1, 1056] | 前 2048 维编码列、后 2048 维编码行，各为 sin \| cos |
+| `image_embeds`（输出） | [1, 64, 4096] | 直接作为 LLM 输入行 |
+
+- 量化 W8A16，用 76 张真实照片（COCO val2017 + 几张文档图）校准，11 张留作验证。
+  对官方 float32：重写的浮点图相对误差中位 1e-3（官方 BF16 自身约 2e-2）；量化结果见 `work/logs/vision.log`。
+- SigLIP 从第 9 层起有“巨大激活”：fc1 输出到 ±280、残差流到 ±2200。tanh 近似 GELU 里的 x³ 因此到 ±2e7，
+  16-bit 激活编码被撑爆（全图对浮点余弦只有 0.80–0.89，只量化权重时 0.999）。GELU 内部改为对 clamp(x, ±10) 取立方
+  （tanh 在那里已经是 ±1，数值完全相同）后，W8A16 对浮点余弦 0.997–0.999。
+- NaViT 的 bucketize 必须用 float32 步长（官方是 `1 / tgt_sizes` 的 int32 张量），float64 步长会让部分网格尺寸
+  （如 25×41）的位置桶错位，那张图的误差从 1e-3 涨到 7e-2。
+- 编码在调用 `attachImage` 的线程上跑（App 的 IO 线程），与推理线程共用 HTP 执行锁；图像行在下一单元预填充
+  时插入，该单元的预填充从 1 次 AR-16 变成 5 次（77 行）。`end()` 清掉还没送出的图，`begin()` 保留通话前选好的图。
+- 没有 `vision.bin` 的旧模型包（v1）照常加载，只是不能看图。
 
 ## 长对话
 

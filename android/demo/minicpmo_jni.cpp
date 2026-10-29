@@ -10,6 +10,8 @@
 void* minicpmoCreate(const std::string& libraryDir, const std::string& modelDirectory);
 void minicpmoBegin(void* session, bool highPerformance, float temperature, uint64_t seed);
 bool minicpmoStep(void* session, const int16_t* input, size_t count, std::vector<int16_t>& pcm, std::vector<uint8_t>& text);
+bool minicpmoSupportsImages(void* session);
+void minicpmoAttachImage(void* session, const uint8_t* rgb, size_t width, size_t height);
 void minicpmoEnd(void* session, const std::string& performanceCsv);
 void minicpmoDestroy(void* session);
 
@@ -101,6 +103,32 @@ Java_com_overmindy_duplex_engine_MiniCpmoNative_nativeText(JNIEnv* env, jclass, 
   } catch (const std::exception& error) {
     throwJava(env, error.what());
     return nullptr;
+  }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_overmindy_duplex_engine_MiniCpmoNative_nativeSupportsImages(JNIEnv* env, jclass, jlong handle) {
+  try {
+    return minicpmoSupportsImages(handleOf(handle)->session) ? JNI_TRUE : JNI_FALSE;
+  } catch (const std::exception& error) {
+    throwJava(env, error.what());
+    return JNI_FALSE;
+  }
+}
+
+// rgb: width * height interleaved 8-bit RGB. Encodes on the calling thread; the next unit feeds it.
+extern "C" JNIEXPORT void JNICALL
+Java_com_overmindy_duplex_engine_MiniCpmoNative_nativeAttachImage(
+    JNIEnv* env, jclass, jlong handle, jbyteArray rgb, jint width, jint height) {
+  try {
+    const jsize count = env->GetArrayLength(rgb);
+    if (width <= 0 || height <= 0 || static_cast<int64_t>(count) != int64_t{width} * height * 3)
+      throw std::runtime_error("RGB buffer does not match the image size");
+    std::vector<uint8_t> pixels(static_cast<size_t>(count));
+    env->GetByteArrayRegion(rgb, 0, count, reinterpret_cast<jbyte*>(pixels.data()));
+    minicpmoAttachImage(handleOf(handle)->session, pixels.data(), static_cast<size_t>(width), static_cast<size_t>(height));
+  } catch (const std::exception& error) {
+    throwJava(env, error.what());
   }
 }
 

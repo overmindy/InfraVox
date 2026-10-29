@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <exception>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -35,6 +36,7 @@ using namespace qnnrt;
 constexpr int32_t kVocab = 151748, kDim = 4096, kTtsDim = 768, kCodes = 6562;
 constexpr int32_t kListen = 151705, kTtsBos = 151703, kChunkEos = 151718, kChunkTtsEos = 151721;
 constexpr int32_t kTurnEos = 151717, kTtsPad = 151722, kUnit = 151683, kUnitEnd = 151684;
+constexpr int32_t kImageStart = 151669, kImageEnd = 151670;
 constexpr int32_t kTtsEos = 6561, kAudioBosText = 151687, kSilenceCode = 4218;
 constexpr int kMaxSpeakTokens = 20, kArN = 16;
 constexpr float kMaskMin = -50.0f;
@@ -381,6 +383,174 @@ class AudioEncoder {
   Graph graph_;
   const uint16_t* positions_;
   size_t past_ = 0, length_ = 0;
+};
+
+// PIL Image.resize(BICUBIC) on 8-bit RGB: separable passes (horizontal first) with antialiasing
+// support, 22-bit fixed-point coefficients and an 8-bit intermediate, as Pillow's Resample.c.
+std::vector<uint8_t> resizeBicubic(const uint8_t* rgb, size_t width, size_t height, size_t outWidth, size_t outHeight) {
+  constexpr int kBits = 22;
+  struct Taps { std::vector<int> first, count; std::vector<int32_t> weights; size_t size = 0; };
+  const auto coefficients = [](size_t in, size_t out) {
+    const double scale = static_cast<double>(in) / out, filterScale = std::max(scale, 1.0), support = 2.0 * filterScale;
+    Taps taps;
+    taps.size = static_cast<size_t>(std::ceil(support)) * 2 + 1;
+    taps.first.resize(out);
+    taps.count.resize(out);
+    taps.weights.assign(out * taps.size, 0);
+    std::vector<double> k(taps.size);
+    for (size_t x = 0; x < out; ++x) {
+      const double center = (x + 0.5) * scale;
+      const int lo = std::max(0, static_cast<int>(center - support + 0.5));
+      const int hi = std::min(static_cast<int>(in), static_cast<int>(center + support + 0.5));
+      double total = 0;
+      for (int i = lo; i < hi; ++i) {
+        double t = std::fabs((i - center + 0.5) / filterScale);
+        constexpr double a = -0.5;
+        const double w = t < 1 ? ((a + 2) * t - (a + 3)) * t * t + 1 : t < 2 ? (((t - 5) * t + 8) * t - 4) * a : 0.0;
+        k[i - lo] = w;
+        total += w;
+      }
+      taps.first[x] = lo;
+      taps.count[x] = hi - lo;
+      for (int i = 0; i < hi - lo; ++i) {
+        const double w = total != 0 ? k[i] / total : 0.0;
+        taps.weights[x * taps.size + i] = static_cast<int32_t>(w < 0 ? -0.5 + w * (1 << kBits) : 0.5 + w * (1 << kBits));
+      }
+    }
+    return taps;
+  };
+  const auto clip = [](int64_t v) { return static_cast<uint8_t>(std::clamp<int64_t>(v >> kBits, 0, 255)); };
+  std::vector<uint8_t> current(rgb, rgb + width * height * 3);
+  if (outWidth != width) {
+    const Taps taps = coefficients(width, outWidth);
+    std::vector<uint8_t> next(outWidth * height * 3);
+    for (size_t y = 0; y < height; ++y)
+      for (size_t x = 0; x < outWidth; ++x)
+        for (size_t c = 0; c < 3; ++c) {
+          int64_t sum = 1 << (kBits - 1);
+          for (int i = 0; i < taps.count[x]; ++i)
+            sum += static_cast<int64_t>(current[(y * width + taps.first[x] + i) * 3 + c]) * taps.weights[x * taps.size + i];
+          next[(y * outWidth + x) * 3 + c] = clip(sum);
+        }
+    current.swap(next);
+  }
+  if (outHeight != height) {
+    const Taps taps = coefficients(height, outHeight);
+    std::vector<uint8_t> next(outWidth * outHeight * 3);
+    for (size_t y = 0; y < outHeight; ++y)
+      for (size_t x = 0; x < outWidth * 3; ++x) {
+        int64_t sum = 1 << (kBits - 1);
+        for (int i = 0; i < taps.count[y]; ++i)
+          sum += static_cast<int64_t>(current[(taps.first[y] + i) * outWidth * 3 + x]) * taps.weights[y * taps.size + i];
+        next[y * outWidth * 3 + x] = clip(sum);
+      }
+    current.swap(next);
+  }
+  return current;
+}
+
+// Graph inputs of scripts/minicpmo_vision.py for one photo prepared like MiniCPMVImageProcessor with
+// max_slice_nums=1: bicubic resize to ~448x448 area keeping the aspect ratio, 14x14 patches, mean/std 0.5.
+// Channel-first [C, slots]; slots past rows * cols are padding.
+struct VisionInputs {
+  static constexpr size_t kPatch = 14, kGrid = 70, kWidth = 1152, kMaxSide = 128;
+  static constexpr double kMaxAspect = 4.0;  // the graph's 1056 patch slots cover aspect ratios up to 4:1
+
+  size_t rows = 0, cols = 0;
+  std::vector<float> patches, positions, mask, keys;
+
+  // buckets [128, 128]: NaViT position bucket per side length; table [4900, 1152] f16 position embeddings.
+  VisionInputs(const uint8_t* rgb, size_t width, size_t height, size_t slots, const int32_t* buckets, const uint16_t* table) {
+    // Centre-crop beyond 4:1 (upstream would need more patches than the graph has).
+    size_t x0 = 0, y0 = 0, w = width, h = height;
+    if (w > h * kMaxAspect) { w = static_cast<size_t>(h * kMaxAspect); x0 = (width - w) / 2; }
+    if (h > w * kMaxAspect) { h = static_cast<size_t>(w * kMaxAspect); y0 = (height - h) / 2; }
+    std::vector<uint8_t> cropped(w * h * 3);
+    for (size_t y = 0; y < h; ++y) std::memcpy(&cropped[y * w * 3], rgb + ((y0 + y) * width + x0) * 3, w * 3);
+    // find_best_resize(allow_upscale=True) + ensure_divide (Python round: ties to even).
+    const double ratio = static_cast<double>(w) / h;
+    const auto fitted = static_cast<int64_t>(448.0 / std::sqrt(ratio));
+    const auto fittedWidth = static_cast<int64_t>(fitted * ratio);
+    const auto divide = [](int64_t length) { return std::max<int64_t>(std::nearbyint(length / 14.0) * 14, 14); };
+    const size_t outWidth = divide(fittedWidth), outHeight = divide(fitted);
+    cols = outWidth / kPatch;
+    rows = outHeight / kPatch;
+    const size_t count = rows * cols;
+    if (count > slots || rows > kMaxSide || cols > kMaxSide) throw std::runtime_error("Image grid too large");
+    const auto pixels = resizeBicubic(cropped.data(), w, h, outWidth, outHeight);
+
+    patches.assign(3 * kPatch * kPatch * slots, 0.0f);  // (channel, row, column) per patch
+    for (size_t r = 0; r < rows; ++r)
+      for (size_t c = 0; c < cols; ++c)
+        for (size_t ch = 0; ch < 3; ++ch)
+          for (size_t ky = 0; ky < kPatch; ++ky)
+            for (size_t kx = 0; kx < kPatch; ++kx) {
+              const uint8_t v = pixels[((r * kPatch + ky) * outWidth + c * kPatch + kx) * 3 + ch];
+              patches[((ch * kPatch + ky) * kPatch + kx) * slots + r * cols + c] = (v / 255.0f - 0.5f) / 0.5f;
+            }
+
+    positions.assign(kWidth * slots, 0.0f);
+    std::vector<float> row(kWidth);
+    for (size_t p = 0; p < count; ++p) {
+      rowF16(table, positionId(buckets, p), kWidth, row.data());
+      for (size_t k = 0; k < kWidth; ++k) positions[k * slots + p] = row[k];
+    }
+
+    mask.assign(slots, kMaskMin);
+    std::fill(mask.begin(), mask.begin() + count, 0.0f);
+
+    // Resampler 2D sin-cos: dims [0, 2048) encode the column, [2048, 4096) the row; each half is sin | cos.
+    keys.assign(static_cast<size_t>(kDim) * slots, 0.0f);
+    constexpr size_t quarter = kDim / 4;
+    std::vector<float> omega(quarter);
+    for (size_t k = 0; k < quarter; ++k) omega[k] = 1.0f / std::pow(10000.0f, static_cast<float>(k) / quarter);
+    for (size_t p = 0; p < count; ++p) {
+      const float coordinate[2] = {static_cast<float>(p % cols), static_cast<float>(p / cols)};
+      for (size_t half = 0; half < 2; ++half)
+        for (size_t k = 0; k < quarter; ++k) {
+          const float angle = coordinate[half] * omega[k];
+          keys[(half * 2 * quarter + k) * slots + p] = std::sin(angle);
+          keys[(half * 2 * quarter + quarter + k) * slots + p] = std::cos(angle);
+        }
+    }
+  }
+
+  size_t positionId(const int32_t* buckets, size_t p) const {
+    return buckets[(rows - 1) * kMaxSide + p / cols] * kGrid + buckets[(cols - 1) * kMaxSide + p % cols];
+  }
+};
+
+// SigLIP + resampler (scripts/minicpmo_vision.py): one photo -> the 64 LLM rows between <image> and </image>.
+class VisionEncoder {
+ public:
+  static constexpr size_t kQueries = 64;
+
+  VisionEncoder(Runtime& runtime, const std::string& dir)
+      : runtime_(runtime), assets_(dir + "/vision_assets.bin"), graph_(runtime, dir + "/vision.bin", true) {
+    slots_ = tensorDimensions(graph_.input("attention_mask").tensor)[3];
+  }
+
+  // Interleaved RGB -> 64 x 4096 LLM rows.
+  std::vector<float> encode(const uint8_t* rgb, size_t width, size_t height) {
+    const auto start = Clock::now();
+    const VisionInputs in(rgb, width, height, slots_, assets_.i32("vision_buckets"), assets_.f16("vision_positions"));
+    setReal(graph_.input("patches"), in.patches.data(), in.patches.size());
+    setReal(graph_.input("positions"), in.positions.data(), in.positions.size());
+    setReal(graph_.input("attention_mask"), in.mask.data(), in.mask.size());
+    setReal(graph_.input("resampler_pos"), in.keys.data(), in.keys.size());
+    runtime_.timing("vision_prepare", "total", elapsedMs(start));
+    graph_.execute();
+    std::vector<float> embeds(kQueries * kDim);
+    getReal(graph_.output("image_embeds"), embeds.data(), embeds.size());
+    runtime_.timing("vision_image", "total", elapsedMs(start));
+    return embeds;
+  }
+
+ private:
+  Runtime& runtime_;
+  Assets assets_;
+  Graph graph_;
+  size_t slots_ = 0;
 };
 
 // StreamDecoder.decode in sampling mode with the duplex defaults (modeling_minicpmo / utils.py).
@@ -1178,12 +1348,16 @@ class Session {
  public:
   Session(const std::string& libraryDir, const std::string& dir) : runtime_(libraryDir), assets_(dir + "/assets.bin") {
     uint64_t spill = 0;
-    for (const char* name : {"llm_head", "audio_encoder", "dit", "hift_f0", "hift_decode", "llm_part_0", "llm_part_1",
-                             "llm_part_2", "llm_part_3"})
-      spill = std::max(spill, runtime_.spillFillBytes(dir + "/" + name + ".bin"));
+    std::vector<std::string> contexts = {"llm_head", "audio_encoder", "dit", "hift_f0", "hift_decode", "llm_part_0",
+                                         "llm_part_1", "llm_part_2", "llm_part_3"};
+    // Bundles without the vision graph (v1) still load; they just cannot take images.
+    const bool vision = std::ifstream(dir + "/vision.bin").good();
+    if (vision) contexts.push_back("vision");
+    for (const auto& name : contexts) spill = std::max(spill, runtime_.spillFillBytes(dir + "/" + name + ".bin"));
     runtime_.groupSpillBytes = spill;
     head_ = std::make_unique<Graph>(runtime_, dir + "/llm_head.bin", true);  // group leader: created first, freed last
     encoder_ = std::make_unique<AudioEncoder>(runtime_, dir + "/audio_encoder.bin", assets_.f16("whisper_positions"));
+    if (vision) vision_ = std::make_unique<VisionEncoder>(runtime_, dir);
     for (int p = 0; p < 4; ++p)
       parts_.push_back(std::make_unique<KvModel>(runtime_, dir + "/llm_part_" + std::to_string(p) + ".bin",
                                                  "llm_part_" + std::to_string(p), "hidden", "hidden_out", 1e6));
@@ -1202,7 +1376,7 @@ class Session {
     wake_.notify_all();
     worker_.join();
     runtime_.endPerformanceVote();
-    token2wav_.reset(); tts_.reset(); parts_.clear(); encoder_.reset();
+    token2wav_.reset(); tts_.reset(); parts_.clear(); vision_.reset(); encoder_.reset();
     head_.reset();
     runtime_.groupLeader = nullptr;
   }
@@ -1257,7 +1431,27 @@ class Session {
     return true;
   }
 
+  bool supportsImages() const { return vision_ != nullptr; }
+
+  // Any thread: encodes a photo now and feeds it with the next unit as <image>[64 rows]</image>
+  // right after <unit>, as streaming_prefill does with frame_list (one source image, no slices).
+  // Images attached before begin() go into the first unit of that conversation.
+  void attachImage(const uint8_t* rgb, size_t width, size_t height) {
+    if (!vision_) throw std::runtime_error("This model bundle has no vision encoder");
+    const auto image = vision_->encode(rgb, width, height);
+    std::vector<float> rows;
+    embed(kImageStart, rows);
+    rows.insert(rows.end(), image.begin(), image.end());
+    embed(kImageEnd, rows);
+    std::lock_guard<std::mutex> lock(imageMutex_);
+    images_.insert(images_.end(), rows.begin(), rows.end());
+  }
+
   void end(const std::string& performanceCsv) {
+    {
+      std::lock_guard<std::mutex> lock(imageMutex_);
+      images_.clear();
+    }
     idle();
     runtime_.timing("pipeline", "wall_total", elapsedMs(started_));
     runtime_.endPerformanceVote();
@@ -1354,6 +1548,11 @@ class Session {
   Speech generate(const std::vector<float>& audio, std::vector<uint8_t>& text) {
     std::vector<float> rows;
     embed(kUnit, rows);
+    {
+      std::lock_guard<std::mutex> lock(imageMutex_);
+      rows.insert(rows.end(), images_.begin(), images_.end());
+      images_.clear();
+    }
     rows.insert(rows.end(), audio.begin(), audio.end());
     std::vector<float> logits, semantic;
     logitsOf(flush(rows), logits, semantic);
@@ -1445,6 +1644,9 @@ class Session {
   Assets assets_;
   std::unique_ptr<Graph> head_;
   std::unique_ptr<AudioEncoder> encoder_;
+  std::unique_ptr<VisionEncoder> vision_;
+  std::mutex imageMutex_;
+  std::vector<float> images_;  // rows of attached images waiting for the next unit
   std::vector<std::unique_ptr<KvModel>> parts_;
   std::unique_ptr<Tts> tts_;
   std::unique_ptr<Token2wav> token2wav_;
@@ -1477,6 +1679,12 @@ void minicpmoBegin(void* session, bool highPerformance, float temperature, uint6
 
 bool minicpmoStep(void* session, const int16_t* input, size_t count, std::vector<int16_t>& pcm, std::vector<uint8_t>& text) {
   return static_cast<Session*>(session)->step(input, count, pcm, text);
+}
+
+bool minicpmoSupportsImages(void* session) { return static_cast<Session*>(session)->supportsImages(); }
+
+void minicpmoAttachImage(void* session, const uint8_t* rgb, size_t width, size_t height) {
+  static_cast<Session*>(session)->attachImage(rgb, width, height);
 }
 
 void minicpmoEnd(void* session, const std::string& performanceCsv) { static_cast<Session*>(session)->end(performanceCsv); }

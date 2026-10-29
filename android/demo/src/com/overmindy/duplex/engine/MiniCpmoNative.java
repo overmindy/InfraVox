@@ -13,6 +13,8 @@ final class MiniCpmoNative {
     static native void nativeBegin(long handle, boolean highPerformance, float temperature, int seed);
     static native short[] nativeStep(long handle, short[] input);
     static native byte[] nativeText(long handle);
+    static native boolean nativeSupportsImages(long handle);
+    static native void nativeAttachImage(long handle, byte[] rgb, int width, int height);
     static native void nativeEnd(long handle, String performanceCsv);
     static native void nativeRelease(long handle);
 }

@@ -184,6 +184,7 @@ question got an answer.
 | Model stops talking after a few minutes | KV ring wrapped over the system prompt / attention sink | pin the first positions in the ring |
 | Garbage attention after reset | ring filled with byte 0 instead of the quantized zero | fill with `quantizeTo(affine, 0)` |
 | 16-bit activation range blown | `-inf` attention masks | use a large finite negative or slice the cache instead |
+| A16 accuracy collapses after one layer while W8-only is fine | tanh-GELU's `x³` on "massive activations" (SigLIP fc1 ±280 → ±2e7) | take the cube of `clamp(x, -10, 10)`: identical values, bounded range (`scripts/minicpmo_vision.py`) |
 | Model always stays silent with greedy decoding | quantization shifts the listen/speak logit | sample (temperature ~0.7, top-k / min-p) instead of argmax |
 | `contextCreateFromBinary` fails on another phone | contexts are bound to SoC + QAIRT version | only the target SoC is supported; other SoCs need their own context build |
 | `deviceCreate` 14001 after `remote work start failed: 3` (Android 17) | the NPU scheduler only serves apps granted by `NpuManager` | call `engine/NpuGate.java` before loading; targetSdk 37 + `uses-feature android.hardware.npu` |

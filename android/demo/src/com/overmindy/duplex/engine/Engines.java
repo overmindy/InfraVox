@@ -8,6 +8,11 @@ public final class Engines {
         return "moshi".equals(engine) || "minicpmo".equals(engine);
     }
 
+    /** Engines that can see photos (when the bundle has a vision graph; see DuplexEngine.supportsImages). */
+    public static boolean takesImages(String engine) {
+        return "minicpmo".equals(engine);
+    }
+
     public static DuplexEngine create(String engine) {
         if ("moshi".equals(engine)) return new MoshiEngine();
         if ("minicpmo".equals(engine)) return new MiniCpmoEngine();

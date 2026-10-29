@@ -1,6 +1,7 @@
 package com.overmindy.duplex.engine;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -61,7 +62,27 @@ public final class MiniCpmoEngine implements DuplexEngine {
     }
 
     @Override
-    public void release() {
+    public synchronized boolean supportsImages() {
+        return handle != 0 && MiniCpmoNative.nativeSupportsImages(handle);
+    }
+
+    // Synchronized with release(): encoding takes a few hundred ms on another thread than step().
+    @Override
+    public synchronized void attachImage(Bitmap image) {
+        int width = image.getWidth(), height = image.getHeight();
+        int[] argb = new int[width * height];
+        image.getPixels(argb, 0, width, 0, 0, width, height);
+        byte[] rgb = new byte[argb.length * 3];
+        for (int i = 0; i < argb.length; i++) {
+            rgb[3 * i] = (byte) (argb[i] >> 16);
+            rgb[3 * i + 1] = (byte) (argb[i] >> 8);
+            rgb[3 * i + 2] = (byte) argb[i];
+        }
+        MiniCpmoNative.nativeAttachImage(handle, rgb, width, height);
+    }
+
+    @Override
+    public synchronized void release() {
         if (handle != 0) MiniCpmoNative.nativeRelease(handle);
         handle = 0;
         if (npu != null) npu.notifyUnloaded();
